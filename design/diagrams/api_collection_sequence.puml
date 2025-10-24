@@ -1,0 +1,227 @@
+@startuml
+title API采集流程时序图
+
+skinparam sequence {
+    ArrowColor DeepSkyBlue
+    ActorBorderColor DeepSkyBlue
+    LifeLineBorderColor blue
+    LifeLineBackgroundColor #A9DCDF
+
+    ParticipantBorderColor DeepSkyBlue
+    ParticipantBackgroundColor DodgerBlue
+    ParticipantFontColor #FFFFFF
+
+    ActorBackgroundColor aqua
+    ActorFontColor DeepSkyBlue
+
+    BoxBackgroundColor #EEEEEE
+}
+
+participant "Worker节点" as Worker
+participant "APICollector" as API
+participant "HTTPClient\n(resty)" as HTTP
+participant "OAuth2Config\n认证管理器" as OAuth
+participant "PaginationEngine\n分页引擎" as Pagination
+participant "JSONPathExtractor\n数据提取器" as JSONPath
+participant "目标API" as TargetAPI
+database "Redis缓存" as Redis
+
+== 初始化阶段 ==
+
+Worker -> API: Collect(task)
+activate Worker
+activate API
+
+API -> API: 解析API配置\n(URL、方法、认证方式、分页等)
+
+API -> HTTP: 初始化HTTP客户端
+activate HTTP
+HTTP -> HTTP: 设置BaseURL
+HTTP -> HTTP: 设置超时时间
+HTTP -> HTTP: 配置重试策略
+HTTP --> API: HTTPClient实例
+deactivate HTTP
+
+== 认证阶段 ==
+
+alt 认证类型: API Key
+    API -> HTTP: SetHeader("Authorization", "Bearer " + apiKey)
+    activate HTTP
+    HTTP --> API: OK
+    deactivate HTTP
+
+else 认证类型: OAuth 2.0
+    API -> OAuth: GetToken()
+    activate OAuth
+
+    OAuth -> Redis: 检查缓存Token
+    activate Redis
+    Redis --> OAuth: Token或nil
+    deactivate Redis
+
+    alt Token已缓存且未过期
+        OAuth --> API: 返回缓存Token
+    else Token不存在或已过期
+        OAuth -> TargetAPI: POST /oauth/token\n{grant_type, client_id, client_secret, scope}
+        activate TargetAPI
+        TargetAPI --> OAuth: {access_token, expires_in, refresh_token}
+        deactivate TargetAPI
+
+        OAuth -> Redis: 缓存Token(TTL=expires_in-60)
+        activate Redis
+        Redis --> OAuth: OK
+        deactivate Redis
+
+        OAuth --> API: 返回新Token
+    end
+    deactivate OAuth
+
+    API -> HTTP: SetAuthToken(token)
+    activate HTTP
+    HTTP --> API: OK
+    deactivate HTTP
+
+else 认证类型: Basic Auth
+    API -> HTTP: SetBasicAuth(username, password)
+    activate HTTP
+    HTTP --> API: OK
+    deactivate HTTP
+
+else 无需认证
+    note over API: 跳过认证步骤
+end
+
+== 数据采集阶段 ==
+
+alt 启用分页
+    API -> Pagination: CollectWithPagination(config)
+    activate Pagination
+
+    Pagination -> Pagination: 初始化:\npage=1, allData=[]
+
+    loop 直到无更多数据或达到最大页数
+        note over Pagination
+          分页参数可能是:
+          - page/size模式
+          - offset/limit模式
+          - cursor模式
+        end note
+
+        Pagination -> HTTP: GET/POST请求\n+ 分页参数(page, size)
+        activate HTTP
+
+        HTTP -> HTTP: 构造请求参数
+        HTTP -> HTTP: 添加认证头
+        HTTP -> HTTP: 添加自定义Headers
+
+        HTTP -> TargetAPI: HTTP请求
+        activate TargetAPI
+
+        alt 请求成功
+            TargetAPI --> HTTP: 200 OK\n{data: [...], pagination: {...}}
+            deactivate TargetAPI
+
+            HTTP --> Pagination: 响应数据
+            deactivate HTTP
+
+            Pagination -> JSONPath: Extract(response, dataPath)
+            activate JSONPath
+
+            note right
+              使用JSONPath提取数据:
+              例如: "data.items"
+              gjson.Get(json, "data.items")
+            end note
+
+            JSONPath -> JSONPath: 解析JSON
+            JSONPath -> JSONPath: 应用JSONPath表达式
+            JSONPath --> Pagination: 提取的数据数组
+            deactivate JSONPath
+
+            Pagination -> Pagination: 追加到allData
+            Pagination -> Pagination: 判断是否有更多数据
+
+            alt 响应中包含hasMore字段
+                Pagination -> Pagination: hasMore = response.pagination.hasMore
+            else 通过数据量判断
+                Pagination -> Pagination: hasMore = len(data) >= pageSize
+            end
+
+            Pagination -> Pagination: page++
+
+        else 请求失败
+            HTTP --> Pagination: 错误信息
+            deactivate HTTP
+
+            alt 可重试(5xx, 超时等)
+                Pagination -> Pagination: 等待(指数退避)
+                note right
+                  重试策略:
+                  - 首次: 等待1秒
+                  - 第二次: 等待2秒
+                  - 第三次: 等待4秒
+                  - 最多重试3次
+                end note
+                Pagination -> HTTP: 重试请求
+            else 不可重试(4xx, 认证失败等)
+                Pagination --> API: 返回错误
+            end
+        end
+    end
+
+    Pagination --> API: 所有页面数据
+    deactivate Pagination
+
+else 不分页
+    API -> HTTP: SendRequest(method, url, params, headers)
+    activate HTTP
+    HTTP -> TargetAPI: HTTP请求
+    activate TargetAPI
+    TargetAPI --> HTTP: 响应数据
+    deactivate TargetAPI
+    HTTP --> API: 响应数据
+    deactivate HTTP
+
+    API -> JSONPath: Extract(response, dataPath)
+    activate JSONPath
+    JSONPath --> API: 提取的数据
+    deactivate JSONPath
+end
+
+== 数据处理阶段 ==
+
+API -> API: 格式化数据
+
+alt 响应格式为JSON
+    API -> API: 保持JSON格式
+else 响应格式为XML
+    API -> API: XML转JSON
+else 响应格式为CSV
+    API -> API: CSV转JSON
+end
+
+API -> API: 添加元数据\n(采集时间、来源URL、请求参数)
+
+API -> API: 构造RawData对象\n{Data, Format, Metadata}
+
+== 返回结果 ==
+
+API --> Worker: RawData
+deactivate API
+
+Worker -> Worker: 进入数据处理流程
+deactivate Worker
+
+== 异常处理 ==
+
+note over Worker, TargetAPI
+  可能的异常情况:
+  1. 认证失败(401) → 重新获取Token
+  2. 请求限流(429) → 等待后重试
+  3. 服务不可用(5xx) → 指数退避重试
+  4. 网络超时 → 重试或标记失败
+  5. 分页参数错误 → 调整参数重试
+  6. JSONPath提取失败 → 记录日志并返回空数据
+end note
+
+@enduml

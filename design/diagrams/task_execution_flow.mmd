@@ -1,0 +1,53 @@
+sequenceDiagram
+    participant User as 用户
+    participant WebUI as Web界面
+    participant TaskMgr as 任务管理器
+    participant Scheduler as 调度器
+    participant Collector as 采集器
+    participant Parser as 解析器
+    participant Storage as 存储器
+    participant Monitor as 监控器
+    participant Alert as 告警系统
+    
+    User->>WebUI: 创建采集任务
+    WebUI->>TaskMgr: 提交任务配置
+    TaskMgr->>TaskMgr: 验证配置
+    TaskMgr->>Scheduler: 注册任务
+    Scheduler-->>WebUI: 任务创建成功
+    WebUI-->>User: 显示任务信息
+    
+    Note over Scheduler: 等待触发时间
+    
+    Scheduler->>Collector: 触发任务执行
+    Collector->>Monitor: 记录任务开始
+    
+    alt 网页采集
+        Collector->>Collector: 发送HTTP请求
+        Collector->>Parser: 传递HTML内容
+    else 数据库采集
+        Collector->>Collector: 执行SQL查询
+        Collector->>Parser: 传递查询结果
+    end
+    
+    Parser->>Parser: 解析数据
+    Parser->>Parser: 数据清洗
+    Parser->>Storage: 传递处理后数据
+    
+    alt 存储成功
+        Storage->>Storage: 写入数据库/文件
+        Storage-->>Monitor: 报告成功
+        Monitor->>Monitor: 更新统计信息
+        Monitor-->>Scheduler: 任务完成
+    else 存储失败
+        Storage-->>Monitor: 报告失败
+        Monitor->>Alert: 发送告警
+        Alert-->>User: 邮件/短信通知
+        Monitor->>Scheduler: 请求重试
+        Scheduler->>Collector: 重新执行任务
+    end
+    
+    User->>WebUI: 查看任务状态
+    WebUI->>Monitor: 获取任务信息
+    Monitor-->>WebUI: 返回执行结果
+    WebUI-->>User: 显示任务详情
+

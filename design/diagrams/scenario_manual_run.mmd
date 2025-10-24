@@ -1,0 +1,37 @@
+flowchart TD
+    Start([用户需要手动执行任务]) --> TaskList[进入任务列表]
+    TaskList --> SelectTask[选择要执行的任务]
+    SelectTask --> TaskDetail[进入任务详情页]
+    
+    TaskDetail --> ClickRun[点击立即执行按钮]
+    ClickRun --> Confirm[系统弹出确认对话框]
+    Confirm --> UserConfirm{用户确认?}
+    
+    UserConfirm -->|取消| TaskDetail
+    UserConfirm -->|确认| SubmitRun[提交执行请求]
+    
+    SubmitRun --> CreateRun[系统创建任务执行实例]
+    CreateRun --> RunPage[跳转到执行详情页]
+    
+    RunPage --> ShowProgress[显示执行进度]
+    ShowProgress --> ShowLog[实时显示日志]
+    
+    ShowLog --> Running{任务状态}
+    Running -->|运行中| WaitUpdate[等待状态更新]
+    WaitUpdate --> ShowLog
+    
+    Running -->|成功| ShowSuccess[显示成功信息<br/>执行耗时/数据量]
+    Running -->|失败| ShowError[显示失败信息<br/>错误原因]
+    
+    ShowSuccess --> ViewData[查看采集数据]
+    ShowError --> ViewErrorLog[查看错误日志]
+    
+    ViewData --> Export{需要导出?}
+    Export -->|是| ExportData[导出为CSV/Excel]
+    Export -->|否| End([完成])
+    ExportData --> End
+    
+    ViewErrorLog --> Retry{需要重试?}
+    Retry -->|是| ClickRun
+    Retry -->|否| End
+

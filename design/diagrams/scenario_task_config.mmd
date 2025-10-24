@@ -1,0 +1,50 @@
+flowchart TD
+    Start([开始创建任务]) --> TaskMgmt[进入任务管理页面]
+    TaskMgmt --> NewTask[点击新建任务]
+    
+    NewTask --> FillBasic[填写任务基本信息<br/>名称/描述/类型]
+    FillBasic --> SelectDS[选择数据源]
+    SelectDS --> DSList[从已配置数据源列表中选择]
+    
+    DSList --> ConfigSchedule[配置调度策略]
+    ConfigSchedule --> ScheduleType{选择调度类型}
+    
+    ScheduleType -->|定时调度| CronConfig[配置Cron表达式]
+    ScheduleType -->|周期性| IntervalConfig[配置执行间隔]
+    ScheduleType -->|手动触发| ManualConfig[无需配置调度]
+    
+    CronConfig --> CronUI[使用可视化界面<br/>配置分/时/日/月/周]
+    CronUI --> PreviewCron[预览执行时间<br/>显示下次执行时间]
+    PreviewCron --> ConfigParams[配置任务参数]
+    
+    IntervalConfig --> SetInterval[设置间隔时间<br/>秒/分钟/小时]
+    SetInterval --> ConfigParams
+    
+    ManualConfig --> ConfigParams
+    
+    ConfigParams --> HasParams{数据源有变量?}
+    HasParams -->|是| SetParams[设置变量值<br/>如date=today]
+    HasParams -->|否| ConfigRetry[配置重试策略]
+    SetParams --> ConfigRetry
+    
+    ConfigRetry --> EnableRetry{启用失败重试?}
+    EnableRetry -->|是| SetRetry[设置最大重试次数<br/>重试间隔/重试策略]
+    EnableRetry -->|否| ConfigAlert[配置告警通知]
+    SetRetry --> ConfigAlert
+    
+    ConfigAlert --> EnableAlert{启用告警?}
+    EnableAlert -->|是| SetAlert[选择通知方式<br/>邮件/短信/钉钉<br/>设置接收人]
+    EnableAlert -->|否| Review[预览任务配置]
+    SetAlert --> Review
+    
+    Review --> Confirm{确认配置正确?}
+    Confirm -->|否| BackEdit[返回修改]
+    BackEdit --> FillBasic
+    
+    Confirm -->|是| SaveTask[保存任务]
+    SaveTask --> StartNow{立即启动任务?}
+    
+    StartNow -->|是| StartTask[启动任务]
+    StartNow -->|否| End([任务创建完成])
+    StartTask --> End
+

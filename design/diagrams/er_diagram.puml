@@ -1,0 +1,194 @@
+@startuml
+!define Table(name,desc) class name as "desc" << (T,#FFAAAA) >>
+!define primary_key(x) <b><u>x</u></b>
+!define foreign_key(x) <i>x</i>
+!define unique(x) <color:green>x</color>
+
+title DataFusion 数据库ER图
+
+Table(users, "用户表 - users") {
+  primary_key(id): UUID
+  unique(username): VARCHAR(50)
+  unique(email): VARCHAR(100)
+  password_hash: VARCHAR(255)
+  role: VARCHAR(20)
+  auth_source: VARCHAR(100)
+  permissions: JSONB
+  status: VARCHAR(20)
+  last_login_at: TIMESTAMP
+  created_at: TIMESTAMP
+  updated_at: TIMESTAMP
+}
+
+note right of users
+  **auth_source字段说明:**
+  - 'local': 本地用户(用户名密码)
+  - 'oauth_企业统一认证平台': OAuth第三方
+  - 'oauth_企业微信': 企业微信OAuth
+  - 'oauth_钉钉': 钉钉OAuth
+  - 'ldap_公司LDAP': LDAP目录服务
+
+  **role字段(5种角色):**
+  - admin: 系统管理员
+  - data_analyst: 数据分析师
+  - algorithm_engineer: 算法工程师
+  - business_operator: 业务运营(第三方用户默认)
+  - developer: 开发工程师
+
+  **注意:** auth_source != 'local'时, password_hash可为NULL
+end note
+
+Table(oauth_providers, "OAuth提供商表 - oauth_providers") {
+  primary_key(id): UUID
+  name: VARCHAR(100)
+  provider_type: VARCHAR(50)
+  client_id: VARCHAR(255)
+  client_secret: VARCHAR(255)
+  authorization_url: VARCHAR(500)
+  token_url: VARCHAR(500)
+  user_info_url: VARCHAR(500)
+  scopes: VARCHAR(200)
+  enabled: BOOLEAN
+  foreign_key(created_by): UUID
+  created_at: TIMESTAMP
+  updated_at: TIMESTAMP
+}
+
+note right of oauth_providers
+  **provider_type字段:**
+  - 'custom': 企业自建OAuth
+  - 'wework': 企业微信
+  - 'dingtalk': 钉钉
+  - 'ldap': LDAP目录服务
+
+  **配置示例:**
+  - name: "公司统一认证平台"
+  - client_id: OAuth应用ID
+  - client_secret: OAuth应用密钥
+  - scopes: "openid profile email"
+end note
+
+Table(data_sources, "数据源表 - data_sources") {
+  primary_key(id): UUID
+  name: VARCHAR(100)
+  type: VARCHAR(50)
+  config: JSONB
+  foreign_key(created_by): UUID
+  created_at: TIMESTAMP
+  updated_at: TIMESTAMP
+}
+
+Table(tasks, "任务表 - tasks") {
+  primary_key(id): UUID
+  name: VARCHAR(200)
+  description: TEXT
+  type: VARCHAR(50)
+  status: VARCHAR(20)
+  config: JSONB
+  foreign_key(data_source_id): UUID
+  foreign_key(created_by): UUID
+  created_at: TIMESTAMP
+  updated_at: TIMESTAMP
+}
+
+Table(task_schedules, "任务调度表 - task_schedules") {
+  primary_key(id): UUID
+  foreign_key(task_id): UUID
+  schedule_type: VARCHAR(20)
+  cron_expr: VARCHAR(100)
+  interval_seconds: INT
+  next_run_time: TIMESTAMP
+  last_run_time: TIMESTAMP
+  created_at: TIMESTAMP
+  updated_at: TIMESTAMP
+}
+
+Table(task_runs, "任务执行记录表 - task_runs") {
+  primary_key(id): UUID
+  foreign_key(task_id): UUID
+  status: VARCHAR(20)
+  start_time: TIMESTAMP
+  end_time: TIMESTAMP
+  data_count: INT
+  error_msg: TEXT
+  foreign_key(worker_id): UUID
+  retry_count: INT
+  created_at: TIMESTAMP
+}
+
+Table(task_logs, "任务日志表 - task_logs") {
+  primary_key(id): BIGSERIAL
+  foreign_key(task_run_id): UUID
+  level: VARCHAR(10)
+  message: TEXT
+  context: JSONB
+  created_at: TIMESTAMP
+}
+
+Table(workers, "Worker节点表 - workers") {
+  primary_key(id): UUID
+  hostname: VARCHAR(100)
+  ip_address: VARCHAR(50)
+  status: VARCHAR(20)
+  capacity: INT
+  current_load: INT
+  last_heartbeat: TIMESTAMP
+  created_at: TIMESTAMP
+  updated_at: TIMESTAMP
+}
+
+Table(alert_rules, "告警规则表 - alert_rules") {
+  primary_key(id): UUID
+  name: VARCHAR(100)
+  type: VARCHAR(50)
+  condition: JSONB
+  notification_config: JSONB
+  enabled: BOOLEAN
+  foreign_key(created_by): UUID
+  created_at: TIMESTAMP
+  updated_at: TIMESTAMP
+}
+
+Table(alert_records, "告警记录表 - alert_records") {
+  primary_key(id): UUID
+  foreign_key(rule_id): UUID
+  foreign_key(task_id): UUID
+  foreign_key(task_run_id): UUID
+  level: VARCHAR(20)
+  message: TEXT
+  status: VARCHAR(20)
+  notified_at: TIMESTAMP
+  created_at: TIMESTAMP
+}
+
+Table(api_keys, "API密钥表 - api_keys") {
+  primary_key(id): UUID
+  unique(key_value): VARCHAR(64)
+  name: VARCHAR(100)
+  foreign_key(user_id): UUID
+  permissions: JSONB
+  expires_at: TIMESTAMP
+  last_used_at: TIMESTAMP
+  created_at: TIMESTAMP
+}
+
+' 关系定义
+users "1" -- "0..*" oauth_providers : creates
+users "1" -- "0..*" data_sources : creates
+users "1" -- "0..*" tasks : creates
+users "1" -- "0..*" alert_rules : creates
+users "1" -- "0..*" api_keys : owns
+
+data_sources "1" -- "0..*" tasks : used_by
+
+tasks "1" -- "1" task_schedules : has
+tasks "1" -- "0..*" task_runs : executes
+tasks "1" -- "0..*" alert_records : triggers
+
+task_runs "1" -- "0..*" task_logs : generates
+task_runs "0..*" -- "1" workers : executed_by
+
+alert_rules "1" -- "0..*" alert_records : generates
+
+@enduml
+

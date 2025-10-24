@@ -1,0 +1,64 @@
+graph TD
+    Start([用户开始]) --> Login[用户登录系统]
+    Login --> Dashboard[进入控制台]
+    Dashboard --> Choice{选择操作}
+    
+    Choice -->|创建任务| CreateTask[创建采集任务]
+    Choice -->|查看任务| ViewTask[查看任务列表]
+    Choice -->|配置数据源| ConfigDS[配置数据源]
+    Choice -->|查看监控| Monitor[查看监控面板]
+    
+    CreateTask --> SelectType{选择数据源类型}
+    SelectType -->|网页采集| WebConfig[配置网页采集规则]
+    SelectType -->|数据库采集| DBConfig[配置数据库连接]
+    
+    WebConfig --> SetRule[设置解析规则]
+    DBConfig --> SetQuery[设置查询语句]
+    
+    SetRule --> SetSchedule[设置调度策略]
+    SetQuery --> SetSchedule
+    
+    SetSchedule --> SetStorage[配置存储方式]
+    SetStorage --> SaveTask[保存任务]
+    SaveTask --> ExecuteChoice{是否立即执行}
+    
+    ExecuteChoice -->|是| RunTask[执行任务]
+    ExecuteChoice -->|否| Dashboard
+    
+    RunTask --> TaskMonitor[监控任务执行]
+    TaskMonitor --> TaskResult{任务执行结果}
+    
+    TaskResult -->|成功| ViewData[查看采集数据]
+    TaskResult -->|失败| ViewLog[查看错误日志]
+    TaskResult -->|运行中| TaskMonitor
+    
+    ViewData --> Dashboard
+    ViewLog --> FixTask{是否修改任务}
+    FixTask -->|是| CreateTask
+    FixTask -->|否| Dashboard
+    
+    ViewTask --> TaskList[显示任务列表]
+    TaskList --> TaskOp{任务操作}
+    TaskOp -->|编辑| CreateTask
+    TaskOp -->|删除| DeleteTask[删除任务]
+    TaskOp -->|启动| RunTask
+    TaskOp -->|停止| StopTask[停止任务]
+    TaskOp -->|查看详情| TaskDetail[查看任务详情]
+    
+    DeleteTask --> Dashboard
+    StopTask --> Dashboard
+    TaskDetail --> Dashboard
+    
+    ConfigDS --> DSForm[填写数据源信息]
+    DSForm --> TestConn[测试连接]
+    TestConn --> ConnResult{连接测试结果}
+    ConnResult -->|成功| SaveDS[保存数据源]
+    ConnResult -->|失败| DSForm
+    SaveDS --> Dashboard
+    
+    Monitor --> MonitorView[查看监控指标]
+    MonitorView --> AlertCheck{是否有告警}
+    AlertCheck -->|有| HandleAlert[处理告警]
+    AlertCheck -->|无| Dashboard
+    HandleAlert --> Dashboard
+

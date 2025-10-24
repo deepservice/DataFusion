@@ -1,0 +1,175 @@
+@startuml system_architecture
+!define RECTANGLE class
+
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+package "用户层" {
+  [Web浏览器] as Browser
+  [第三方应用] as ThirdParty
+  [命令行工具] as CLI
+}
+
+package "接入层" {
+  [Nginx负载均衡] as Nginx
+}
+
+package "前端层" {
+  [Web UI\n(Vue.js静态资源)] as WebUI
+}
+
+package "应用服务层" {
+  [API网关\n(认证/鉴权/路由)] as APIGateway
+
+  package "Master节点集群" {
+    package "Master-1" {
+      [任务管理服务] as TaskMgr
+      [调度引擎] as Scheduler
+      [监控告警服务] as Monitor
+      [配置管理服务] as ConfigMgr
+    }
+
+    package "Master-2/3/N..." as MasterOthers {
+      note as MasterNote
+        其他Master节点
+        结构与Master-1相同
+        通过etcd实现高可用
+      end note
+    }
+  }
+}
+
+package "Worker节点集群" {
+  package "Worker-1" {
+    [采集器] as Collector
+    [处理器] as Processor
+    [存储器] as Storage
+  }
+
+  package "Worker-2/3/N..." as WorkerOthers {
+    note as WorkerNote
+      其他Worker节点
+      结构与Worker-1相同
+      可动态扩缩容
+    end note
+  }
+}
+
+package "基础设施层" {
+  database "PostgreSQL\n(主从)" as PG
+  database "Redis\n(集群)" as Redis
+  queue "RabbitMQ\n(集群)" as MQ
+  [etcd\n(集群)] as Etcd
+
+  package "日志体系" {
+    [ELK Stack] as ELK
+    [Kibana\n(日志查询)] as Kibana
+  }
+
+  package "监控体系" {
+    [Prometheus] as Prom
+    [Grafana\n(指标可视化)] as Graf
+  }
+}
+
+package "存储层" {
+  database "目标数据库" as TargetDB
+  folder "文件存储" as FileStorage
+}
+
+package "外部数据源" #FFCDD2{
+  cloud "目标网站" as WebSite 
+  database "外部数据库" as ExtDB 
+}
+
+Browser --> Nginx : HTTPS请求
+ThirdParty --> Nginx : API调用
+CLI --> Nginx : CLI命令
+
+Nginx --> WebUI : 静态资源
+Nginx --> APIGateway : /api/*
+
+note right of WebUI
+  Web UI是Vue.js前端应用
+  静态资源通过Nginx托管
+  浏览器加载后通过AJAX
+  调用API网关的RESTful API
+end note
+
+Browser -[#blue]-> APIGateway : AJAX调用\n/api/v1/*
+WebUI -[hidden]-> APIGateway
+
+APIGateway --> TaskMgr : 负载均衡
+APIGateway --> ConfigMgr : 负载均衡
+APIGateway --> Monitor : 负载均衡
+
+note left of APIGateway
+  <b>API网关职责:</b>
+  • JWT/API Key认证
+  • RBAC权限校验
+  • OAuth/LDAP集成
+  • 请求路由与负载均衡
+  • 全局限流控制
+end note
+
+TaskMgr --> PG
+TaskMgr --> Scheduler
+Scheduler --> MQ
+Scheduler --> Redis
+
+MQ --> Collector
+
+Collector --> WebSite
+Collector --> ExtDB
+Collector --> Processor
+Processor --> Storage
+Storage --> TargetDB
+Storage --> FileStorage
+
+' === 服务注册与发现 ===
+TaskMgr --> Etcd
+Collector --> Etcd
+
+' === 日志上报到ELK ===
+TaskMgr --> ELK
+Scheduler --> ELK
+Collector --> ELK
+
+' === ELK日志分析与告警 ===
+ELK --> Kibana
+ELK -[#red]-> Monitor
+
+' === 指标上报到Prometheus ===
+TaskMgr --> Prom
+Scheduler --> Prom
+Collector --> Prom
+
+' === Prometheus指标采集与告警 ===
+Prom --> Graf
+Prom -[#red]-> Monitor
+
+note right of ELK
+  <b>日志数据流向:</b>
+  • 各服务上报日志到ELK
+  • Kibana提供日志查询界面
+  • Monitor从ELK检测日志异常
+end note
+
+note right of Prom
+  <b>监控数据流向:</b>
+  • 各服务上报指标到Prometheus
+  • Grafana从Prometheus读取并可视化
+  • Monitor从Prometheus评估告警规则
+end note
+
+note bottom of Monitor
+  <b>监控告警服务:</b>
+  • 从Prometheus获取指标数据
+  • 从ELK检测日志异常
+  • 从PostgreSQL读取告警规则
+  • 触发告警通知
+    (邮件/短信/钉钉/企业微信)
+end note
+
+@enduml
+

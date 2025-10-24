@@ -1,0 +1,71 @@
+@startuml
+title 任务创建时序图
+
+actor 用户 as User
+participant "Web UI" as UI
+participant "API Gateway" as API
+participant "认证服务" as Auth
+participant "任务管理器" as TaskMgr
+database "PostgreSQL" as DB
+participant "调度引擎" as Scheduler
+participant "Redis" as Cache
+participant "etcd" as Etcd
+
+User -> UI: 填写任务配置信息
+activate UI
+
+UI -> UI: 前端验证
+UI -> API: POST /api/v1/tasks\n{task_config}
+activate API
+
+API -> Auth: 验证Token
+activate Auth
+Auth -> Auth: 解析JWT
+Auth --> API: 返回用户信息
+deactivate Auth
+
+API -> TaskMgr: CreateTask(task_config, user_id)
+activate TaskMgr
+
+TaskMgr -> TaskMgr: 验证配置参数
+TaskMgr -> TaskMgr: 生成任务ID
+
+TaskMgr -> DB: INSERT INTO tasks\nVALUES (...)
+activate DB
+DB --> TaskMgr: 插入成功
+deactivate DB
+
+TaskMgr -> DB: INSERT INTO task_schedules\nVALUES (...)
+activate DB
+DB --> TaskMgr: 插入成功
+deactivate DB
+
+TaskMgr -> Scheduler: RegisterTask(task_id, schedule)
+activate Scheduler
+
+Scheduler -> Scheduler: 解析Cron表达式
+Scheduler -> Scheduler: 添加到调度队列
+Scheduler -> Cache: SET task:{task_id}:status = "active"
+activate Cache
+Cache --> Scheduler: OK
+deactivate Cache
+
+Scheduler -> Etcd: PUT /tasks/{task_id}
+activate Etcd
+Etcd --> Scheduler: OK
+deactivate Etcd
+
+Scheduler --> TaskMgr: 注册成功
+deactivate Scheduler
+
+TaskMgr --> API: 返回任务信息\n{task_id, status, ...}
+deactivate TaskMgr
+
+API --> UI: HTTP 201 Created\n{task_id, ...}
+deactivate API
+
+UI --> User: 显示创建成功
+deactivate UI
+
+@enduml
+

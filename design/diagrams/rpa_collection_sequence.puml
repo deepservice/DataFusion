@@ -1,0 +1,186 @@
+@startuml
+title RPA采集流程时序图
+
+skinparam sequence {
+    ArrowColor DeepSkyBlue
+    ActorBorderColor DeepSkyBlue
+    LifeLineBorderColor blue
+    LifeLineBackgroundColor #A9DCDF
+
+    ParticipantBorderColor DeepSkyBlue
+    ParticipantBackgroundColor DodgerBlue
+    ParticipantFontColor #FFFFFF
+
+    ActorBackgroundColor aqua
+    ActorFontColor DeepSkyBlue
+
+    BoxBackgroundColor #EEEEEE
+}
+
+participant "Worker节点" as Worker
+participant "RPACollector" as RPA
+participant "浏览器池\nBrowserPool" as Pool
+participant "Playwright\n浏览器引擎" as Browser
+participant "ScriptEngine\n脚本引擎" as Script
+participant "目标网页" as WebPage
+
+== 初始化阶段 ==
+
+Worker -> RPA: Collect(task)
+activate Worker
+activate RPA
+
+RPA -> RPA: 解析RPA配置\n(浏览器类型、超时、代理等)
+
+RPA -> Pool: Acquire(context, timeout)
+activate Pool
+note right
+  从浏览器池获取可用实例
+  如池已满则等待或创建新实例
+end note
+
+Pool -> Browser: 创建/获取浏览器实例
+activate Browser
+Browser --> Pool: Browser实例
+Pool --> RPA: Browser实例
+deactivate Pool
+
+== 页面配置阶段 ==
+
+RPA -> Browser: NewPage()
+Browser -> Browser: 创建新页面
+Browser --> RPA: Page对象
+activate Browser
+
+RPA -> Browser: SetViewport(width, height)
+Browser --> RPA: OK
+
+RPA -> Browser: SetUserAgent(ua)
+Browser --> RPA: OK
+
+alt 配置了代理
+    RPA -> Browser: SetProxy(server, username, password)
+    Browser --> RPA: OK
+end
+
+RPA -> Browser: SetTimeout(pageLoadTimeout)
+Browser --> RPA: OK
+
+== 页面导航阶段 ==
+
+RPA -> Browser: Goto(url, waitStrategy)
+activate Browser
+note right
+  等待策略可选:
+  - load: 等待页面完全加载
+  - domcontentloaded: DOM就绪
+  - networkidle: 网络空闲
+end note
+
+Browser -> WebPage: HTTP GET请求
+activate WebPage
+WebPage --> Browser: HTML响应
+deactivate WebPage
+
+Browser -> Browser: 执行JavaScript
+Browser -> Browser: 渲染页面
+Browser -> Browser: 等待指定事件
+
+Browser --> RPA: 导航完成
+deactivate Browser
+
+== 自定义脚本执行阶段 ==
+
+alt 配置了自定义脚本
+    RPA -> Script: Execute(page, customScript)
+    activate Script
+
+    note over Script
+      脚本可能包含:
+      - 登录操作: page.type(), page.click()
+      - 滚动加载: window.scrollTo()
+      - 等待元素: page.waitForSelector()
+      - 触发AJAX请求等
+    end note
+
+    Script -> Browser: 执行JavaScript代码
+    activate Browser
+
+    alt 登录操作
+        Browser -> Browser: page.type('#username', user)
+        Browser -> Browser: page.type('#password', pass)
+        Browser -> Browser: page.click('#login-btn')
+        Browser -> Browser: waitForNavigation()
+    end
+
+    alt 滚动加载
+        Browser -> Browser: autoScroll()
+        Browser -> Browser: wait(2000ms)
+    end
+
+    Browser --> Script: 执行成功
+    deactivate Browser
+    Script --> RPA: OK
+    deactivate Script
+else 无自定义脚本
+    note over RPA: 跳过脚本执行
+end
+
+== 数据提取阶段 ==
+
+RPA -> Browser: Content()
+activate Browser
+note right
+  获取完整的HTML内容
+  包含动态加载的元素
+end note
+
+Browser -> Browser: 序列化DOM树
+Browser --> RPA: HTML字符串
+deactivate Browser
+
+alt 需要截图调试
+    RPA -> Browser: Screenshot()
+    activate Browser
+    Browser --> RPA: 截图文件
+    deactivate Browser
+end
+
+== 资源清理阶段 ==
+
+RPA -> Browser: Close()
+activate Browser
+Browser -> Browser: 关闭页面
+Browser -> Browser: 释放资源
+Browser --> RPA: OK
+deactivate Browser
+
+RPA -> Pool: Release(browser)
+activate Pool
+note right
+  归还浏览器实例到池中
+  供后续任务复用
+end note
+Pool --> RPA: OK
+deactivate Pool
+
+== 返回结果 ==
+
+RPA -> RPA: 构造RawData对象\n{HTML, URL, Metadata}
+
+RPA --> Worker: RawData
+deactivate RPA
+Worker -> Worker: 进入数据处理流程
+deactivate Worker
+
+== 异常处理 ==
+
+note over Worker, WebPage
+  可能的异常情况:
+  1. 页面加载超时 → 重试或标记失败
+  2. 脚本执行错误 → 记录日志并跳过
+  3. 浏览器崩溃 → 重启浏览器实例
+  4. 目标网站不可达 → 等待后重试
+end note
+
+@enduml

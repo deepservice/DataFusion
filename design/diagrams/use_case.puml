@@ -1,0 +1,62 @@
+@startuml
+left to right direction
+skinparam packageStyle rectangle
+
+actor "数据分析师" as Analyst
+actor "系统管理员" as Admin
+actor "业务运营" as Operator
+actor "算法工程师" as Engineer
+
+rectangle DataFusion系统 {
+  usecase "创建采集任务" as UC1
+  usecase "配置数据源" as UC2
+  usecase "设置调度策略" as UC3
+  usecase "执行任务" as UC4
+  usecase "查看任务状态" as UC5
+  usecase "查看采集数据" as UC6
+  usecase "配置告警规则" as UC7
+  usecase "查看监控面板" as UC8
+  usecase "管理用户权限" as UC9
+  usecase "系统配置管理" as UC10
+  usecase "查看日志" as UC11
+  usecase "数据质量检查" as UC12
+  usecase "API调用" as UC13
+  usecase "导出数据" as UC14
+  usecase "任务调试" as UC15
+}
+
+Analyst --> UC1
+Analyst --> UC2
+Analyst --> UC3
+Analyst --> UC4
+Analyst --> UC5
+Analyst --> UC6
+Analyst --> UC14
+
+Operator --> UC1
+Operator --> UC4
+Operator --> UC5
+Operator --> UC6
+Operator --> UC14
+
+Engineer --> UC1
+Engineer --> UC4
+Engineer --> UC6
+Engineer --> UC13
+Engineer --> UC14
+
+Admin --> UC7
+Admin --> UC8
+Admin --> UC9
+Admin --> UC10
+Admin --> UC11
+Admin --> UC15
+
+UC1 ..> UC2 : <<include>>
+UC1 ..> UC3 : <<include>>
+UC4 ..> UC12 : <<include>>
+UC8 ..> UC5 : <<include>>
+UC15 ..> UC11 : <<include>>
+
+@enduml
+

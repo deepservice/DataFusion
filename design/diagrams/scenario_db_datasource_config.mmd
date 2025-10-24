@@ -1,0 +1,42 @@
+flowchart TD
+    Start([开始配置数据库数据源]) --> SelectDB[选择数据库类型<br/>MySQL/PostgreSQL/MongoDB]
+    SelectDB --> FillConn[填写连接信息]
+    
+    FillConn --> ConnInfo[输入主机地址<br/>端口/数据库名<br/>用户名/密码]
+    ConnInfo --> TestConn[点击测试连接]
+    TestConn --> Connecting[系统尝试连接数据库]
+    
+    Connecting --> ConnResult{连接成功?}
+    ConnResult -->|失败| ShowError[显示错误信息<br/>连接超时/认证失败等]
+    ShowError --> FixConn{修改配置}
+    FixConn --> ConnInfo
+    
+    ConnResult -->|成功| ConfigQuery[配置查询语句]
+    ConfigQuery --> WriteSQL["编写SQL查询<br/>支持变量如date"]
+    WriteSQL --> TestQuery[执行查询测试]
+    
+    TestQuery --> QueryResult{查询成功?}
+    QueryResult -->|失败| ShowSQLError[显示SQL错误]
+    ShowSQLError --> WriteSQL
+    
+    QueryResult -->|成功| PreviewData[预览查询结果<br/>显示前10条数据]
+    PreviewData --> ConfigMapping[配置字段映射]
+    
+    ConfigMapping --> MapFields[将源字段映射到目标字段]
+    MapFields --> TypeConvert[配置数据类型转换]
+    TypeConvert --> Incremental{需要增量同步?}
+    
+    Incremental -->|是| SetIncrement[设置增量字段<br/>如时间戳字段]
+    Incremental -->|否| ConfigStorage[配置存储目标]
+    SetIncrement --> ConfigStorage
+    
+    ConfigStorage --> SelectTarget[选择目标数据库和表]
+    SelectTarget --> TestWrite[测试写入]
+    
+    TestWrite --> WriteResult{写入成功?}
+    WriteResult -->|失败| ShowWriteError[显示写入错误]
+    ShowWriteError --> SelectTarget
+    
+    WriteResult -->|成功| SaveConfig[保存数据源配置]
+    SaveConfig --> End([配置完成])
+

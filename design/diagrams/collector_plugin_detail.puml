@@ -1,0 +1,216 @@
+@startuml
+title 采集器插件详细架构图
+
+skinparam class {
+    BackgroundColor<<Interface>> #E3F2FD
+    BackgroundColor<<Abstract>> #FFF3E0
+    BackgroundColor<<Concrete>> #E8F5E9
+    BorderColor<<Interface>> #1976D2
+    BorderColor<<Abstract>> #F57C00
+    BorderColor<<Concrete>> #388E3C
+}
+
+package "插件核心接口" {
+    interface Collector <<Interface>> {
+        +Name() string
+        +Version() string
+        +ValidateConfig(config map[string]interface{}) error
+        +Collect(task *Task) (*RawData, error)
+        +HealthCheck() error
+    }
+
+    note right of Collector
+      所有采集器必须实现此接口
+      通过插件注册机制动态加载
+    end note
+}
+
+package "插件注册与管理" {
+    class CollectorRegistry {
+        -collectors map[string]Collector
+        -mu sync.RWMutex
+        --
+        +Register(name string, collector Collector) error
+        +Unregister(name string) error
+        +Get(name string) (Collector, error)
+        +List() []string
+        +GetAll() map[string]Collector
+    }
+
+    class PluginLoader {
+        -pluginDir string
+        -registry *CollectorRegistry
+        --
+        +LoadPlugins() error
+        +LoadPlugin(path string) error
+        +ReloadPlugin(name string) error
+        +WatchPluginDir() error
+    }
+
+    note bottom of PluginLoader
+      支持热加载机制:
+      - 监听plugins目录
+      - 自动加载新插件
+      - 支持插件热更新
+    end note
+}
+
+package "内置采集器实现" {
+    class RPACollector <<Concrete>> {
+        -browserPool *BrowserPool
+        -scriptEngine *ScriptEngine
+        -config *RPAConfig
+        --
+        +Name() string
+        +Collect(task *Task) (*RawData, error)
+        -setupPage(page *Page, config *RPAConfig) error
+        -executeScript(page *Page, script string) error
+    }
+
+    class APICollector <<Concrete>> {
+        -httpClient *resty.Client
+        -authManager *AuthManager
+        -paginationEngine *PaginationEngine
+        --
+        +Name() string
+        +Collect(task *Task) (*RawData, error)
+        -authenticate(config *AuthConfig) error
+        -fetchWithPagination(config *PaginationConfig) ([]*RawData, error)
+    }
+
+    class DatabaseCollector <<Concrete>> {
+        -connPool *sql.DBPool
+        -queryBuilder *QueryBuilder
+        --
+        +Name() string
+        +Collect(task *Task) (*RawData, error)
+        -connect(dsn string) error
+        -executeQuery(query string, params []interface{}) (*sql.Rows, error)
+    }
+}
+
+package "辅助组件" {
+    class BrowserPool {
+        -browsers []*Browser
+        -maxSize int
+        -idleTimeout time.Duration
+        --
+        +Acquire(ctx context.Context) (*Browser, error)
+        +Release(browser *Browser)
+        +Size() int
+        +Close() error
+    }
+
+    class ScriptEngine {
+        -vm *goja.Runtime
+        -sandbox *Sandbox
+        --
+        +Execute(page *Page, script string) error
+        +ValidateScript(script string) error
+    }
+
+    class AuthManager {
+        -tokenCache *cache.Cache
+        --
+        +GetToken(config *AuthConfig) (string, error)
+        +RefreshToken(refreshToken string) (string, error)
+        +InvalidateToken(key string)
+    }
+
+    class PaginationEngine {
+        -strategy PaginationStrategy
+        --
+        +FetchAllPages(config *PaginationConfig) ([]*RawData, error)
+        -detectHasMore(response *Response) bool
+    }
+}
+
+package "配置模型" {
+    class Task {
+        +ID string
+        +Name string
+        +CollectorType string
+        +Config map[string]interface{}
+        +Schedule *Schedule
+    }
+
+    class RPAConfig {
+        +BrowserType string
+        +Headless bool
+        +PageLoadTimeout time.Duration
+        +WaitStrategy string
+        +CustomScript string
+        +Proxy *ProxyConfig
+    }
+
+    class APIConfig {
+        +URL string
+        +Method string
+        +AuthType string
+        +AuthConfig *AuthConfig
+        +Parameters []Parameter
+        +Pagination *PaginationConfig
+    }
+
+    class RawData {
+        +Content string
+        +Format string
+        +URL string
+        +Metadata map[string]interface{}
+        +Timestamp time.Time
+    }
+}
+
+' 继承关系
+Collector <|.. RPACollector : implements
+Collector <|.. APICollector : implements
+Collector <|.. DatabaseCollector : implements
+
+' 组合关系
+CollectorRegistry o-right- Collector : manages
+PluginLoader *-- CollectorRegistry : uses
+
+RPACollector *-- BrowserPool : uses
+RPACollector *-- ScriptEngine : uses
+APICollector *-- AuthManager : uses
+APICollector *-- PaginationEngine : uses
+
+' 依赖关系
+RPACollector ..> RPAConfig : depends
+APICollector ..> APIConfig : depends
+RPACollector ..> RawData : produces
+APICollector ..> RawData : produces
+DatabaseCollector ..> RawData : produces
+
+Task ..> RPAConfig : contains
+Task ..> APIConfig : contains
+
+' 注册流程
+note as N1
+  插件注册流程:
+  1. PluginLoader扫描plugins目录
+  2. 加载符合规范的插件(.so或可执行文件)
+  3. 调用插件的Init()函数获取Collector实例
+  4. 调用CollectorRegistry.Register()注册
+  5. Worker通过Registry.Get()获取并使用
+end note
+
+N1 .. PluginLoader
+N1 .. CollectorRegistry
+
+' 使用示例
+note as N2
+  使用示例:
+
+  // 注册内置采集器
+  registry.Register("rpa", &RPACollector{...})
+  registry.Register("api", &APICollector{...})
+
+  // 获取并使用
+  collector, _ := registry.Get("rpa")
+  rawData, _ := collector.Collect(task)
+end note
+
+N2 .. RPACollector
+
+@enduml

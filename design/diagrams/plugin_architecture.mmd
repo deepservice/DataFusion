@@ -1,0 +1,72 @@
+graph TB
+    subgraph "Worker核心框架 (Go)"
+        Core[Worker主进程]
+        PluginMgr[插件管理器]
+        PluginLoader[插件加载器]
+        IPC[进程间通信层]
+    end
+    
+    subgraph "采集插件"
+        WebPlugin[网页采集插件<br/>Python/Go]
+        DBPlugin[数据库采集插件<br/>Python/Go]
+        APIPlugin[API采集插件<br/>Python/Go]
+        CustomPlugin[自定义采集插件<br/>Python/Go]
+    end
+    
+    subgraph "解析插件"
+        HTMLParser[HTML解析器<br/>Python]
+        JSONParser[JSON解析器<br/>Python]
+        XMLParser[XML解析器<br/>Python]
+        CustomParser[自定义解析器<br/>Python]
+    end
+    
+    subgraph "存储插件"
+        MySQLStorage[MySQL存储<br/>Python/Go]
+        PGStorage[PostgreSQL存储<br/>Python/Go]
+        MongoStorage[MongoDB存储<br/>Python/Go]
+        FileStorage[文件存储<br/>Python/Go]
+        CustomStorage[自定义存储<br/>Python/Go]
+    end
+    
+    subgraph "插件接口规范"
+        CollectorInterface[ICollector接口<br/>Collect方法]
+        ParserInterface[IParser接口<br/>Parse方法]
+        StorageInterface[IStorage接口<br/>Store方法]
+    end
+    
+    Core --> PluginMgr
+    PluginMgr --> PluginLoader
+    PluginLoader --> IPC
+    
+    IPC --> WebPlugin
+    IPC --> DBPlugin
+    IPC --> APIPlugin
+    IPC --> CustomPlugin
+    
+    IPC --> HTMLParser
+    IPC --> JSONParser
+    IPC --> XMLParser
+    IPC --> CustomParser
+    
+    IPC --> MySQLStorage
+    IPC --> PGStorage
+    IPC --> MongoStorage
+    IPC --> FileStorage
+    IPC --> CustomStorage
+    
+    WebPlugin -.实现.-> CollectorInterface
+    DBPlugin -.实现.-> CollectorInterface
+    APIPlugin -.实现.-> CollectorInterface
+    CustomPlugin -.实现.-> CollectorInterface
+    
+    HTMLParser -.实现.-> ParserInterface
+    JSONParser -.实现.-> ParserInterface
+    XMLParser -.实现.-> ParserInterface
+    CustomParser -.实现.-> ParserInterface
+    
+    MySQLStorage -.实现.-> StorageInterface
+    PGStorage -.实现.-> StorageInterface
+    MongoStorage -.实现.-> StorageInterface
+    FileStorage -.实现.-> StorageInterface
+    CustomStorage -.实现.-> StorageInterface
+

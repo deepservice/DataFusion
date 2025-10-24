@@ -1,0 +1,112 @@
+@startuml
+title 任务优先级队列架构图
+
+skinparam component {
+    BackgroundColor<< High >> #FFB6C1
+    BackgroundColor<< Medium >> #FFE4B5
+    BackgroundColor<< Low >> #E0FFFF
+    BorderColor<< High >> #FF0000
+    BorderColor<< Medium >> #FFA500
+    BorderColor<< Low >> #0000FF
+}
+
+package "调度层" {
+    [Scheduler\n调度引擎] as Scheduler
+    [PriorityManager\n优先级管理器] as PM
+}
+
+package "消息队列层" {
+    queue "RabbitMQ集群" {
+        queue "高优先级队列\nPriority=3" as HighQ << High >>
+        queue "中优先级队列\nPriority=2" as MediumQ << Medium >>
+        queue "低优先级队列\nPriority=1" as LowQ << Low >>
+
+        note bottom of HighQ
+          核心业务任务
+          - 实时数据采集
+          - 紧急数据更新
+          - VIP客户任务
+        end note
+
+        note bottom of MediumQ
+          常规业务任务
+          - 定时数据采集
+          - 日常数据同步
+        end note
+
+        note bottom of LowQ
+          批量/后台任务
+          - 历史数据补采
+          - 非紧急数据清洗
+        end note
+    }
+
+    database "Redis\n优先级元数据存储" as Redis
+}
+
+package "执行层" {
+    [Worker-1] as W1
+    [Worker-2] as W2
+    [Worker-N] as WN
+    [监控服务\nMonitor] as Monitor
+}
+
+database "PostgreSQL\n任务配置库" as PG
+
+' 调度流程
+Scheduler --> PM: 创建任务
+PM --> PG: 读取任务优先级配置
+PG --> PM: 优先级=High/Medium/Low
+PM --> Redis: 记录任务元数据
+
+PM -[#Red]-> HighQ: 高优先级任务\n发布消息(priority=3)
+PM -[#Orange]-> MediumQ: 中优先级任务\n发布消息(priority=2)
+PM -[#Blue]-> LowQ: 低优先级任务\n发布消息(priority=1)
+
+' 消费流程
+HighQ -[#Red]-> W1: Worker优先消费
+MediumQ -[#Orange]-> W2: 次优先消费
+LowQ -[#Blue]-> WN: 最后消费
+
+W1 --> Monitor: 上报执行状态
+W2 --> Monitor: 上报执行状态
+WN --> Monitor: 上报执行状态
+
+' 优先级动态调整
+Monitor --> PM: 检测低优先级任务饥饿
+note right of PM
+  饥饿检测规则:
+  - 等待时间 > 30分钟
+  - 重试次数 > 3次
+  触发优先级提升
+end note
+
+PM --> Redis: 更新任务优先级
+PM -[#Orange]-> MediumQ: 重新发布(提升优先级)
+
+' 队列配置说明
+note right of HighQ
+  队列配置参数:
+  x-max-priority: 3
+  x-message-ttl: 3600000 (1小时)
+  prefetch-count: 1
+  durable: true
+end note
+
+' 图例
+legend right
+  |<#FFB6C1>| 高优先级(Priority=3) |
+  |<#FFE4B5>| 中优先级(Priority=2) |
+  |<#E0FFFF>| 低优先级(Priority=1) |
+
+  **消费策略:**
+  1. Worker优先消费高优先级队列
+  2. 高优先级队列为空时消费中优先级
+  3. 中优先级队列为空时消费低优先级
+
+  **防饥饿机制:**
+  - 低优先级等待>30分钟自动提升
+  - 监控队列积压情况动态扩容Worker
+endlegend
+
+@enduml

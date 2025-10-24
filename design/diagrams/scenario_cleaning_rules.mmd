@@ -1,0 +1,42 @@
+flowchart TD
+    Start([开始配置清洗规则]) --> DSEdit[进入数据源编辑页面]
+    DSEdit --> CleanSection[进入数据清洗规则配置区域]
+    
+    CleanSection --> SelectField[选择要清洗的字段]
+    SelectField --> RuleType{选择规则类型}
+    
+    RuleType -->|预置规则| PresetRule[选择预置规则]
+    RuleType -->|自定义规则| CustomRule[配置自定义规则]
+    
+    PresetRule --> PresetList[去除空格<br/>去除HTML标签<br/>转换大小写<br/>限制长度<br/>日期格式转换]
+    PresetList --> SelectPreset[勾选需要的规则]
+    SelectPreset --> TestRule[测试清洗效果]
+    
+    CustomRule --> CustomType{自定义类型}
+    CustomType -->|正则替换| RegexRule[配置正则表达式<br/>输入匹配模式和替换内容]
+    CustomType -->|脚本处理| ScriptRule[编写处理脚本<br/>Python/JavaScript]
+    
+    RegexRule --> TestRule
+    ScriptRule --> TestRule
+    
+    TestRule --> InputTest[输入测试数据]
+    InputTest --> RunTest[执行清洗测试]
+    RunTest --> ShowResult[显示清洗结果]
+    
+    ShowResult --> ResultOK{结果正确?}
+    ResultOK -->|否| AdjustRule[调整规则]
+    AdjustRule --> TestRule
+    
+    ResultOK -->|是| SaveRule[保存清洗规则]
+    SaveRule --> MoreField{需要配置其他字段?}
+    
+    MoreField -->|是| SelectField
+    MoreField -->|否| ReviewAll[预览所有清洗规则]
+    
+    ReviewAll --> FinalTest[使用真实数据测试]
+    FinalTest --> FinalOK{整体效果满意?}
+    
+    FinalOK -->|否| SelectField
+    FinalOK -->|是| SaveAll[保存所有规则]
+    SaveAll --> End([配置完成])
+

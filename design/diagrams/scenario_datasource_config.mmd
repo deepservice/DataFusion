@@ -1,0 +1,53 @@
+flowchart TD
+    Start([用户开始配置数据源]) --> Login[登录系统]
+    Login --> Menu[进入数据源管理]
+    Menu --> Create[点击新建数据源]
+    
+    Create --> SelectType{选择数据源类型}
+    SelectType -->|网页| WebConfig[配置网页数据源]
+    SelectType -->|数据库| DBConfig[配置数据库数据源]
+    
+    WebConfig --> FillBasic[填写基本信息<br/>名称/描述/URL]
+    FillBasic --> ConfigRequest[配置请求参数<br/>方式/Header/代理]
+    ConfigRequest --> ConfigParse[配置解析规则]
+    
+    ConfigParse --> AddField[添加字段定义]
+    AddField --> FieldDetail[设置字段名/类型/<br/>提取规则]
+    FieldDetail --> TestExtract[测试提取效果]
+    TestExtract --> ExtractOK{提取结果正确?}
+    ExtractOK -->|否| FieldDetail
+    ExtractOK -->|是| MoreField{需要更多字段?}
+    MoreField -->|是| AddField
+    MoreField -->|否| ConfigClean[配置数据清洗规则]
+    
+    ConfigClean --> AddCleanRule[添加清洗规则<br/>去空格/去标签/格式转换]
+    AddCleanRule --> TestClean[测试清洗效果]
+    TestClean --> CleanOK{清洗结果正确?}
+    CleanOK -->|否| AddCleanRule
+    CleanOK -->|是| ConfigStorage[配置存储目标]
+    
+    DBConfig --> FillConn[填写连接信息<br/>主机/端口/数据库/用户]
+    FillConn --> TestConn[测试连接]
+    TestConn --> ConnResult{连接成功?}
+    ConnResult -->|否| FillConn
+    ConnResult -->|是| ConfigSQL[配置查询语句]
+    ConfigSQL --> TestSQL[执行查询测试]
+    TestSQL --> SQLResult{查询成功?}
+    SQLResult -->|否| ConfigSQL
+    SQLResult -->|是| ConfigMapping[配置字段映射]
+    ConfigMapping --> ConfigStorage
+    
+    ConfigStorage --> SelectStorage{选择存储类型}
+    SelectStorage -->|数据库| DBStorage[选择目标数据库<br/>配置表名和字段映射]
+    SelectStorage -->|文件| FileStorage[配置文件路径<br/>选择文件格式]
+    
+    DBStorage --> TestSave[测试采集]
+    FileStorage --> TestSave
+    
+    TestSave --> SaveResult{测试成功?}
+    SaveResult -->|否| ViewError[查看错误信息]
+    ViewError --> FixConfig{修改配置}
+    FixConfig --> ConfigParse
+    SaveResult -->|是| SaveDS[保存数据源配置]
+    SaveDS --> Success([配置完成])
+

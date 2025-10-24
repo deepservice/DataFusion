@@ -1,0 +1,238 @@
+@startuml
+title 监控告警系统架构图
+
+skinparam component {
+    BackgroundColor<<Metrics>> #E3F2FD
+    BackgroundColor<<Alert>> #FFEBEE
+    BackgroundColor<<Notify>> #FFF3E0
+    BorderColor<<Metrics>> #1976D2
+    BorderColor<<Alert>> #D32F2F
+    BorderColor<<Notify>> #F57C00
+}
+
+package "数据采集层" {
+    [Master节点] as Master
+    [Worker节点] as Worker
+    [API服务] as API
+}
+
+package "指标暴露层" {
+    [Prometheus Client\n(Master)] as PMaster <<Metrics>>
+    [Prometheus Client\n(Worker)] as PWorker <<Metrics>>
+    [Prometheus Client\n(API)] as PAPI <<Metrics>>
+}
+
+package "指标采集与存储" {
+    [Prometheus Server] as Prom <<Metrics>>
+
+    note right of Prom
+      **Prometheus Server配置:**
+      - 时序数据库
+      - 数据保留期: 15天
+      - 采集间隔: 15秒
+
+      **核心指标类型:**
+      - Counter: 累计计数
+      - Gauge: 瞬时值
+      - Histogram: 分布统计
+      - Summary: 分位数统计
+    end note
+}
+
+package "可视化展示" {
+    [Grafana] as Graf <<Metrics>>
+
+    note right of Graf
+      **Grafana功能:**
+      - Dashboard面板
+      - 实时监控大屏
+      - 自定义图表
+
+      **预置Dashboard:**
+      1. 系统概览
+      2. 任务执行监控
+      3. Worker资源监控
+      4. 数据采集趋势
+      5. 错误分析面板
+    end note
+}
+
+package "告警规则引擎" {
+    [Alertmanager] as AM <<Alert>>
+
+    note right of AM
+      **Alertmanager功能:**
+      - 告警路由
+      - 告警分组
+      - 告警抑制
+      - 告警静默
+
+      --
+      告警规则示例:
+
+      # Worker节点下线
+      - alert: WorkerDown
+        expr: up{job="worker"} == 0
+        for: 1m
+        severity: critical
+
+      # 任务失败率过高
+      - alert: HighTaskFailureRate
+        expr: rate(task_failures[10m]) > 0.2
+        for: 5m
+        severity: warning
+
+      # 队列积压
+      - alert: QueueBacklog
+        expr: rabbitmq_queue_messages > 1000
+        for: 10m
+        severity: warning
+    end note
+}
+
+package "通知渠道" {
+    [邮件通知\nEmail] as Email <<Notify>>
+    [短信通知\nSMS] as SMS <<Notify>>
+    [钉钉通知\nDingTalk] as DingTalk <<Notify>>
+    [Webhook] as Webhook <<Notify>>
+}
+
+package "日志系统" {
+    [Filebeat] as FB
+    [Logstash] as LS
+    database "Elasticsearch" as ES
+    [Kibana] as Kibana
+
+    note right of FB
+      - 日志采集agent
+      - 部署在每个节点
+    end note
+
+    note right of LS
+      - 日志过滤和转换
+      - Grok解析
+      - 字段提取
+    end note
+
+    note right of ES
+      - 日志存储和索引
+      - 保留期: 30天
+    end note
+
+    note right of Kibana
+      - 日志查询界面
+      - 日志分析
+      - 错误追踪
+    end note
+}
+
+' 指标采集流程
+Master --> PMaster: 暴露指标\n/metrics
+Worker --> PWorker: 暴露指标\n/metrics
+API --> PAPI: 暴露指标\n/metrics
+
+Prom --> PMaster: Pull(每15s)
+Prom --> PWorker: Pull(每15s)
+Prom --> PAPI: Pull(每15s)
+
+' 可视化
+Prom --> Graf: PromQL查询
+
+' 告警流程
+Prom --> AM: 触发告警
+
+AM --> Email: 发送邮件\n(Warning+Critical)
+AM --> SMS: 发送短信\n(仅Critical)
+AM --> DingTalk: 发送钉钉消息\n(Warning+Critical)
+AM --> Webhook: 自定义Webhook\n(如PagerDuty)
+
+' 日志流程
+Master --> FB: 输出日志
+Worker --> FB: 输出日志
+API --> FB: 输出日志
+
+FB --> LS: 转发日志
+LS --> ES: 写入索引
+ES --> Kibana: 查询展示
+
+' 关键指标说明
+note as N1
+  **系统级指标 (System Metrics):**
+  - CPU使用率: node_cpu_seconds_total
+  - 内存使用率: node_memory_MemAvailable_bytes
+  - 磁盘使用率: node_filesystem_avail_bytes
+  - 网络流量: node_network_receive_bytes_total
+
+  **任务级指标 (Task Metrics):**
+  - 任务总数: task_total{status="active"}
+  - 任务执行次数: task_run_total
+  - 任务成功率: task_run_success_rate
+  - 任务耗时: task_run_duration_seconds
+
+  **Worker指标 (Worker Metrics):**
+  - Worker数量: worker_count{status="running"}
+  - Worker CPU: worker_cpu_usage
+  - Worker内存: worker_memory_usage
+  - 任务处理量: worker_tasks_processed_total
+
+  **队列指标 (Queue Metrics):**
+  - 队列长度: rabbitmq_queue_messages
+  - 消费速率: rabbitmq_queue_messages_ready
+  - 消息堆积: rabbitmq_queue_messages_unacknowledged
+end note
+
+N1 -up- Prom
+
+' 告警通知流程说明
+note as N2
+  **告警通知流程:**
+
+  1. Prometheus定期评估告警规则
+  2. 规则触发后发送告警到Alertmanager
+  3. Alertmanager进行告警分组和去重
+  4. 根据告警级别路由到不同通知渠道:
+     - Critical(严重): 邮件+短信+钉钉
+     - Warning(警告): 邮件+钉钉
+     - Info(信息): 仅钉钉
+  5. 支持告警静默(maintenance window)
+  6. 支持告警抑制(依赖关系)
+
+  **告警分组策略:**
+  - 按cluster分组
+  - 按severity分组
+  - 5分钟内相同告警合并
+end note
+
+N2 -down- AM
+
+' 日志级别说明
+note as N3
+  **日志级别 (Log Levels):**
+  - DEBUG: 调试信息(仅开发环境)
+  - INFO: 一般信息(任务开始/完成)
+  - WARN: 警告信息(重试、降级)
+  - ERROR: 错误信息(任务失败)
+  - FATAL: 严重错误(服务崩溃)
+
+  **日志格式 (JSON):**
+  ```json
+  {
+    "timestamp": "2025-10-23T10:30:00Z",
+    "level": "ERROR",
+    "module": "collector",
+    "message": "Failed to collect data",
+    "task_id": "task-123",
+    "error": "connection timeout",
+    "trace_id": "abc123"
+  }
+  ```
+
+  **日志查询示例:**
+  - 查询错误: level:ERROR
+  - 查询任务: task_id:"task-123"
+  - 时间范围: @timestamp:[now-1h TO now]
+end note
+
+N3 -down- ES
+
+@enduml

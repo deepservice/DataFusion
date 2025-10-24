@@ -1,0 +1,251 @@
+@startuml
+title DataFusion 核心类图
+
+package "任务管理域" {
+    class Task {
+        +id: UUID
+        +name: string
+        +description: string
+        +type: TaskType
+        +status: TaskStatus
+        +config: TaskConfig
+        +schedule: Schedule
+        +created_by: UUID
+        +created_at: timestamp
+        +updated_at: timestamp
+        --
+        +Create()
+        +Update()
+        +Delete()
+        +Start()
+        +Stop()
+        +GetRuns()
+    }
+    
+    enum TaskType {
+        WEB_CRAWLER
+        DATABASE_SYNC
+        API_FETCH
+    }
+    
+    enum TaskStatus {
+        ACTIVE
+        PAUSED
+        DISABLED
+    }
+    
+    class TaskConfig {
+        +data_source_id: UUID
+        +collection_rules: Rules
+        +processing_rules: Rules
+        +storage_config: StorageConfig
+        +retry_policy: RetryPolicy
+        --
+        +Validate()
+    }
+    
+    class Schedule {
+        +type: ScheduleType
+        +cron_expr: string
+        +interval: int
+        +next_run_time: timestamp
+        --
+        +CalculateNextRunTime()
+    }
+    
+    enum ScheduleType {
+        CRON
+        INTERVAL
+        MANUAL
+    }
+    
+    class TaskRun {
+        +id: UUID
+        +task_id: UUID
+        +status: RunStatus
+        +start_time: timestamp
+        +end_time: timestamp
+        +data_count: int
+        +error_msg: string
+        --
+        +Start()
+        +Success()
+        +Fail()
+    }
+    
+    enum RunStatus {
+        PENDING
+        RUNNING
+        SUCCESS
+        FAILED
+        CANCELLED
+    }
+}
+
+package "数据源域" {
+    interface DataSource {
+        +id: UUID
+        +name: string
+        +type: DataSourceType
+        +config: map
+        --
+        +Connect()
+        +Disconnect()
+        +TestConnection()
+    }
+    
+    enum DataSourceType {
+        WEB
+        MYSQL
+        POSTGRESQL
+        MONGODB
+        API
+    }
+    
+    class WebDataSource {
+        +url: string
+        +headers: map
+        +cookies: map
+        +proxy: string
+        --
+        +Fetch()
+    }
+    
+    class DatabaseDataSource {
+        +host: string
+        +port: int
+        +database: string
+        +username: string
+        +password: string
+        --
+        +Query()
+    }
+}
+
+package "采集器域" {
+    interface Collector {
+        +Collect(task: Task): RawData
+    }
+    
+    class WebCollector {
+        +http_client: HTTPClient
+        +browser: Browser
+        --
+        +CollectStatic()
+        +CollectDynamic()
+    }
+    
+    class DBCollector {
+        +connection_pool: ConnectionPool
+        --
+        +ExecuteQuery()
+        +FetchData()
+    }
+}
+
+package "处理器域" {
+    interface Processor {
+        +Process(raw: RawData, rules: Rules): ProcessedData
+    }
+    
+    class Parser {
+        +ParseHTML()
+        +ParseJSON()
+        +ParseXML()
+        +ParseCSV()
+    }
+    
+    class Cleaner {
+        +RemoveHTMLTags()
+        +TrimWhitespace()
+        +NormalizeText()
+    }
+    
+    class Transformer {
+        +ConvertType()
+        +FormatDate()
+        +ExtractFields()
+    }
+    
+    class Deduplicator {
+        +hash_set: Set
+        --
+        +CheckDuplicate()
+        +AddHash()
+    }
+}
+
+package "存储器域" {
+    interface Storage {
+        +Store(data: ProcessedData, config: StorageConfig): Result
+    }
+    
+    class DatabaseStorage {
+        +connection: Connection
+        --
+        +Insert()
+        +BulkInsert()
+    }
+    
+    class FileStorage {
+        +base_path: string
+        --
+        +WriteJSON()
+        +WriteCSV()
+    }
+}
+
+package "调度域" {
+    class Scheduler {
+        +task_queue: PriorityQueue
+        +timer: Timer
+        --
+        +RegisterTask()
+        +UnregisterTask()
+        +Dispatch()
+    }
+    
+    class Worker {
+        +id: UUID
+        +status: WorkerStatus
+        +capacity: int
+        +current_load: int
+        --
+        +Execute(task_run: TaskRun)
+        +Heartbeat()
+    }
+    
+    enum WorkerStatus {
+        IDLE
+        BUSY
+        OFFLINE
+    }
+}
+
+' 关系定义
+Task "1" *-- "1" TaskConfig
+Task "1" *-- "1" Schedule
+Task "1" -- "0..*" TaskRun
+Task "1" -- "1" DataSource
+
+DataSource <|.. WebDataSource
+DataSource <|.. DatabaseDataSource
+
+Collector <|.. WebCollector
+Collector <|.. DBCollector
+
+Processor <|.. Parser
+Processor <|.. Cleaner
+Processor <|.. Transformer
+Processor <|.. Deduplicator
+
+Storage <|.. DatabaseStorage
+Storage <|.. FileStorage
+
+Scheduler "1" -- "0..*" Worker
+Worker "1" -- "1" Collector
+Worker "1" -- "1" Processor
+Worker "1" -- "1" Storage
+
+@enduml
+

@@ -1,0 +1,281 @@
+@startuml
+!pragma maxMessageSize 8192
+title Kubernetes部署架构图
+
+skinparam node {
+    BackgroundColor<<K8sMaster>> #FFF3E0
+    BackgroundColor<<K8sWorker>> #E8F5E9
+    BorderColor<<K8sMaster>> #FF6F00
+    BorderColor<<K8sWorker>> #4CAF50
+}
+
+skinparam artifact {
+    BackgroundColor<<Pod>> #E3F2FD
+    BorderColor<<Pod>> #1976D2
+}
+
+skinparam component {
+    BackgroundColor<<Service>> #FFF9C4
+    BackgroundColor<<ControlPlane>> #FFEBEE
+    BorderColor<<Service>> #F57C00
+    BorderColor<<ControlPlane>> #D32F2F
+}
+
+skinparam cloud {
+    BackgroundColor<<Network>> #F3E5F5
+    BorderColor<<Network>> #8E24AA
+}
+
+' ==================== K8s集群 ====================
+
+package "Kubernetes集群 (v1.28+)" {
+
+    ' ==================== K8s Master节点 ====================
+
+    node "K8s Master节点: 192.168.1.10\n配置: 4C8G, 100GB SSD\nOS: Ubuntu 22.04" <<K8sMaster>> as k8s_master {
+
+        component "kube-apiserver" as apiserver <<ControlPlane>>
+        component "kube-scheduler" as scheduler_cp <<ControlPlane>>
+        component "kube-controller-manager" as controller <<ControlPlane>>
+        component "etcd (K8s存储)" as etcd_cp <<ControlPlane>>
+
+        note right of k8s_master
+          **K8s控制平面节点**
+          - 管理集群状态
+          - 调度Pod到Worker节点
+          - 不运行DataFusion工作负载
+          - Taint: node-role.kubernetes.io/master
+        end note
+    }
+
+    ' ==================== K8s Worker节点1 ====================
+
+    node "K8s Worker节点1: 192.168.1.11\n配置: 8C16G, 200GB SSD\nOS: Ubuntu 22.04" <<K8sWorker>> as k8s_worker1 {
+
+        component "Kubelet + Container Runtime" as kubelet1
+
+        artifact "Pod:\ndatafusion-master-1" <<Pod>> as pod_master1 {
+            component "Container: master\nDataFusion Master服务\nPORT: 9000" as svc_master1 <<Service>>
+        }
+
+        artifact "Pod:\ndatafusion-api-1" <<Pod>> as pod_api1 {
+            component "Container: api\nAPI Gateway\nPORT: 8000" as svc_api1 <<Service>>
+        }
+
+        artifact "Pod:\ndatafusion-webui-1" <<Pod>> as pod_webui1 {
+            component "Container: webui\nWeb UI\nPORT: 8080" as svc_webui1 <<Service>>
+        }
+
+        artifact "Pod:\ndatafusion-worker-1" <<Pod>> as pod_worker1_1 {
+            component "Container: worker\nDataFusion Worker服务" as svc_worker1_1 <<Service>>
+        }
+
+        artifact "Pod:\ndatafusion-worker-2" <<Pod>> as pod_worker1_2 {
+            component "Container: worker\nDataFusion Worker服务" as svc_worker1_2 <<Service>>
+        }
+
+        artifact "Pod:\npostgresql-0\n(StatefulSet)" <<Pod>> as pod_pg1 {
+            component "Container: postgres\nPostgreSQL主库\nPORT: 5432" as svc_pg1 <<Service>>
+        }
+
+        artifact "Pod:\nredis-0\n(StatefulSet)" <<Pod>> as pod_redis1 {
+            component "Container: redis\nRedis节点1\nPORT: 6379" as svc_redis1 <<Service>>
+        }
+
+        artifact "Pod:\nrabbitmq-0\n(StatefulSet)" <<Pod>> as pod_mq1 {
+            component "Container: rabbitmq\nRabbitMQ节点1\nPORT: 5672,15672" as svc_mq1 <<Service>>
+        }
+
+        artifact "Pod:\ningress-nginx-controller" <<Pod>> as pod_ingress1 {
+            component "Container: nginx\nIngress Controller\nPORT: 80,443" as svc_ingress1 <<Service>>
+        }
+
+        kubelet1 .down.> pod_master1: 管理
+        kubelet1 .down.> pod_api1: 管理
+        kubelet1 .down.> pod_webui1: 管理
+        kubelet1 .down.> pod_worker1_1: 管理
+        kubelet1 .down.> pod_worker1_2: 管理
+        kubelet1 .down.> pod_pg1: 管理
+        kubelet1 .down.> pod_redis1: 管理
+        kubelet1 .down.> pod_mq1: 管理
+        kubelet1 .down.> pod_ingress1: 管理
+    }
+
+    ' ==================== K8s Worker节点2 ====================
+
+    node "K8s Worker节点2: 192.168.1.12\n配置: 8C16G, 200GB SSD\nOS: Ubuntu 22.04" <<K8sWorker>> as k8s_worker2 {
+
+        component "Kubelet + Container Runtime" as kubelet2
+
+        artifact "Pod:\ndatafusion-master-2" <<Pod>> as pod_master2 {
+            component "Container: master\nDataFusion Master服务\nPORT: 9000" as svc_master2 <<Service>>
+        }
+
+        artifact "Pod:\ndatafusion-worker-3" <<Pod>> as pod_worker2_1 {
+            component "Container: worker\nDataFusion Worker服务" as svc_worker2_1 <<Service>>
+        }
+
+        artifact "Pod:\ndatafusion-worker-4" <<Pod>> as pod_worker2_2 {
+            component "Container: worker\nDataFusion Worker服务" as svc_worker2_2 <<Service>>
+        }
+
+        artifact "Pod:\npostgresql-1\n(StatefulSet)" <<Pod>> as pod_pg2 {
+            component "Container: postgres\nPostgreSQL从库\nPORT: 5432" as svc_pg2 <<Service>>
+        }
+
+        artifact "Pod:\nredis-1\n(StatefulSet)" <<Pod>> as pod_redis2 {
+            component "Container: redis\nRedis节点2\nPORT: 6379" as svc_redis2 <<Service>>
+        }
+
+        artifact "Pod:\nrabbitmq-1\n(StatefulSet)" <<Pod>> as pod_mq2 {
+            component "Container: rabbitmq\nRabbitMQ节点2\nPORT: 5672,15672" as svc_mq2 <<Service>>
+        }
+
+        artifact "Pod:\nprometheus" <<Pod>> as pod_prom {
+            component "Container: prometheus\nPrometheus\nPORT: 9090" as svc_prom <<Service>>
+        }
+
+        artifact "Pod:\ngrafana" <<Pod>> as pod_grafana {
+            component "Container: grafana\nGrafana\nPORT: 3000" as svc_grafana <<Service>>
+        }
+
+        kubelet2 .down.> pod_master2: 管理
+        kubelet2 .down.> pod_worker2_1: 管理
+        kubelet2 .down.> pod_worker2_2: 管理
+        kubelet2 .down.> pod_pg2: 管理
+        kubelet2 .down.> pod_redis2: 管理
+        kubelet2 .down.> pod_mq2: 管理
+        kubelet2 .down.> pod_prom: 管理
+        kubelet2 .down.> pod_grafana: 管理
+    }
+
+    ' ==================== K8s网络组件 ====================
+
+    cloud "K8s Service对象\n(ClusterIP)" <<Network>> as k8s_services {
+        component "Service:\ndatafusion-webui-svc\nClusterIP: 10.96.1.10:8080" as svc_webui
+        component "Service:\ndatafusion-api-svc\nClusterIP: 10.96.1.20:8000" as svc_api
+        component "Service:\ndatafusion-master-svc\nClusterIP: 10.96.1.30:9000" as svc_master
+        component "Service:\npostgresql-svc\nHeadless Service" as svc_postgres
+        component "Service:\nredis-svc\nHeadless Service" as svc_redis
+        component "Service:\nrabbitmq-svc\nHeadless Service" as svc_rabbitmq
+    }
+
+    cloud "Ingress对象" <<Network>> as k8s_ingress {
+        component "Ingress:\ndatafusion-ingress\nHost: datafusion.example.com\nPaths: /, /api/*" as ingress_obj
+    }
+
+    cloud "LoadBalancer Service" <<Network>> as k8s_lb {
+        component "Service:\ningress-nginx-lb\nType: LoadBalancer\nExternal IP: <云厂商分配>" as lb_svc
+    }
+
+    ' K8s控制平面与Kubelet通信
+    apiserver -[#Orange]-> kubelet1: Pod调度和管理
+    apiserver -[#Orange]-> kubelet2: Pod调度和管理
+}
+
+' ==================== 外部组件 ====================
+
+actor "外部用户" as user
+
+cloud "外部数据源" {
+    component "目标网站/API" as target_web
+    database "外部数据库" as target_db
+}
+
+' ==================== 流量路径 ====================
+
+' 外部访问流量
+user -[#Green]-> lb_svc: **1. HTTPS访问**\nhttps://datafusion.example.com
+lb_svc -[#Green]-> svc_ingress1: **2. 转发到Ingress Pod**\nPORT 443
+svc_ingress1 -[#Green]-> ingress_obj: **3. Ingress路由规则**\nSSL终止, 路径匹配
+ingress_obj -[#Green]-> svc_webui: **4. 路由到Service**\nPath: / → webui-svc
+ingress_obj -[#Green]-> svc_api: **4. 路由到Service**\nPath: /api/* → api-svc
+
+' Service负载均衡到Pod
+svc_webui -[#Blue]-> svc_webui1: **5. Service负载均衡**\nkube-proxy规则
+svc_api -[#Blue]-> svc_api1: **5. Service负载均衡**\nkube-proxy规则
+
+' 应用间通信
+svc_webui1 --> svc_api: HTTP\n通过ClusterIP Service
+svc_api1 --> svc_master: gRPC\n通过ClusterIP Service
+svc_master -[#Purple]-> svc_master1: Service负载均衡
+svc_master -[#Purple]-> svc_master2: Service负载均衡
+
+' DataFusion Master访问基础设施
+svc_master1 --> svc_postgres: SQL
+svc_master1 --> svc_redis: Redis
+svc_master1 --> svc_rabbitmq: AMQP
+
+' Service到实际Pod
+svc_postgres -[#Brown]-> svc_pg1: Headless Service\nDNS直连
+svc_postgres -[#Brown]-> svc_pg2: Headless Service\nDNS直连
+svc_redis -[#Brown]-> svc_redis1: Headless Service\nDNS直连
+svc_redis -[#Brown]-> svc_redis2: Headless Service\nDNS直连
+svc_rabbitmq -[#Brown]-> svc_mq1: Headless Service\nDNS直连
+svc_rabbitmq -[#Brown]-> svc_mq2: Headless Service\nDNS直连
+
+' DataFusion Worker访问基础设施
+svc_worker1_1 --> svc_rabbitmq: AMQP\n消费任务
+svc_worker1_1 --> svc_postgres: SQL\n写入数据
+svc_worker2_1 --> svc_rabbitmq: AMQP\n消费任务
+
+' Worker数据采集
+svc_worker1_1 -[#Red]-> target_web: 数据采集\nHTTP/HTTPS
+svc_worker2_1 -[#Red]-> target_web: 数据采集\nHTTP/HTTPS
+
+' 监控指标
+svc_master1 --> svc_prom: /metrics
+svc_worker1_1 --> svc_prom: /metrics
+svc_api1 --> svc_prom: /metrics
+svc_prom --> svc_grafana: PromQL查询
+
+' 数据库复制
+svc_pg1 -[#Red]-> svc_pg2: 主从复制\nStreaming Replication
+
+legend right
+  **Kubernetes部署架构说明:**
+
+  **物理层级:**
+  - K8s Master节点: 运行控制平面(apiserver, scheduler, controller-manager)
+  - K8s Worker节点: 运行Kubelet,调度和管理Pod
+  - Pod: K8s最小调度单元,包含一个或多个Container
+  - Container: 运行DataFusion服务组件的容器实例
+
+  **关键区别:**
+  - K8s Master节点 ≠ DataFusion Master服务
+  - K8s Worker节点 ≠ DataFusion Worker服务
+  - K8s Master节点: 管理集群,不运行业务Pod
+  - DataFusion Master/Worker服务: 运行在Worker节点的Pod中
+
+  **K8s网络流量路径:**
+  1. 外部用户 → LoadBalancer Service (云LB)
+  2. LoadBalancer → Ingress Controller Pod (Nginx)
+  3. Ingress Controller → 路由规则匹配 (SSL终止)
+  4. Ingress → ClusterIP Service (服务发现)
+  5. Service → Pod (kube-proxy负载均衡)
+
+  **Service类型:**
+  - LoadBalancer: 暴露给外部访问,云厂商提供公网IP
+  - ClusterIP: 集群内部服务发现和负载均衡
+  - Headless Service: StatefulSet专用,DNS直接解析到Pod IP
+
+  **StatefulSet服务:**
+  - PostgreSQL: 2副本主从复制
+  - Redis: 2副本Cluster或Sentinel模式
+  - RabbitMQ: 2副本镜像队列
+  - 提供稳定的网络标识和持久化存储
+
+  **Pod副本配置 (默认简化配置):**
+  - DataFusion Master: 2个Pod (可扩展至3-5)
+  - DataFusion Worker: 4个Pod (可HPA自动扩展至50+)
+  - API Gateway: 1个Pod (可扩展至3)
+  - Web UI: 1个Pod (可扩展至2)
+
+  **扩展说明:**
+  - 增加K8s Worker节点可水平扩展
+  - 使用HPA自动扩展Worker Pod副本数
+  - 使用PVC挂载持久化存储卷
+  - 可选用云RDS替代PostgreSQL StatefulSet
+endlegend
+
+@enduml

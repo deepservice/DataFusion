@@ -1,0 +1,238 @@
+@startuml
+title DataFusion 组件关系图
+
+skinparam component {
+    BackgroundColor<<UI>> #E3F2FD
+    BackgroundColor<<Service>> #E8F5E9
+    BackgroundColor<<Plugin>> #FFF9C4
+    BackgroundColor<<Database>> #FFEBEE
+    BackgroundColor<<Cache>> #F3E5F5
+    BackgroundColor<<Monitor>> #FCE4EC
+    BorderColor<<UI>> #1976D2
+    BorderColor<<Service>> #4CAF50
+    BorderColor<<Plugin>> #FBC02D
+    BorderColor<<Database>> #D32F2F
+    BorderColor<<Cache>> #9C27B0
+    BorderColor<<Monitor>> #E91E63
+}
+
+' 用户界面层
+package "用户界面层" {
+    [Web管理界面] <<UI>> as webui
+    [API网关] <<UI>> as api
+
+    note right of webui
+      **Web UI:**
+      - Vue.js框架
+      - 任务可视化管理
+      - 实时监控看板
+      - 用户权限管理
+    end note
+
+    note right of api
+      **API Gateway:**
+      - Gin框架
+      - 统一认证入口
+      - 请求路由转发
+      - 限流熔断
+    end note
+}
+
+' Master服务层
+package "Master服务层" {
+    [任务管理器\nTaskManager] <<Service>> as taskmgr
+    [调度引擎\nScheduler] <<Service>> as scheduler
+    [监控服务\nMonitor] <<Service>> as monitor
+    [认证授权\nAuth] <<Service>> as auth
+
+    note right of taskmgr
+      **任务管理器:**
+      - 任务CRUD
+      - 任务生命周期
+      - 任务配置管理
+      - 数据源管理
+    end note
+
+    note right of scheduler
+      **调度引擎:**
+      - Cron定时调度
+      - 任务优先级
+      - 任务分发
+      - 重试机制
+    end note
+}
+
+' Worker服务层
+package "Worker服务层" {
+    [采集器\nCollector] <<Service>> as collector
+    [处理器\nProcessor] <<Service>> as processor
+    [存储器\nStorage] <<Service>> as storage
+
+    note right of collector
+      **采集器:**
+      - RPA采集
+      - API采集
+      - 数据库采集
+      - 插件管理
+    end note
+
+    note right of processor
+      **处理器:**
+      - 数据解析
+      - 数据清洗
+      - 数据转换
+      - 数据去重
+    end note
+}
+
+' 插件系统
+package "插件系统" <<Plugin>> {
+    [网页采集插件] <<Plugin>> as web_plugin
+    [数据库采集插件] <<Plugin>> as db_plugin
+    [解析器插件] <<Plugin>> as parser_plugin
+    [存储插件] <<Plugin>> as storage_plugin
+
+    note bottom of web_plugin
+      - Puppeteer
+      - Playwright
+      - Requests
+    end note
+
+    note bottom of parser_plugin
+      - HTML: goquery
+      - JSON: gjson
+      - XML: xmlquery
+      - CSV: encoding/csv
+    end note
+}
+
+' 基础设施层
+package "基础设施层" {
+    database "PostgreSQL" <<Database>> as postgres {
+        collections tasks
+        collections data_sources
+        collections users
+        collections logs
+    }
+
+    database "Redis" <<Cache>> as redis {
+        collections 缓存
+        collections 分布式锁
+        collections 令牌桶
+    }
+
+    queue "RabbitMQ" <<Cache>> as mq {
+        collections high_priority
+        collections medium_priority
+        collections low_priority
+    }
+
+    component "etcd" <<Service>> as etcd
+
+    note right of etcd
+      **服务注册中心:**
+      - 节点注册
+      - 配置中心
+      - 服务发现
+    end note
+}
+
+' 监控与日志
+package "监控与日志层" {
+    component "Prometheus" <<Monitor>> as prometheus
+    component "Grafana" <<Monitor>> as grafana
+    component "ELK Stack" <<Monitor>> as elk
+
+    note right of prometheus
+      **指标采集:**
+      - 任务成功率
+      - 系统资源
+      - 响应延迟
+      - 错误率
+    end note
+}
+
+' ==================== 关系连接 ====================
+
+' 用户界面层连接
+webui --> api: HTTPS
+
+' API Gateway连接
+api --> auth: 认证请求\ngRPC
+api --> taskmgr: 任务管理\ngRPC
+api --> monitor: 查询指标\ngRPC
+
+' 任务管理器连接
+taskmgr --> postgres: 读写数据\nSQL
+taskmgr --> scheduler: 注册任务\ngRPC
+taskmgr --> redis: 缓存操作\nRedis
+
+' 调度引擎连接
+scheduler --> mq: 发布任务\nAMQP
+scheduler --> redis: 状态缓存\nRedis
+scheduler --> etcd: 服务发现\ngRPC
+scheduler --> postgres: 读取任务\nSQL
+
+' 采集器连接
+collector --> mq: 接收任务\nAMQP
+collector --> etcd: 服务注册\ngRPC
+collector --> web_plugin: 调用插件\ngRPC/Stdio
+collector --> db_plugin: 调用插件\ngRPC/Stdio
+collector --> processor: 传递原始数据
+
+' 处理器连接
+processor --> parser_plugin: 解析数据\ngRPC/Stdio
+processor --> storage: 传递处理数据
+
+' 存储器连接
+storage --> storage_plugin: 存储数据\ngRPC/Stdio
+storage --> postgres: 写入数据\nSQL
+storage --> redis: 去重检查\nRedis
+
+' 监控连接
+monitor --> prometheus: 查询指标\nHTTP
+monitor --> elk: 查询日志\nHTTP
+prometheus --> grafana: 数据源\nHTTP
+
+' 指标暴露
+taskmgr --> prometheus: /metrics
+scheduler --> prometheus: /metrics
+collector --> prometheus: /metrics
+processor --> prometheus: /metrics
+
+' 日志推送
+taskmgr --> elk: 推送日志\nTCP
+scheduler --> elk: 推送日志\nTCP
+collector --> elk: 推送日志\nTCP
+
+legend right
+  **组件说明:**
+
+  **用户界面层:**
+  提供用户交互和API访问入口
+
+  **Master服务层:**
+  负责任务管理、调度和监控
+
+  **Worker服务层:**
+  执行数据采集、处理和存储
+
+  **插件系统:**
+  支持扩展的采集和处理能力
+
+  **基础设施层:**
+  提供数据存储、缓存和消息队列
+
+  **监控日志层:**
+  系统指标采集和日志分析
+
+  **通信协议:**
+  - gRPC: 服务间通信
+  - AMQP: 消息队列
+  - SQL: 数据库访问
+  - Redis: 缓存协议
+  - HTTP: 监控和API
+endlegend
+
+@enduml
+

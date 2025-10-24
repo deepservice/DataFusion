@@ -1,0 +1,309 @@
+@startuml
+title Docker Compose部署架构图
+
+skinparam node {
+    BackgroundColor<<VM>> #E8F5E9
+    BorderColor<<VM>> #4CAF50
+}
+
+skinparam artifact {
+    BackgroundColor<<Container>> #E3F2FD
+    BorderColor<<Container>> #1976D2
+}
+
+skinparam component {
+    BackgroundColor<<Service>> #FFF9C4
+    BorderColor<<Service>> #F57C00
+}
+
+skinparam database {
+    BackgroundColor<<DB>> #FFEBEE
+    BorderColor<<DB>> #C62828
+}
+
+' ==================== 单机部署模式 ====================
+
+package "单机部署模式" {
+    node "虚拟机: 192.168.1.100\n配置: 4C8G, 100GB SSD\nOS: Ubuntu 22.04" <<VM>> as vm_single {
+
+        component "Docker Engine (v24.0+)" as docker_single
+
+        artifact "Container:\ndatafusion-master-1" <<Container>> as c_master1 {
+            component "Master进程\nPORT: 9000" as svc_master1 <<Service>>
+        }
+
+        artifact "Container:\ndatafusion-api-1" <<Container>> as c_api1 {
+            component "API Gateway\nPORT: 8000" as svc_api1 <<Service>>
+        }
+
+        artifact "Container:\ndatafusion-webui-1" <<Container>> as c_webui1 {
+            component "Web UI\nPORT: 8080" as svc_webui1 <<Service>>
+        }
+
+        artifact "Container:\ndatafusion-worker-1" <<Container>> as c_worker1_1 {
+            component "Worker进程-1" as svc_worker1_1 <<Service>>
+        }
+
+        artifact "Container:\ndatafusion-worker-2" <<Container>> as c_worker1_2 {
+            component "Worker进程-2" as svc_worker1_2 <<Service>>
+        }
+
+        artifact "Container:\npostgresql" <<Container>> as c_pg1 {
+            database "PostgreSQL\nPORT: 5432\nVolume: /data/postgres" as svc_pg1 <<DB>>
+        }
+
+        artifact "Container:\nredis" <<Container>> as c_redis1 {
+            database "Redis\nPORT: 6379\nVolume: /data/redis" as svc_redis1 <<DB>>
+        }
+
+        artifact "Container:\nrabbitmq" <<Container>> as c_mq1 {
+            component "RabbitMQ\nPORT: 5672,15672\nVolume: /data/rabbitmq" as svc_mq1 <<Service>>
+        }
+
+        artifact "Container:\netcd" <<Container>> as c_etcd1 {
+            component "etcd\nPORT: 2379" as svc_etcd1 <<Service>>
+        }
+
+        artifact "Container:\nprometheus" <<Container>> as c_prom1 {
+            component "Prometheus\nPORT: 9090" as svc_prom1 <<Service>>
+        }
+
+        artifact "Container:\ngrafana" <<Container>> as c_graf1 {
+            component "Grafana\nPORT: 3000" as svc_graf1 <<Service>>
+        }
+
+        ' Docker网络
+        cloud "Docker Bridge Network\ndatafusion-net" as net_single
+
+        docker_single .down.> c_master1: 管理
+        docker_single .down.> c_api1: 管理
+        docker_single .down.> c_webui1: 管理
+        docker_single .down.> c_worker1_1: 管理
+        docker_single .down.> c_worker1_2: 管理
+        docker_single .down.> c_pg1: 管理
+        docker_single .down.> c_redis1: 管理
+        docker_single .down.> c_mq1: 管理
+        docker_single .down.> c_etcd1: 管理
+        docker_single .down.> c_prom1: 管理
+        docker_single .down.> c_graf1: 管理
+
+        ' 服务间通信
+        svc_webui1 --> svc_api1: HTTP
+        svc_api1 --> svc_master1: gRPC
+        svc_master1 --> svc_pg1: SQL
+        svc_master1 --> svc_redis1: Redis
+        svc_master1 --> svc_mq1: AMQP
+        svc_master1 --> svc_etcd1: gRPC
+        svc_worker1_1 --> svc_mq1: AMQP
+        svc_worker1_2 --> svc_mq1: AMQP
+        svc_worker1_1 --> svc_etcd1: gRPC
+        svc_master1 --> svc_prom1: /metrics
+        svc_worker1_1 --> svc_prom1: /metrics
+        svc_prom1 --> svc_graf1: Data
+    }
+
+    note right of vm_single
+      **单机部署说明:**
+      - 所有容器运行在同一台主机
+      - 通过docker-compose.yml统一管理
+      - 默认配置: 除Worker外均为单实例
+      - Worker默认2个容器实例
+
+      **docker-compose.yml示例:**
+      services:
+        master:
+          image: datafusion/master:latest
+          deploy:
+            replicas: 1  # 可配置
+        worker:
+          image: datafusion/worker:latest
+          deploy:
+            replicas: ${WORKER_REPLICAS:-2}
+    end note
+}
+
+' ==================== 多机部署模式 ====================
+
+package "多机部署模式" {
+
+    ' 管理节点
+    node "管理节点: 192.168.1.101\n配置: 4C8G, 100GB SSD\nOS: Ubuntu 22.04" <<VM>> as vm_mgmt {
+
+        component "Docker Engine (v24.0+)" as docker_mgmt
+
+        artifact "Container:\ndatafusion-master-1" <<Container>> as c_master_m {
+            component "Master进程\nPORT: 9000" as svc_master_m <<Service>>
+        }
+
+        artifact "Container:\ndatafusion-api-1" <<Container>> as c_api_m {
+            component "API Gateway\nPORT: 8000" as svc_api_m <<Service>>
+        }
+
+        artifact "Container:\ndatafusion-webui-1" <<Container>> as c_webui_m {
+            component "Web UI\nPORT: 8080" as svc_webui_m <<Service>>
+        }
+
+        artifact "Container:\npostgresql" <<Container>> as c_pg_m {
+            database "PostgreSQL\nPORT: 5432\nVolume: /data/postgres" as svc_pg_m <<DB>>
+        }
+
+        artifact "Container:\nredis" <<Container>> as c_redis_m {
+            database "Redis\nPORT: 6379\nVolume: /data/redis" as svc_redis_m <<DB>>
+        }
+
+        artifact "Container:\nrabbitmq" <<Container>> as c_mq_m {
+            component "RabbitMQ\nPORT: 5672,15672\nVolume: /data/rabbitmq" as svc_mq_m <<Service>>
+        }
+
+        artifact "Container:\netcd" <<Container>> as c_etcd_m {
+            component "etcd\nPORT: 2379" as svc_etcd_m <<Service>>
+        }
+
+        artifact "Container:\nprometheus" <<Container>> as c_prom_m {
+            component "Prometheus\nPORT: 9090" as svc_prom_m <<Service>>
+        }
+
+        artifact "Container:\ngrafana" <<Container>> as c_graf_m {
+            component "Grafana\nPORT: 3000" as svc_graf_m <<Service>>
+        }
+
+        docker_mgmt .down.> c_master_m: 管理
+        docker_mgmt .down.> c_api_m: 管理
+        docker_mgmt .down.> c_webui_m: 管理
+        docker_mgmt .down.> c_pg_m: 管理
+        docker_mgmt .down.> c_redis_m: 管理
+        docker_mgmt .down.> c_mq_m: 管理
+        docker_mgmt .down.> c_etcd_m: 管理
+        docker_mgmt .down.> c_prom_m: 管理
+        docker_mgmt .down.> c_graf_m: 管理
+
+        ' 管理节点内部通信
+        svc_webui_m --> svc_api_m: HTTP
+        svc_api_m --> svc_master_m: gRPC
+        svc_master_m --> svc_pg_m: SQL
+        svc_master_m --> svc_redis_m: Redis
+        svc_master_m --> svc_mq_m: AMQP
+        svc_master_m --> svc_etcd_m: gRPC
+        svc_master_m --> svc_prom_m: /metrics
+        svc_prom_m --> svc_graf_m: Data
+    }
+
+    ' 工作节点1
+    node "工作节点1: 192.168.1.102\n配置: 4C8G\nOS: Ubuntu 22.04" <<VM>> as vm_worker1 {
+
+        component "Docker Engine (v24.0+)" as docker_worker1
+
+        artifact "Container:\ndatafusion-worker-1" <<Container>> as c_worker1 {
+            component "Worker进程-1" as svc_worker1 <<Service>>
+        }
+
+        artifact "Container:\ndatafusion-worker-2" <<Container>> as c_worker2 {
+            component "Worker进程-2" as svc_worker2 <<Service>>
+        }
+
+        docker_worker1 .down.> c_worker1: 管理
+        docker_worker1 .down.> c_worker2: 管理
+    }
+
+    ' 工作节点2
+    node "工作节点2: 192.168.1.103\n配置: 4C8G\nOS: Ubuntu 22.04" <<VM>> as vm_worker2 {
+
+        component "Docker Engine (v24.0+)" as docker_worker2
+
+        artifact "Container:\ndatafusion-worker-3" <<Container>> as c_worker3 {
+            component "Worker进程-3" as svc_worker3 <<Service>>
+        }
+
+        artifact "Container:\ndatafusion-worker-4" <<Container>> as c_worker4 {
+            component "Worker进程-4" as svc_worker4 <<Service>>
+        }
+
+        docker_worker2 .down.> c_worker3: 管理
+        docker_worker2 .down.> c_worker4: 管理
+    }
+
+    ' 跨主机网络
+    cloud "Overlay Network / Host Network\ndatafusion-net" as net_multi
+
+    ' 工作节点访问管理节点基础设施
+    svc_worker1 --> svc_mq_m: AMQP\n跨主机通信
+    svc_worker1 --> svc_etcd_m: gRPC\n跨主机通信
+    svc_worker1 --> svc_pg_m: SQL\n跨主机通信
+
+    svc_worker2 --> svc_mq_m: AMQP\n跨主机通信
+    svc_worker2 --> svc_etcd_m: gRPC\n跨主机通信
+
+    svc_worker3 --> svc_mq_m: AMQP\n跨主机通信
+    svc_worker3 --> svc_etcd_m: gRPC\n跨主机通信
+
+    svc_worker4 --> svc_mq_m: AMQP\n跨主机通信
+
+    svc_worker1 --> svc_prom_m: /metrics\n跨主机
+    svc_worker3 --> svc_prom_m: /metrics\n跨主机
+
+    note right of vm_mgmt
+      **多机部署说明:**
+      - 管理节点: 运行控制平面+基础设施
+      - 工作节点: 运行Worker容器
+      - 工作节点通过网络访问管理节点的基础设施
+
+      **部署方式:**
+      1. 管理节点运行完整的docker-compose.yml
+      2. 工作节点仅运行worker服务的docker-compose.yml
+      3. 通过环境变量配置基础设施地址
+
+      **网络配置:**
+      - Overlay Network: Docker Swarm模式
+      - Host Network: 直接使用主机IP+端口
+    end note
+}
+
+' 外部访问
+actor "用户" as user
+cloud "外部数据源" as external {
+    component "目标网站/API" as target_web
+    database "外部数据库" as target_db
+}
+
+user -[#Green]-> svc_webui1: 浏览器访问\n单机:8080
+user -[#Green]-> svc_webui_m: 浏览器访问\n多机:8080
+
+svc_worker1_1 -[#Purple]-> target_web: 数据采集
+svc_worker1 -[#Purple]-> target_web: 数据采集
+svc_worker3 -[#Purple]-> target_web: 数据采集
+
+legend right
+  **部署架构说明:**
+
+  **层级关系:**
+  - 虚拟机(node): 物理或虚拟主机
+  - Docker Engine: 容器运行时
+  - Container(artifact): Docker容器实例
+  - Service(component): 容器内服务进程
+
+  **单机部署(1台VM):**
+  - 所有服务单实例(1个容器)
+  - Worker默认2个容器实例
+  - 适合开发测试环境
+
+  **多机部署(3台VM):**
+  - 管理节点: Master+API+基础设施(单实例)
+  - 工作节点1/2: 各运行2个Worker容器
+  - 工作节点直连管理节点基础设施
+
+  **副本数配置(docker-compose.yml):**
+  services:
+    worker:
+      deploy:
+        replicas: ${WORKER_REPLICAS:-2}
+
+  **容器命名规则:**
+  - 格式: {项目名}-{服务名}-{序号}
+  - 例如: datafusion-worker-1
+
+  **扩展说明:**
+  - 单机: 增加Worker副本数
+  - 多机: 增加工作节点VM数量
+endlegend
+
+@enduml

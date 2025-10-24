@@ -1,0 +1,54 @@
+flowchart TD
+    Start([Worker启动]) --> Init[初始化配置]
+    Init --> Register[向etcd注册服务]
+    Register --> ConnMQ[连接RabbitMQ]
+    ConnMQ --> Heartbeat[启动心跳线程]
+    Heartbeat --> Listen[监听任务队列]
+    
+    Listen --> Receive{接收到任务?}
+    Receive -->|否| Listen
+    Receive -->|是| ValidateTask[验证任务配置]
+    
+    ValidateTask --> CheckValid{配置有效?}
+    CheckValid -->|否| ReportError[上报错误]
+    ReportError --> AckMsg[ACK消息]
+    AckMsg --> Listen
+    
+    CheckValid -->|是| UpdateStatus[更新任务状态为运行中]
+    UpdateStatus --> LoadPlugin[加载采集插件]
+    
+    LoadPlugin --> CheckPlugin{插件加载成功?}
+    CheckPlugin -->|否| ReportError
+    
+    CheckPlugin -->|是| ExecuteCollect[执行数据采集]
+    ExecuteCollect --> CollectResult{采集成功?}
+    
+    CollectResult -->|失败| CheckRetry{可重试?}
+    CheckRetry -->|是| Delay[延迟等待]
+    Delay --> ExecuteCollect
+    CheckRetry -->|否| ReportError
+    
+    CollectResult -->|成功| ParseData[解析数据]
+    ParseData --> CleanData[清洗数据]
+    CleanData --> TransformData[转换数据]
+    TransformData --> DeduplicateData[去重数据]
+    
+    DeduplicateData --> ValidateData{数据有效?}
+    ValidateData -->|否| ReportError
+    
+    ValidateData -->|是| StoreData[存储数据]
+    StoreData --> StoreResult{存储成功?}
+    
+    StoreResult -->|失败| CheckRetry
+    StoreResult -->|成功| UpdateSuccess[更新任务状态为成功]
+    
+    UpdateSuccess --> RecordMetrics[记录指标]
+    RecordMetrics --> SendLog[发送日志]
+    SendLog --> AckMsg
+    
+    Listen --> Shutdown{收到停止信号?}
+    Shutdown -->|是| Cleanup[清理资源]
+    Cleanup --> Unregister[从etcd注销]
+    Unregister --> End([Worker停止])
+    Shutdown -->|否| Listen
+

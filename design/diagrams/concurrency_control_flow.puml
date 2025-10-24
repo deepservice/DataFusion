@@ -1,0 +1,188 @@
+@startuml
+title 并发控制机制流程图
+
+skinparam activity {
+    BackgroundColor<< Success >> LightGreen
+    BackgroundColor<< Failure >> LightCoral
+    BackgroundColor<< Waiting >> LightYellow
+    BorderColor<< Success >> Green
+    BorderColor<< Failure >> Red
+    BorderColor<< Waiting >> Orange
+}
+
+start
+
+:Worker节点接收任务;
+
+note right
+  任务信息包含:
+  - task_id
+  - target_url
+  - concurrency_config
+end note
+
+partition "全局并发控制" {
+    :尝试获取全局令牌;
+
+    :连接到Redis集群;
+
+    :执行Lua脚本检查全局令牌桶;
+
+    note right
+      令牌桶算法实现:
+      key: "global:tokens"
+      max_tokens: 100
+      refill_rate: 10/秒
+    end note
+
+    if (全局令牌可用?) then (是)
+        :扣减全局令牌计数;
+        :记录令牌获取时间;
+        #LightGreen:全局令牌获取成功 ✓;
+    else (否)
+        if (等待时间<超时阈值?) then (是)
+            #LightYellow:进入等待队列;
+            :设置等待超时(默认30秒);
+            :订阅Redis令牌释放事件;
+
+            note right
+              使用Redis Pub/Sub机制
+              当有令牌释放时通知等待者
+            end note
+
+            if (收到释放通知?) then (是)
+                :重新尝试获取全局令牌;
+                #LightGreen:获取成功 ✓;
+            else (否-超时)
+                #LightCoral:全局并发限流,任务失败 ✗;
+                stop
+            endif
+        else (否-已超时)
+            #LightCoral:等待超时,任务失败 ✗;
+            stop
+        endif
+    endif
+}
+
+partition "任务级并发控制" {
+    :读取任务并发配置;
+
+    note right
+      任务级配置:
+      - task_id: "task-123"
+      - max_concurrent: 5
+      - rate_limit: 10/min
+    end note
+
+    :构造任务级令牌桶Key\n"task:{task_id}:tokens";
+
+    :检查任务级令牌桶;
+
+    if (任务级令牌可用?) then (是)
+        :扣减任务级令牌;
+        #LightGreen:任务级令牌获取成功 ✓;
+    else (否)
+        if (等待时间<任务超时?) then (是)
+            #LightYellow:等待任务级令牌;
+            :延迟重试(指数退避);
+
+            note right
+              退避策略:
+              第1次: 延迟1秒
+              第2次: 延迟2秒
+              第3次: 延迟4秒
+              最多重试3次
+            end note
+
+            if (重试成功?) then (是)
+                #LightGreen:获取成功 ✓;
+            else (否)
+                :归还全局令牌;
+                #LightCoral:任务级限流,任务失败 ✗;
+                stop
+            endif
+        else (否)
+            :归还全局令牌;
+            #LightCoral:任务超时,任务失败 ✗;
+            stop
+        endif
+    endif
+}
+
+partition "请求频率控制" {
+    :检查请求间隔限制;
+
+    :读取上次请求时间\nfrom Redis;
+
+    :计算距上次请求的间隔;
+
+    if (间隔 >= 最小间隔?) then (是)
+        #LightGreen:频率检查通过 ✓;
+    else (否)
+        :计算需要等待时间\nwait_time = 最小间隔 - 当前间隔;
+
+        if (wait_time < 5秒?) then (是)
+            #LightYellow:短暂等待;
+            :sleep(wait_time);
+            #LightGreen:等待完成 ✓;
+        else (否)
+            :归还全局令牌;
+            :归还任务级令牌;
+            #LightCoral:频率限制过严,任务失败 ✗;
+            stop
+        endif
+    endif
+
+    :更新本次请求时间到Redis;
+}
+
+partition "执行任务" {
+    #LightGreen:**开始执行数据采集任务**;
+
+    note right
+      此时已通过所有并发控制:
+      ✓ 全局并发限制
+      ✓ 任务级并发限制
+      ✓ 请求频率限制
+    end note
+
+    :调用Collector执行采集;
+
+    if (采集成功?) then (是)
+        #LightGreen:采集完成;
+        :处理采集到的数据;
+    else (否)
+        #LightCoral:采集失败;
+        :记录失败日志;
+    endif
+}
+
+partition "资源释放" {
+    :归还任务级令牌到Redis;
+
+    :发布Redis事件\n通知任务级等待者;
+
+    :归还全局令牌到Redis;
+
+    :发布Redis事件\n通知全局等待者;
+
+    note right
+      令牌归还后立即通知
+      等待队列中的Worker
+      提高资源利用率
+    end note
+
+    #LightGreen:资源释放完成 ✓;
+}
+
+:任务执行完成;
+
+stop
+
+legend right
+  |<#LightGreen>| 成功路径 |
+  |<#LightCoral>| 失败路径 |
+  |<#LightYellow>| 等待状态 |
+endlegend
+
+@enduml

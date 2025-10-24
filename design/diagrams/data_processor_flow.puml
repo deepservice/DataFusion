@@ -1,0 +1,278 @@
+@startuml
+!pragma maxMessageSize 8192
+title 数据处理模块流程图
+
+skinparam activity {
+    BackgroundColor<<Parse>> LightBlue
+    BackgroundColor<<Clean>> LightGreen
+    BackgroundColor<<Transform>> LightYellow
+    BackgroundColor<<Deduplicate>> LightCoral
+    BorderColor<<Parse>> Blue
+    BorderColor<<Clean>> Green
+    BorderColor<<Transform>> Orange
+    BorderColor<<Deduplicate>> Red
+}
+
+|数据接收|
+start
+
+:接收原始数据\n(RawData);
+
+note right
+  原始数据来源:
+  - RPA采集: HTML字符串
+  - API采集: JSON/XML
+  - DB采集: 结构化记录
+end note
+
+:加载处理配置\n(ParseRules, CleanRules, FieldMapping);
+
+|数据解析阶段|
+
+partition "数据解析" <<Parse>> {
+    :识别数据格式\n(HTML/JSON/XML/CSV);
+
+    if (数据格式?) then (HTML)
+        :使用HTML解析器\n(goquery);
+
+        fork
+            :应用CSS选择器规则;
+            :提取字段1;
+        fork again
+            :应用XPath规则;
+            :提取字段2;
+        fork again
+            :应用正则表达式;
+            :提取字段3;
+        end fork
+
+        :合并提取结果;
+
+    elseif (JSON)
+        :使用JSON解析器\n(gjson);
+        :应用JSONPath表达式;
+        :提取目标字段;
+
+    elseif (XML)
+        :使用XML解析器;
+        :应用XPath表达式;
+        :提取目标字段;
+
+    elseif (CSV)
+        :使用CSV解析器;
+        :按列索引/列名提取;
+        :构造结构化数据;
+
+    else (未知格式)
+        #LightCoral:解析失败,记录错误;
+        stop
+    endif
+
+    :生成结构化数据对象\n(StructuredData);
+
+    note right
+      结构化数据格式:
+      map[string]interface{}{
+        "title": "...",
+        "content": "...",
+        "date": "2025-10-23",
+        ...
+      }
+    end note
+}
+
+|数据清洗阶段|
+
+partition "数据清洗" <<Clean>> {
+    :加载清洗规则引擎\n(expr);
+
+    :遍历每个字段;
+
+    repeat
+        :读取字段清洗规则;
+
+        if (有清洗规则?) then (是)
+            fork
+                :去除首尾空格\ntrim();
+            fork again
+                if (去除HTML标签?) then (是)
+                    :stripHTML();
+                endif
+            fork again
+                if (日期格式转换?) then (是)
+                    :dateNormalize()\n"YYYY年MM月DD日" → "YYYY-MM-DD";
+                endif
+            fork again
+                if (干扰信息去除?) then (是)
+                    :removeNoiseText()\n例如: "【广告】"、"点击查看更多";
+                endif
+            fork again
+                if (枚举类型标准化?) then (是)
+                    :standardizeEnum()\n例如: "男/M/male" → "MALE";
+                endif
+            fork again
+                if (正则替换?) then (是)
+                    :regexReplace(pattern, replacement);
+                endif
+            fork again
+                if (自定义脚本?) then (是)
+                    :执行expr表达式\n例如: upper(field) + "-suffix";
+                endif
+            end fork
+
+            :更新字段值;
+
+        else (否)
+            :保持原值;
+        endif
+
+        backward :下一个字段;
+    repeat while (还有字段?) is (是) not (否)
+}
+
+|数据转换阶段|
+
+partition "数据转换" <<Transform>> {
+    :应用字段映射规则\n(FieldMapping);
+
+    note right
+      字段映射示例:
+      source_field → target_field
+      "pub_time" → "publish_date"
+      "author_name" → "author"
+    end note
+
+    :创建目标数据结构;
+
+    repeat
+        :读取映射规则\n(sourceField, targetField, typeConvert);
+
+        if (类型转换?) then (是)
+            switch (目标类型)
+            case (INT)
+                :字符串 → 整数;
+            case (FLOAT)
+                :字符串 → 浮点数;
+            case (DATE)
+                :字符串 → 日期对象;
+            case (JSON)
+                :字符串 → JSON对象;
+            endswitch
+        else (否)
+            :保持原类型;
+        endif
+
+        :设置目标字段值;
+
+        backward :下一个映射;
+    repeat while (还有映射规则?) is (是) not (否)
+
+    :生成目标数据对象\n(TransformedData);
+}
+
+|数据去重阶段|
+
+partition "数据去重" <<Deduplicate>> {
+    :读取去重配置\n(deduplicateFields, strategy);
+
+    note right
+      去重策略:
+      - 基于主键字段
+      - 基于内容哈希
+      - 基于URL+时间
+    end note
+
+    if (启用去重?) then (是)
+        if (去重策略?) then (主键去重)
+            :计算主键字段组合;
+            :生成唯一标识\nkey = md5(field1 + field2 + ...);
+
+        elseif (内容哈希)
+            :计算内容哈希\nhash = sha256(json.dumps(data));
+
+        elseif (URL+时间)
+            :组合URL和采集时间\nkey = url + "_" + timestamp;
+        endif
+
+        :查询Redis缓存;
+
+        if (key已存在?) then (是)
+            #LightCoral:标记为重复数据;
+            :记录去重日志;
+
+            if (更新策略=替换?) then (是)
+                :使用新数据替换旧数据;
+                :更新Redis TTL;
+            else (跳过)
+                :丢弃当前数据;
+                stop
+            endif
+
+        else (否-新数据)
+            #LightGreen:标记为新数据;
+            :将key写入Redis\n(设置TTL=7天);
+        endif
+
+    else (否)
+        #LightYellow:跳过去重检查;
+    endif
+}
+
+|增量/全量策略|
+
+partition "更新策略判断" {
+    if (更新策略?) then (增量更新)
+        :查询上次采集的数据快照;
+
+        :计算数据差异\n(Diff Algorithm);
+
+        note right
+          差异计算:
+          - 新增: 新数据中有,旧数据中无
+          - 更新: 两者都有,但内容不同
+          - 删除: 旧数据有,新数据无
+        end note
+
+        if (有差异?) then (是)
+            #LightGreen:标记变更字段;
+            :生成增量数据集\n(仅包含变更);
+            :更新数据快照;
+        else (否)
+            #LightYellow:无变更,跳过存储;
+            stop
+        endif
+
+    elseif (全量更新)
+        #LightBlue:使用完整数据集;
+        :覆盖旧数据;
+
+    endif
+}
+
+|数据输出|
+
+:构造最终处理结果\n(ProcessedData);
+
+note right
+  输出数据包含:
+  - data: 处理后的数据
+  - metadata: 元数据信息
+  - stats: 统计信息
+    - parsed_count: 解析数量
+    - cleaned_count: 清洗数量
+    - duplicated_count: 去重数量
+    - final_count: 最终数量
+end note
+
+:传递给存储模块\n(Storage Module);
+
+stop
+
+legend right
+  |<#LightBlue>| 解析阶段 |
+  |<#LightGreen>| 清洗阶段 |
+  |<#LightYellow>| 转换阶段 |
+  |<#LightCoral>| 去重阶段 |
+endlegend
+
+@enduml

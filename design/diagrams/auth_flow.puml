@@ -1,0 +1,363 @@
+@startuml
+title 认证授权流程图
+
+skinparam sequence {
+    ArrowColor DeepSkyBlue
+    ActorBorderColor DeepSkyBlue
+    LifeLineBorderColor blue
+    LifeLineBackgroundColor #A9DCDF
+    ParticipantBorderColor DeepSkyBlue
+    ParticipantBackgroundColor DodgerBlue
+    ParticipantFontColor #FFFFFF
+}
+
+actor "用户" as User
+participant "Web UI" as UI
+participant "API Gateway" as Gateway
+participant "AuthService\n认证服务" as Auth
+database "PostgreSQL\n用户数据库" as DB
+database "Redis\n会话缓存" as Redis
+participant "RBAC\n权限控制" as RBAC
+participant "OAuth Provider\n(第三方)" as OAuth
+
+== 场景1: 本地用户登录 ==
+
+User -> UI: 输入用户名密码
+activate UI
+
+UI -> Gateway: POST /api/v1/auth/login\n{username, password}
+activate Gateway
+
+Gateway -> Auth: Login(username, password)
+activate Auth
+
+Auth -> DB: SELECT * FROM users\nWHERE username=?
+activate DB
+DB --> Auth: User记录
+deactivate DB
+
+alt 用户不存在
+    Auth --> Gateway: 401 Unauthorized
+    Gateway --> UI: 登录失败
+    UI --> User: 提示"用户名或密码错误"
+end
+
+Auth -> Auth: 验证密码哈希\nbcrypt.Compare(hashedPassword, password)
+
+alt 密码错误
+    Auth -> DB: UPDATE users\nSET failed_attempts=failed_attempts+1
+    activate DB
+    DB --> Auth: OK
+    deactivate DB
+
+    Auth --> Gateway: 401 Unauthorized
+    Gateway --> UI: 登录失败
+    UI --> User: 提示"用户名或密码错误"
+end
+
+Auth -> Auth: 生成JWT Token
+
+note right
+  JWT Payload:
+  {
+    "user_id": "123",
+    "username": "admin",
+    "role": "admin",
+    "exp": timestamp + 24h,
+    "iat": timestamp
+  }
+  签名算法: HS256
+  密钥: 从环境变量读取
+end note
+
+Auth -> Redis: 存储会话信息\nkey=session:{user_id}\nvalue={token, login_time, ip}\nTTL=24h
+activate Redis
+Redis --> Auth: OK
+deactivate Redis
+
+Auth -> DB: UPDATE users\nSET last_login=NOW(), failed_attempts=0
+activate DB
+DB --> Auth: OK
+deactivate DB
+
+Auth --> Gateway: {access_token, refresh_token, user_info}
+deactivate Auth
+
+Gateway --> UI: 登录成功
+UI -> UI: 存储Token到localStorage
+UI --> User: 跳转到主页
+deactivate Gateway
+deactivate UI
+
+== 场景2: OAuth第三方登录(SSO) ==
+
+User -> UI: 点击"第三方登录"
+activate UI
+
+UI -> Gateway: GET /api/v1/auth/oauth/authorize?provider=github
+activate Gateway
+
+Gateway -> Auth: GetAuthURL(provider)
+activate Auth
+Auth --> Gateway: OAuth授权URL
+Gateway --> UI: 重定向URL
+deactivate Gateway
+
+UI --> User: 跳转到GitHub授权页面
+deactivate UI
+
+User -> OAuth: 授权登录
+activate OAuth
+OAuth --> User: 重定向到callback\n+ authorization_code
+
+User -> UI: callback?code=xxx
+activate UI
+
+UI -> Gateway: GET /api/v1/auth/oauth/callback?code=xxx
+activate Gateway
+
+Gateway -> Auth: HandleOAuthCallback(code)
+activate Auth
+
+Auth -> OAuth: POST /oauth/token\n{code, client_id, client_secret}
+OAuth --> Auth: {access_token, id_token}
+
+Auth -> OAuth: GET /user\nAuthorization: Bearer {access_token}
+OAuth --> Auth: 用户信息{id, email, name}
+deactivate OAuth
+
+Auth -> DB: SELECT * FROM users\nWHERE email=?\nAND auth_source LIKE 'oauth_%'
+activate DB
+
+alt 用户首次登录
+    DB --> Auth: 无记录
+    deactivate DB
+
+    Auth -> DB: INSERT INTO users\n(username, email, auth_source='oauth_企业统一认证平台',\nrole='business_operator', password_hash=NULL)
+    activate DB
+    DB --> Auth: 新用户ID
+    deactivate DB
+
+    note right
+      第三方用户:
+      - auth_source标识来源
+      - role默认为business_operator
+      - password_hash为NULL
+    end note
+else 已存在用户
+    DB --> Auth: User记录
+    deactivate DB
+
+    Auth -> DB: UPDATE users\nSET last_login_at=NOW()
+    activate DB
+    DB --> Auth: OK
+    deactivate DB
+end
+
+Auth -> Auth: 生成JWT Token
+
+Auth -> Redis: 存储会话
+activate Redis
+Redis --> Auth: OK
+deactivate Redis
+
+Auth --> Gateway: {access_token, refresh_token, user_info}
+deactivate Auth
+
+Gateway --> UI: 登录成功
+UI --> User: 显示主页
+deactivate Gateway
+deactivate UI
+
+== 场景2.5: LDAP认证登录 ==
+
+User -> UI: 输入LDAP账号密码
+activate UI
+
+UI -> Gateway: POST /api/v1/auth/ldap/login\n{username, password, ldap_provider}
+activate Gateway
+
+Gateway -> Auth: LDAPLogin(username, password, provider)
+activate Auth
+
+Auth -> DB: SELECT * FROM oauth_providers\nWHERE provider_type='ldap' AND name=?
+activate DB
+DB --> Auth: LDAP配置(server, bind_dn, base_dn)
+deactivate DB
+
+participant "LDAP Server\n(企业目录)" as LDAP
+Auth -> LDAP: LDAP Bind\n(bind_dn, password)
+activate LDAP
+
+alt LDAP认证失败
+    LDAP --> Auth: 认证失败
+    deactivate LDAP
+
+    Auth --> Gateway: 401 Unauthorized
+    Gateway --> UI: 登录失败
+    UI --> User: 提示"域账号或密码错误"
+else LDAP认证成功
+    LDAP --> Auth: 认证成功 + 用户属性(email, cn)
+    deactivate LDAP
+end
+
+Auth -> DB: SELECT * FROM users\nWHERE username=?\nAND auth_source LIKE 'ldap_%'
+activate DB
+
+alt 用户首次LDAP登录
+    DB --> Auth: 无记录
+    deactivate DB
+
+    Auth -> DB: INSERT INTO users\n(username, email, auth_source='ldap_公司LDAP',\nrole='business_operator', password_hash=NULL)
+    activate DB
+    DB --> Auth: 新用户ID
+    deactivate DB
+
+    note right
+      LDAP用户:
+      - auth_source='ldap_提供商名'
+      - 使用LDAP认证,不存储密码
+      - 默认角色business_operator
+    end note
+else 已存在LDAP用户
+    DB --> Auth: User记录
+    deactivate DB
+
+    Auth -> DB: UPDATE users\nSET last_login_at=NOW()
+    activate DB
+    DB --> Auth: OK
+    deactivate DB
+end
+
+Auth -> Auth: 生成JWT Token
+
+Auth -> Redis: 存储会话
+activate Redis
+Redis --> Auth: OK
+deactivate Redis
+
+Auth --> Gateway: {access_token, refresh_token, user_info}
+deactivate Auth
+
+Gateway --> UI: 登录成功
+UI --> User: 显示主页
+deactivate Gateway
+deactivate UI
+
+== 场景3: API请求鉴权 ==
+
+User -> UI: 操作(如创建任务)
+activate UI
+
+UI -> Gateway: POST /api/v1/tasks\nAuthorization: Bearer {access_token}\n{task_config}
+activate Gateway
+
+Gateway -> Auth: ValidateToken(token)
+activate Auth
+
+Auth -> Auth: 解析JWT\njwt.Parse(token, secretKey)
+
+alt Token格式错误或签名无效
+    Auth --> Gateway: 401 Invalid Token
+    Gateway --> UI: 认证失败
+    UI --> User: 提示"请重新登录"
+end
+
+Auth -> Redis: 检查会话是否存在\nGET session:{user_id}
+activate Redis
+
+alt 会话已失效(如用户已登出)
+    Redis --> Auth: nil
+    deactivate Redis
+
+    Auth --> Gateway: 401 Session Expired
+    Gateway --> UI: 认证失败
+    UI --> User: 提示"会话已过期"
+else 会话有效
+    Redis --> Auth: 会话信息
+    deactivate Redis
+end
+
+Auth -> Auth: 提取用户信息和角色\nuser_id, role
+
+Auth --> Gateway: 认证成功\n{user_id, role}
+deactivate Auth
+
+Gateway -> RBAC: CheckPermission(user_id, role, resource="tasks", action="create")
+activate RBAC
+
+RBAC -> DB: SELECT permissions\nFROM role_permissions\nWHERE role=?
+activate DB
+DB --> RBAC: 权限列表
+deactivate DB
+
+note right of RBAC
+  RBAC权限模型:
+
+  角色定义(5种):
+  - admin(系统管理员): 所有权限
+  - data_analyst(数据分析师): 任务查看、数据查看
+  - algorithm_engineer(算法工程师): 任务管理、数据管理
+  - business_operator(业务运营): 任务查看、执行
+    ⭐OAuth/LDAP用户默认角色
+  - developer(开发工程师): API调用、任务管理
+
+  权限检查示例:
+  tasks:create → admin, algorithm_engineer, developer
+  tasks:delete → admin
+  tasks:view → all roles
+  tasks:execute → admin, business_operator, algorithm_engineer
+end note
+
+alt 无权限
+    RBAC --> Gateway: 403 Forbidden
+    deactivate RBAC
+
+    Gateway --> UI: 权限不足
+    UI --> User: 提示"您没有权限执行此操作"
+else 有权限
+    RBAC --> Gateway: 授权成功
+    deactivate RBAC
+end
+
+Gateway -> Gateway: 执行业务逻辑\n创建任务
+
+Gateway --> UI: 200 OK\n{task_id, message}
+UI --> User: 提示"任务创建成功"
+deactivate Gateway
+deactivate UI
+
+== 场景4: Token刷新 ==
+
+User -> UI: Token即将过期
+activate UI
+
+UI -> Gateway: POST /api/v1/auth/refresh\nAuthorization: Bearer {refresh_token}
+activate Gateway
+
+Gateway -> Auth: RefreshToken(refresh_token)
+activate Auth
+
+Auth -> Auth: 验证refresh_token
+Auth -> Redis: 检查refresh_token是否有效
+activate Redis
+Redis --> Auth: 有效
+deactivate Redis
+
+Auth -> Auth: 生成新的access_token
+
+Auth -> Redis: 更新会话信息
+activate Redis
+Redis --> Auth: OK
+deactivate Redis
+
+Auth --> Gateway: {new_access_token, new_refresh_token}
+deactivate Auth
+
+Gateway --> UI: Token刷新成功
+UI -> UI: 更新本地Token
+UI --> User: 继续操作
+deactivate Gateway
+deactivate UI
+
+@enduml

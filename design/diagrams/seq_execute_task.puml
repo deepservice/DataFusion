@@ -1,0 +1,152 @@
+@startuml
+title 任务执行时序图
+
+participant "调度引擎" as Scheduler
+participant "RabbitMQ" as MQ
+participant "Worker节点" as Worker
+participant "采集器" as Collector
+participant "采集插件" as Plugin
+participant "处理器" as Processor
+participant "存储器" as Storage
+database "目标数据库" as TargetDB
+participant "监控服务" as Monitor
+database "PostgreSQL" as DB
+
+== 任务调度阶段 ==
+
+Scheduler -> Scheduler: 定时器触发
+activate Scheduler
+
+Scheduler -> DB: SELECT * FROM tasks\nWHERE next_run_time <= NOW()
+activate DB
+DB --> Scheduler: 返回待执行任务列表
+deactivate DB
+
+loop 每个待执行任务
+    Scheduler -> DB: INSERT INTO task_runs\n(task_id, status='pending')
+    activate DB
+    DB --> Scheduler: 返回run_id
+    deactivate DB
+    
+    Scheduler -> MQ: Publish Task Message\n{run_id, task_id, config}
+    activate MQ
+    MQ --> Scheduler: ACK
+    deactivate MQ
+    
+    Scheduler -> DB: UPDATE tasks\nSET next_run_time = ...
+    activate DB
+    DB --> Scheduler: OK
+    deactivate DB
+end
+
+deactivate Scheduler
+
+== 任务执行阶段 ==
+
+Worker -> MQ: Consume Task Message
+activate Worker
+activate MQ
+MQ --> Worker: {run_id, task_id, config}
+deactivate MQ
+
+Worker -> DB: UPDATE task_runs\nSET status='running', start_time=NOW()
+activate DB
+DB --> Worker: OK
+deactivate DB
+
+Worker -> Monitor: 上报任务开始事件
+activate Monitor
+Monitor --> Worker: ACK
+deactivate Monitor
+
+Worker -> Collector: Execute(config)
+activate Collector
+
+alt 网页采集
+    Collector -> Plugin: WebCollectorPlugin.Collect(url, rules)
+    activate Plugin
+    Plugin -> Plugin: 发送HTTP请求
+    Plugin -> Plugin: 解析HTML
+    Plugin --> Collector: 返回原始数据
+    deactivate Plugin
+else 数据库采集
+    Collector -> Plugin: DBCollectorPlugin.Query(conn, sql)
+    activate Plugin
+    Plugin -> Plugin: 连接数据库
+    Plugin -> Plugin: 执行查询
+    Plugin --> Collector: 返回查询结果
+    deactivate Plugin
+end
+
+Collector --> Worker: 返回原始数据
+deactivate Collector
+
+Worker -> Processor: Process(raw_data, rules)
+activate Processor
+
+Processor -> Processor: 数据解析
+Processor -> Processor: 数据清洗
+Processor -> Processor: 数据转换
+Processor -> Processor: 数据去重
+
+Processor --> Worker: 返回处理后数据
+deactivate Processor
+
+Worker -> Storage: Store(processed_data, config)
+activate Storage
+
+alt 成功存储
+    Storage -> TargetDB: INSERT INTO ...
+    activate TargetDB
+    TargetDB --> Storage: 插入成功
+    deactivate TargetDB
+    
+    Storage --> Worker: 存储成功, count=N
+    deactivate Storage
+    
+    Worker -> DB: UPDATE task_runs\nSET status='success',\nend_time=NOW(),\ndata_count=N
+    activate DB
+    DB --> Worker: OK
+    deactivate DB
+    
+    Worker -> Monitor: 上报任务成功事件
+    activate Monitor
+    Monitor --> Worker: ACK
+    deactivate Monitor
+    
+else 存储失败
+    Storage --> Worker: 存储失败, error
+    deactivate Storage
+    
+    Worker -> DB: UPDATE task_runs\nSET status='failed',\nend_time=NOW(),\nerror_msg=...
+    activate DB
+    DB --> Worker: OK
+    deactivate DB
+    
+    Worker -> Monitor: 上报任务失败事件
+    activate Monitor
+    Monitor -> Monitor: 检查告警规则
+    Monitor -> Monitor: 发送告警通知
+    Monitor --> Worker: ACK
+    deactivate Monitor
+    
+    alt 可重试
+        Worker -> Scheduler: 请求重新调度
+        activate Scheduler
+        Scheduler -> MQ: Publish Task Message\n(延迟队列)
+        activate MQ
+        MQ --> Scheduler: ACK
+        deactivate MQ
+        deactivate Scheduler
+    end
+end
+
+Worker -> MQ: ACK Message
+activate MQ
+MQ --> Worker: OK
+deactivate MQ
+
+deactivate Worker
+
+@enduml
+
