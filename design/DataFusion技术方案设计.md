@@ -885,6 +885,341 @@ ui --> user: 提示"数据源配置成功，可用于创建任务"
    - 敏感数据脱敏（可选，如手机号、身份证号）
    - 审计日志（记录所有数据库操作）
 
+#### 3.1.1.3. API数据源配置与采集流程
+
+**场景描述**：用户配置RESTful API数据源，系统测试API调用并提取数据。支持多种认证方式（API Key、OAuth 2.0、Basic Auth）、JSONPath数据提取、多种分页策略和速率限制配置。
+
+**参与组件**：
+- Web UI（前端界面）
+- API Gateway（网关服务）
+- Master - DataSource Service（数据源管理服务）
+- PostgreSQL（配置存储）
+- RabbitMQ（消息队列）
+- Worker - API Collector（API采集Worker）
+- HTTP Client（resty库）
+- Target API（目标API服务）
+
+**时序图**：
+
+```plantuml
+@startuml seq_api_collection
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI" as ui
+participant "API Gateway" as gateway
+participant "Master\nDataSource Service" as master
+database "PostgreSQL" as db
+queue "RabbitMQ" as mq
+participant "Worker\nAPI Collector" as worker
+participant "HTTP Client\n(resty)" as http
+participant "Target API" as api
+
+autonumber
+
+== 配置API端点 ==
+
+user -> ui: 填写API基本信息
+note right of user
+  配置示例：
+  - API名称: 产品数据API
+  - 端点URL: https://api.partner.com/v1/products
+  - HTTP方法: GET
+  - Content-Type: application/json
+end note
+
+ui -> gateway: POST /api/v1/datasources/api/config
+gateway -> master: 创建API数据源配置
+master -> db: INSERT INTO datasources (type='api', config)
+db --> master: 返回datasource_id
+
+== 配置认证方式 ==
+
+user -> ui: 选择认证方式
+note right of user
+  支持的认证方式：
+  1. API Key (Header/Query)
+  2. OAuth 2.0 (Client Credentials/Authorization Code)
+  3. Basic Auth (用户名/密码)
+  4. Bearer Token
+  5. Custom Header
+end note
+
+alt 选择OAuth 2.0
+  user -> ui: 配置OAuth参数
+  note right of user
+    OAuth配置：
+    - Client ID: abc123
+    - Client Secret: ******
+    - Token URL: https://api.partner.com/oauth/token
+    - Grant Type: client_credentials
+    - Scope: read:products
+  end note
+  ui -> gateway: PUT /api/v1/datasources/{id}/auth
+  gateway -> master: 更新认证配置
+  master -> db: UPDATE datasources SET auth_config=encrypted_json
+  note right of master
+    敏感信息加密存储：
+    - Client Secret: AES-256-GCM加密
+    - 密钥存储在密钥管理服务
+  end note
+else 选择API Key
+  user -> ui: 配置API Key
+  ui -> gateway: PUT /api/v1/datasources/{id}/auth
+  gateway -> master: 更新认证配置（API Key）
+  master -> db: UPDATE datasources SET auth_config
+end
+
+db --> master: 更新成功
+master --> gateway: 返回配置结果
+gateway --> ui: 返回成功
+ui --> user: 显示认证配置成功
+
+== 配置请求参数 ==
+
+user -> ui: 配置请求参数
+note right of user
+  参数配置：
+  - Query参数: ?category=electronics&status=active
+  - Header: X-Custom-Header: value
+  - Body(POST): {"filter": "active"}
+  - 动态变量: {start_date}, {end_date}
+end note
+
+ui -> gateway: PUT /api/v1/datasources/{id}/params
+gateway -> master: 更新请求参数配置
+master -> db: UPDATE datasources SET request_params
+db --> master: 更新成功
+
+== 配置响应数据路径(JSONPath) ==
+
+user -> ui: 配置JSONPath表达式
+note right of user
+  JSONPath配置：
+  - 数据根路径: $.data.items[*]
+  - 字段映射:
+    * $.id → product_id
+    * $.name → product_name
+    * $.price → price
+    * $.created_at → created_time
+end note
+
+ui -> gateway: PUT /api/v1/datasources/{id}/extraction
+gateway -> master: 更新数据提取规则
+master -> db: UPDATE datasources SET extraction_rules
+db --> master: 更新成功
+
+== 配置分页策略 ==
+
+user -> ui: 选择分页策略
+note right of user
+  支持的分页策略：
+  1. Page-based: ?page=1&page_size=100
+  2. Offset-based: ?offset=0&limit=100
+  3. Cursor-based: ?cursor=abc123&limit=100
+  4. Link Header: 读取响应Header中的next链接
+end note
+
+ui -> gateway: PUT /api/v1/datasources/{id}/pagination
+gateway -> master: 更新分页配置
+master -> db: UPDATE datasources SET pagination_config
+db --> master: 更新成功
+
+== 测试API调用 ==
+
+user -> ui: 点击"测试连接"
+ui -> gateway: POST /api/v1/datasources/{id}/test
+gateway -> master: 提交测试任务
+master -> db: SELECT auth_config, request_params FROM datasources WHERE id=?
+db --> master: 返回配置信息
+master -> mq: 推送测试任务（高优先级队列）
+mq --> master: ACK
+
+master --> gateway: 返回task_id
+gateway --> ui: WebSocket连接建立
+ui --> user: 显示"测试中..."
+
+mq -> worker: 拉取测试任务
+worker -> db: 查询完整配置
+db --> worker: 返回数据源配置
+
+alt OAuth 2.0认证
+  worker -> http: 构建Token请求
+  http -> api: POST /oauth/token (client_credentials)
+  api --> http: 返回access_token
+  http --> worker: 返回token
+  note right of worker
+    Token缓存：
+    - 存储到Redis
+    - TTL=expires_in - 60s
+    - 后续请求复用
+  end note
+end
+
+worker -> http: 构建API请求（带认证）
+note right of worker
+  请求构建：
+  1. 替换动态变量({start_date}等)
+  2. 添加认证Header/Query
+  3. 设置User-Agent
+  4. 配置超时（默认30s）
+end note
+
+http -> api: GET /v1/products?page=1&page_size=10
+note right of http
+  请求头示例：
+  Authorization: Bearer eyJhbGc...
+  Content-Type: application/json
+  User-Agent: DataFusion/1.0
+  X-Custom-Header: value
+end note
+
+alt API调用成功
+  api --> http: 200 OK + JSON响应
+  note left of api
+    响应示例：
+    {
+      "data": {
+        "items": [
+          {"id": 1, "name": "Product A", "price": 99.99},
+          {"id": 2, "name": "Product B", "price": 149.99}
+        ],
+        "total": 1024,
+        "page": 1
+      }
+    }
+
+    响应头：
+    X-RateLimit-Remaining: 4999
+    X-RateLimit-Reset: 1640000000
+  end note
+
+  http --> worker: 返回响应
+
+  worker -> worker: 解析Rate Limit信息
+  note right of worker
+    Rate Limit检测：
+    - 读取X-RateLimit-*头
+    - 计算剩余配额
+    - 存储到Redis
+    - 动态调整采集速率
+  end note
+
+  worker -> worker: 应用JSONPath提取数据
+  note right of worker
+    数据提取：
+    - 使用gjson库解析JSON
+    - 应用JSONPath: $.data.items[*]
+    - 提取字段并映射
+    - Schema验证
+  end note
+
+  worker -> worker: 数据预览（前10条）
+  worker -> gateway: WebSocket推送结果
+  gateway -> ui: 推送测试结果
+  ui -> user: 显示预览数据
+  note right of user
+    预览结果：
+    ✓ 连接成功
+    ✓ 认证通过
+    ✓ 提取到2条数据
+    ✓ Schema: {id, name, price}
+    ✓ Rate Limit: 4999/5000
+
+    数据示例：
+    [
+      {"product_id": 1, "product_name": "Product A", "price": 99.99},
+      {"product_id": 2, "product_name": "Product B", "price": 149.99}
+    ]
+  end note
+
+else API调用失败
+  api --> http: 4xx/5xx错误
+  note left of api
+    常见错误：
+    - 401 Unauthorized: 认证失败
+    - 403 Forbidden: 权限不足
+    - 429 Too Many Requests: 超速率限制
+    - 500 Internal Server Error: 服务器错误
+  end note
+
+  http --> worker: 返回错误
+  worker -> worker: 错误分类与记录
+  worker -> gateway: WebSocket推送错误
+  gateway -> ui: 推送错误信息
+  ui -> user: 显示错误详情
+  note right of user
+    错误提示：
+    ✗ 测试失败
+    错误类型: 401 Unauthorized
+    建议: 请检查Client ID和Secret是否正确
+  end note
+end
+
+== 保存配置 ==
+
+user -> ui: 确认配置无误，点击"保存"
+ui -> gateway: PUT /api/v1/datasources/{id}/finalize
+gateway -> master: 标记数据源为已激活
+master -> db: UPDATE datasources SET status='active', updated_at=NOW()
+db --> master: 更新成功
+master --> gateway: 返回成功
+gateway --> ui: 返回成功
+ui --> user: 显示"API数据源配置完成"
+
+@enduml
+```
+
+![API数据源配置与采集流程](diagrams/seq_api_collection.png)
+
+**关键技术点**：
+
+1. **HTTP客户端选型**
+   - Go语言使用resty库（基于net/http封装）
+   - 支持连接池、超时控制、自动重试
+   - 支持中间件（日志、指标、链路追踪）
+   - 支持HTTP/2和连接复用
+
+2. **OAuth 2.0流程实现**
+   - 支持Client Credentials流程（服务端应用）
+   - 支持Authorization Code流程（需要用户授权）
+   - Token自动刷新（在过期前60秒主动刷新）
+   - Token存储到Redis（支持分布式Worker共享）
+   - PKCE扩展支持（增强安全性）
+
+3. **JSONPath解析引擎**
+   - 使用gjson库（高性能、零内存分配）
+   - 支持复杂路径：`$.data.items[?(@.status=='active')].id`
+   - 支持数组过滤和条件筛选
+   - Schema自动推断（基于首批数据）
+   - 类型转换（字符串→数字、时间戳→日期）
+
+4. **分页策略自动检测**
+   - 分析响应结构（total、page、next_cursor等字段）
+   - 检测Link Header（RFC 5988）
+   - 自动推断分页参数名称
+   - 支持混合分页（第一页Page-based，后续Cursor-based）
+   - 防止无限循环（最大页数限制、去重检测）
+
+5. **Rate Limiting遵守**
+   - 解析标准Rate Limit头（X-RateLimit-*、Retry-After）
+   - Token Bucket算法（本地速率控制）
+   - 分布式限流（Redis + Lua脚本）
+   - 429错误自动重试（指数退避）
+   - 动态速率调整（根据剩余配额）
+   - 多租户隔离（不同数据源独立限流）
+
+6. **响应Schema自动推断**
+   - 分析首批数据推断字段类型
+   - 支持嵌套JSON扁平化
+   - 检测数组字段（需要展开）
+   - 字段重命名建议（遵循命名规范）
+   - 数据质量评估（空值率、重复率）
+   - 生成数据字典（字段名、类型、示例、描述）
+
 ---
 
 ### 3.2. 核心模块设计
