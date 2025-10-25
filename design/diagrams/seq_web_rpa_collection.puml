@@ -1,0 +1,140 @@
+@startuml seq_web_rpa_collection
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI" as ui
+participant "API Gateway" as gateway
+participant "Master\nDataSource Service" as master
+database "PostgreSQL" as db
+queue "RabbitMQ" as mq
+participant "Worker\nRPA Collector" as worker
+participant "Playwright\nHeadless Browser" as playwright
+participant "Target Website" as website
+
+autonumber
+
+== 配置数据源 ==
+
+user -> ui: 填写网页数据源配置\n(URL, 请求头, 代理等)
+ui -> gateway: POST /api/v1/datasources\n{type: "web_rpa", config: {...}}
+gateway -> gateway: 验证JWT Token
+gateway -> master: 创建数据源请求
+master -> db: INSERT datasource配置\n(status: "draft")
+master --> gateway: 返回数据源ID
+gateway --> ui: 200 OK {datasource_id}
+ui --> user: 显示数据源ID
+
+== 配置字段提取规则 ==
+
+user -> ui: 配置字段提取规则\n(CSS选择器/XPath/正则)
+note right of user
+  用户配置示例：
+  - title: CSS ".article-title"
+  - date: XPath "//span[@class='time']"
+  - content: CSS ".article-content"
+end note
+
+ui -> gateway: PUT /api/v1/datasources/{id}/rules\n{fields: [...]}
+gateway -> master: 更新提取规则
+master -> db: UPDATE datasource\nSET extraction_rules = {...}
+master --> gateway: 200 OK
+gateway --> ui: 配置已保存
+ui --> user: 提示保存成功
+
+== 测试采集 ==
+
+user -> ui: 点击"测试采集"按钮
+ui -> gateway: POST /api/v1/datasources/{id}/test
+gateway -> master: 创建测试任务
+
+master -> mq: 发布测试任务到高优先级队列\n{task_id, datasource_id, type: "test"}
+note right of mq
+  任务消息包含：
+  - 数据源配置（URL、请求头）
+  - 提取规则（CSS/XPath/正则）
+  - RPA配置（浏览器类型、超时）
+end note
+
+master --> gateway: 202 Accepted {task_id}
+gateway --> ui: 返回任务ID
+ui --> user: 显示"正在测试..."
+
+== Worker执行RPA采集 ==
+
+worker -> mq: 从队列获取任务\n(long polling)
+mq --> worker: 返回任务消息
+
+worker -> db: 查询数据源配置\nSELECT * FROM datasources WHERE id = ?
+db --> worker: 返回配置详情
+
+worker -> playwright: 启动无头浏览器\nlaunchBrowser({headless: true})
+playwright --> worker: 返回浏览器实例
+
+worker -> playwright: 创建新页面\nnewPage()
+playwright --> worker: 返回页面实例
+
+worker -> playwright: 设置User-Agent和请求头\nsetUserAgent(), setExtraHTTPHeaders()
+
+worker -> playwright: 访问目标URL\ngoto(url, {waitUntil: 'domcontentloaded'})
+playwright -> website: HTTP GET请求
+website --> playwright: 返回HTML响应
+
+playwright -> playwright: 渲染页面，执行JavaScript
+playwright -> playwright: 等待页面加载完成
+
+playwright --> worker: 页面加载成功
+
+worker -> playwright: 提取字段数据\nevaluate(CSS选择器/XPath)
+note right of worker
+  根据用户配置的规则提取：
+  - title: page.$('.article-title')
+  - date: page.$x('//span[@class="time"]')
+  - content: page.$('.article-content')
+end note
+
+playwright --> worker: 返回提取的数据数组
+
+worker -> worker: 应用数据清洗规则\n(去除HTML标签、格式转换)
+
+worker -> playwright: 关闭浏览器\nbrowser.close()
+
+== 返回测试结果 ==
+
+worker -> db: 保存测试结果\nINSERT INTO test_results\n{task_id, data: [...], status: "success"}
+
+worker -> master: 通过RabbitMQ回调\n上报任务完成状态
+note right of worker
+  结果包含：
+  - 提取到的数据条数
+  - 前3条数据示例
+  - 执行耗时
+  - 是否有错误
+end note
+
+master -> db: UPDATE datasource\nSET test_status = "success",\nlast_test_time = NOW()
+
+== 轮询获取结果（或WebSocket推送） ==
+
+ui -> gateway: GET /api/v1/tasks/{task_id}/result\n(轮询或WebSocket)
+gateway -> master: 查询任务结果
+master -> db: SELECT * FROM test_results\nWHERE task_id = ?
+db --> master: 返回测试结果数据
+master --> gateway: 返回结果JSON
+gateway --> ui: 200 OK {status: "success", data: [...]}
+
+ui --> user: 展示测试结果\n- 提取到50条数据\n- 显示前3条预览\n- 执行耗时: 3.5秒
+
+== 保存数据源 ==
+
+user -> ui: 点击"保存"按钮
+ui -> gateway: PUT /api/v1/datasources/{id}/publish
+gateway -> master: 发布数据源
+master -> db: UPDATE datasource\nSET status = "active",\npublished_at = NOW()
+master --> gateway: 200 OK
+gateway --> ui: 数据源已发布
+ui --> user: 提示"数据源配置成功"
+
+@enduml
