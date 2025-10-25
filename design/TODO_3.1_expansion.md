@@ -3,18 +3,18 @@
 ## 任务目标
 将产品需求分析文档中的11个用户场景转化为14个技术时序图，扩展技术方案设计文档的3.1节。
 
-## 总体进度: 1/14 (7%)
+## 总体进度: 3/14 (21%)
 
 ---
 
 ## Session 1 进度 (2025-10-25)
 
-### ✅ 已完成 (1个时序图)
+### ✅ 已完成 (3个时序图)
 
 1. **3.1节结构重构**
    - ✅ 添加分组标题和总体说明
    - ✅ 重新组织章节结构为4大类
-   - 文件位置: 第389-602行
+   - 文件位置: 第389-402行
 
 2. **3.1.1.1 网页数据源配置与RPA采集流程** ✅
    - 场景描述: 用户配置网页数据源，使用RPA测试采集
@@ -23,53 +23,35 @@
    - 关键技术点: 6个方面（异步执行、RPA引擎、数据提取、错误处理、性能优化、安全性）
    - 文件位置: 第403-602行
    - 图片引用: `diagrams/seq_web_rpa_collection.png`
+   - Git提交: 7407a9d
+
+3. **3.1.1.2 数据库数据源配置与同步流程** ✅
+   - 场景描述: 用户配置数据库数据源，测试连接和SQL查询
+   - 参与组件: 8个（WebUI, Gateway, Master, PostgreSQL, RabbitMQ, Worker, Source Database等）
+   - PlantUML代码: 完整的时序图（约210行）
+   - 关键技术点: 6个方面（连接池管理、SQL注入防护、增量同步、大数据分批、跨数据库兼容、安全性）
+   - 文件位置: 第604-886行
+   - 图片引用: `diagrams/seq_db_sync.png`
+   - Git提交: 454cdb1
+
+4. **3.1.1.3 API数据源配置与采集流程** ✅
+   - 场景描述: 用户配置RESTful API数据源，测试API调用
+   - 参与组件: 8个（WebUI, Gateway, Master, PostgreSQL, RabbitMQ, Worker, HTTP Client, Target API）
+   - PlantUML代码: 完整的时序图（约270行）
+   - 关键技术点: 6个方面（HTTP客户端、OAuth 2.0流程、JSONPath解析、分页策略、Rate Limiting、Schema推断）
+   - 文件位置: 第888-1222行
+   - 图片引用: `diagrams/seq_api_collection.png`
+   - Git提交: 1a5a55f
 
 ### 🔄 进行中
 
-**3.1.1.2 数据库数据源配置与同步流程** (待继续)
+**3.1.1.4 页面DOM解析与智能字段识别流程** (待继续)
 
 ---
 
 ## Session 2 待完成任务
 
-### 📋 3.1.1 数据采集场景（剩余3个）
-
-#### 3.1.1.2 数据库数据源配置与同步流程
-- **场景描述**: 用户配置数据库数据源（MySQL/PostgreSQL），测试连接和SQL查询
-- **参与组件**: WebUI, Gateway, Master, PostgreSQL(配置库), Worker, Source Database
-- **关键流程**:
-  1. 用户配置连接信息（类型、主机、端口、认证）
-  2. 系统测试连接
-  3. 用户配置SQL查询（支持变量如{start_date}）
-  4. 系统执行测试查询，返回预览数据
-  5. 用户配置字段映射（源→目标）
-  6. 配置增量同步策略（可选）
-- **关键技术点**:
-  - 连接池管理（HikariCP）
-  - SQL注入防护（参数化查询）
-  - 增量同步算法（基于时间戳/ID）
-  - 大数据量分批处理（游标/LIMIT OFFSET）
-  - 事务隔离级别控制
-  - 跨数据库兼容性（支持MySQL、PostgreSQL、Oracle等）
-
-#### 3.1.1.3 API数据源配置与采集流程
-- **场景描述**: 用户配置RESTful API数据源，测试API调用和数据提取
-- **参与组件**: WebUI, Gateway, Master, PostgreSQL, Worker, Target API
-- **关键流程**:
-  1. 用户配置API端点（URL、HTTP方法）
-  2. 用户配置认证方式（API Key、OAuth2、Basic Auth）
-  3. 用户配置请求参数（Query/Body/Header）
-  4. 用户配置响应数据路径（JSONPath表达式）
-  5. 用户配置分页策略（Page/Offset、Cursor、Link Header）
-  6. 系统测试API调用
-  7. 返回响应数据预览和schema推断
-- **关键技术点**:
-  - HTTP客户端选型（resty for Go）
-  - OAuth2.0流程实现（Authorization Code、Client Credentials）
-  - JSONPath解析引擎（gjson）
-  - 分页策略自动检测
-  - Rate Limiting遵守（429重试、X-RateLimit头解析）
-  - 响应schema自动推断
+### 📋 3.1.1 数据采集场景（剩余1个）
 
 #### 3.1.1.4 页面DOM解析与智能字段识别流程
 - **场景描述**: 用户输入URL，系统自动解析页面结构，智能识别数据字段
@@ -223,5 +205,6 @@
 
 ## 最后更新
 - **日期**: 2025-10-25
-- **最后完成**: 3.1.1.1 网页数据源配置与RPA采集流程
-- **下一步**: 3.1.1.2 数据库数据源配置与同步流程
+- **最后完成**: 3.1.1.3 API数据源配置与采集流程
+- **下一步**: 3.1.1.4 页面DOM解析与智能字段识别流程
+- **当前进度**: 3/14 (21%)
