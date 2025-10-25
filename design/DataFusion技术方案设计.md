@@ -1220,6 +1220,347 @@ ui --> user: 显示"API数据源配置完成"
    - 数据质量评估（空值率、重复率）
    - 生成数据字典（字段名、类型、示例、描述）
 
+#### 3.1.1.4. 页面DOM解析与智能字段识别流程
+
+**场景描述**：用户输入目标网页URL，系统自动渲染页面、解析DOM结构，并使用AI引擎智能识别数据字段（如标题、日期、作者、内容等），生成推荐的CSS选择器或XPath表达式，大幅简化数据源配置流程。
+
+**参与组件**：
+- Web UI（前端界面）
+- API Gateway（网关服务）
+- Master - DataSource Service（数据源管理服务）
+- PostgreSQL（配置存储）
+- RabbitMQ（消息队列）
+- Worker - RPA Engine（RPA执行引擎）
+- Playwright（无头浏览器）
+- AI Field Recognizer（字段识别引擎）
+- Target Website（目标网站）
+
+**时序图**：
+
+```plantuml
+@startuml seq_dom_parsing
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI" as ui
+participant "API Gateway" as gateway
+participant "Master\nDataSource Service" as master
+database "PostgreSQL" as db
+queue "RabbitMQ" as mq
+participant "Worker\nRPA Engine" as worker
+participant "Playwright" as browser
+participant "AI Field\nRecognizer" as ai
+participant "Target\nWebsite" as website
+
+autonumber
+
+== 输入目标URL ==
+
+user -> ui: 输入目标URL
+note right of user
+  示例：
+  URL: https://example.com/products
+  目标: 采集产品列表数据
+end note
+
+ui -> gateway: POST /api/v1/datasources/preview
+note right of ui
+  请求参数：
+  {
+    "url": "https://example.com/products",
+    "wait_for": "networkidle",
+    "screenshot": true
+  }
+end note
+
+gateway -> master: 提交页面预览任务
+master -> mq: 推送预览任务（高优先级队列）
+mq --> master: ACK
+
+master --> gateway: 返回task_id
+gateway --> ui: WebSocket连接建立
+ui --> user: 显示"正在加载页面..."
+
+== Worker执行页面渲染 ==
+
+mq -> worker: 拉取预览任务
+worker -> browser: 启动Playwright浏览器
+browser --> worker: 浏览器实例创建成功
+
+worker -> browser: 导航到目标URL
+browser -> website: GET https://example.com/products
+website --> browser: 返回HTML + 静态资源
+
+browser -> browser: 执行JavaScript，渲染DOM
+note right of browser
+  等待策略：
+  - networkidle: 网络空闲500ms
+  - domcontentloaded: DOM加载完成
+  - load: 所有资源加载完成
+end note
+
+browser --> worker: 页面渲染完成
+
+== 提取DOM结构 ==
+
+worker -> browser: 执行DOM提取脚本
+note right of worker
+  提取内容：
+  1. 完整DOM树（序列化为JSON）
+  2. 页面截图（PNG格式）
+  3. 页面元数据（title、meta等）
+end note
+
+browser -> browser: 序列化DOM树
+note right of browser
+  DOM结构示例：
+  {
+    "tag": "div",
+    "class": "product-list",
+    "children": [
+      {
+        "tag": "div",
+        "class": "product-item",
+        "children": [
+          {"tag": "h3", "class": "title", "text": "Product A"},
+          {"tag": "span", "class": "price", "text": "$99.99"},
+          {"tag": "time", "attr": {"datetime": "2025-01-01"}}
+        ]
+      },
+      ...
+    ]
+  }
+end note
+
+browser -> browser: 生成页面截图
+browser --> worker: 返回DOM JSON + 截图
+
+== AI智能字段识别 ==
+
+worker -> ai: 调用字段识别引擎
+note right of worker
+  输入数据：
+  - DOM树JSON
+  - 页面截图（可选，用于视觉理解）
+  - 用户提示（可选，如"产品列表"）
+end note
+
+ai -> ai: 分析DOM结构，识别重复模式
+note right of ai
+  重复模式检测算法：
+  1. 遍历DOM树，查找同级重复元素
+  2. 计算元素结构相似度（LCS最长公共子序列）
+  3. 识别容器元素（如ul>li, div.list>div.item）
+  4. 统计重复次数（>=3认为是列表）
+end note
+
+ai -> ai: 识别字段类型
+note right of ai
+  字段类型推断规则：
+  - 标题：h1-h6、.title、.name、大字体文本
+  - 日期：time标签、datetime属性、日期正则匹配
+  - 作者：.author、.by、rel="author"
+  - 价格：$符号、.price、数字+货币单位
+  - 图片：img标签、background-image
+  - 链接：a标签、href属性
+  - 描述：p标签、.description、长文本
+end note
+
+ai -> ai: 生成CSS选择器/XPath
+note right of ai
+  选择器生成策略：
+  1. 优先使用语义化class/id
+  2. 避免过于具体的路径（脆弱）
+  3. 生成最短唯一路径
+  4. 支持nth-child、contains等高级选择器
+
+  示例：
+  - CSS: .product-list .product-item h3.title
+  - XPath: //div[@class='product-list']//h3[@class='title']
+end note
+
+ai -> ai: 计算置信度
+note right of ai
+  置信度评分因素：
+  1. 重复模式一致性（权重40%）
+  2. 字段数量充足性（权重30%）
+  3. 字段类型匹配度（权重20%）
+  4. 选择器唯一性（权重10%）
+
+  置信度等级：
+  - 高（>80%）：绿色标记，建议直接使用
+  - 中（50%-80%）：黄色标记，建议人工审核
+  - 低（<50%）：红色标记，需要手动配置
+end note
+
+ai --> worker: 返回识别结果
+note left of ai
+  识别结果示例：
+  {
+    "container": {
+      "selector": ".product-list .product-item",
+      "count": 24,
+      "confidence": 0.95
+    },
+    "fields": [
+      {
+        "name": "title",
+        "type": "text",
+        "selector": "h3.title",
+        "confidence": 0.92,
+        "sample": ["Product A", "Product B", "Product C"]
+      },
+      {
+        "name": "price",
+        "type": "number",
+        "selector": "span.price",
+        "confidence": 0.88,
+        "sample": ["$99.99", "$149.99", "$79.99"]
+      },
+      {
+        "name": "date",
+        "type": "datetime",
+        "selector": "time",
+        "attribute": "datetime",
+        "confidence": 0.85,
+        "sample": ["2025-01-01", "2025-01-02"]
+      }
+    ]
+  }
+end note
+
+== 返回识别结果 ==
+
+worker -> db: 保存DOM快照和识别结果
+db --> worker: 保存成功
+
+worker -> gateway: WebSocket推送识别结果
+gateway -> ui: 推送识别结果 + 页面截图
+ui -> user: 显示可视化识别结果
+note right of user
+  UI展示：
+  1. 页面截图（高亮识别区域）
+  2. 识别字段列表（名称、类型、选择器、置信度）
+  3. 数据预览（前5-10条示例数据）
+  4. 可视化编辑器（点击元素调整选择器）
+
+  用户操作：
+  - ✓ 确认使用推荐配置
+  - ✏️ 手动调整选择器
+  - ➕ 添加新字段
+  - ➖ 删除不需要的字段
+end note
+
+== 用户确认或调整 ==
+
+alt 用户确认推荐配置
+  user -> ui: 点击"确认配置"
+  ui -> gateway: POST /api/v1/datasources/{id}/apply-suggestion
+  gateway -> master: 应用推荐配置
+  master -> db: UPDATE datasources SET extraction_rules=suggested_rules
+  db --> master: 更新成功
+  master --> gateway: 返回成功
+  gateway --> ui: 返回成功
+  ui --> user: 显示"配置已保存，可以开始采集"
+
+else 用户手动调整
+  user -> ui: 调整选择器或字段类型
+  note right of user
+    调整示例：
+    - 修改选择器：.title → h3.product-name
+    - 更改字段类型：text → url
+    - 添加数据清洗规则：trim()、toUpperCase()
+  end note
+
+  ui -> gateway: PUT /api/v1/datasources/{id}/extraction
+  gateway -> master: 更新提取规则
+  master -> db: UPDATE datasources SET extraction_rules=custom_rules
+  db --> master: 更新成功
+
+  master -> mq: 推送测试任务（验证调整后的规则）
+  mq -> worker: 拉取测试任务
+  worker -> browser: 重新提取数据（使用新规则）
+  browser --> worker: 返回测试数据
+
+  worker -> gateway: WebSocket推送测试结果
+  gateway -> ui: 推送测试结果
+  ui -> user: 显示测试数据预览
+  note right of user
+    测试结果：
+    ✓ 成功提取10条数据
+    字段完整性: 100%
+    数据示例：
+    [
+      {"title": "Product A", "price": 99.99, "date": "2025-01-01"},
+      ...
+    ]
+  end note
+
+  user -> ui: 确认调整后的配置
+  ui -> gateway: POST /api/v1/datasources/{id}/finalize
+  gateway -> master: 标记数据源为已激活
+  master -> db: UPDATE datasources SET status='active'
+  db --> master: 更新成功
+  master --> gateway: 返回成功
+  gateway --> ui: 返回成功
+  ui --> user: 显示"配置完成"
+end
+
+@enduml
+```
+
+![页面DOM解析与智能字段识别流程](diagrams/seq_dom_parsing.png)
+
+**关键技术点**：
+
+1. **DOM树序列化**
+   - 保留完整结构（标签、属性、文本、层级关系）
+   - 过滤不相关信息（script、style、注释）
+   - 压缩存储（去除空白、使用简写属性名）
+   - 支持增量更新（仅序列化变化部分）
+   - 数据结构优化（使用数组索引代替对象引用）
+
+2. **重复模式识别算法**
+   - LCS（最长公共子序列）计算结构相似度
+   - 同级元素聚类分析（K-means或DBSCAN）
+   - 结构指纹生成（基于标签序列、class组合）
+   - 容错机制（允许部分字段缺失或顺序变化）
+   - 性能优化（使用布隆过滤器预筛选、剪枝策略）
+
+3. **字段类型推断**
+   - 基于HTML语义标签（time、address、article等）
+   - 基于class/id命名规则（title、price、author等）
+   - 基于文本模式匹配（正则表达式库）
+   - 基于元素属性（datetime、href、src等）
+   - 可选：轻量级NLP模型（字段语义理解）
+   - 类型优先级排序（语义标签 > 属性 > class > 文本模式）
+
+4. **CSS选择器自动生成**
+   - 生成最短唯一路径（避免过长选择器）
+   - 优先使用语义化class/id（提高可读性和稳定性）
+   - 避免使用绝对位置（nth-child(7)），优先使用相对位置
+   - 支持复杂选择器（属性选择器、伪类、组合选择器）
+   - 健壮性测试（在DOM子集上验证选择器唯一性）
+   - 备选方案生成（提供2-3个候选选择器）
+
+5. **置信度评分**
+   - 多维度评分模型（结构一致性、字段数量、类型匹配度）
+   - 权重可配置（根据实际效果调整）
+   - 阈值分级（高/中/低置信度）
+   - 人工反馈学习（记录用户调整，优化模型）
+   - A/B测试（对比不同算法效果）
+
+6. **可视化编辑器**
+   - 页面截图高亮识别区域（使用不同颜色标记不同字段）
+   - 点击元素直接生成选择器（类似浏览器DevTools）
+   - 实时预览提取结果（所见即所得）
+   - 选择器语法校验和提示
+   - 支持拖拽调整字段顺序
+   - 历史记录和撤销/重做功能
+
 ---
 
 ### 3.2. 核心模块设计
