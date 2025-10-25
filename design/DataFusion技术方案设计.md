@@ -2582,5 +2582,5 @@ POST /api/v1/tasks/batch-delete
 
 **文档版本:** v1.0  
 **编写日期:** 2025-10-23  
-**作者:** Manus AI
+**作者:** zzy
 
