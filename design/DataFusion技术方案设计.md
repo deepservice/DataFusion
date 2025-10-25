@@ -601,6 +601,292 @@ ui --> user: 提示"数据源配置成功"
 
 ---
 
+##### 3.1.1.2. 数据库数据源配置与同步流程
+
+**场景描述**
+
+用户通过Web UI配置一个数据库数据源（MySQL/PostgreSQL/Oracle等），系统测试数据库连接，执行SQL查询获取数据，并配置字段映射和增量同步策略。此场景展示了从连接测试、查询预览、字段映射到保存配置的完整流程。
+
+**参与组件**
+- Web UI (Vue.js)
+- API Gateway (Gin/Go)
+- Master节点 - 数据源管理服务
+- PostgreSQL (配置存储)
+- RabbitMQ (任务队列)
+- Worker节点 - 数据库采集器
+- Source Database (源数据库：MySQL/PostgreSQL/Oracle等)
+
+**时序图**
+
+![数据库数据源配置与同步时序图](diagrams/seq_db_sync.png)
+
+```plantuml
+@startuml seq_db_sync
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI" as ui
+participant "API Gateway" as gateway
+participant "Master\nDataSource Service" as master
+database "PostgreSQL\n(Config DB)" as configdb
+queue "RabbitMQ" as mq
+participant "Worker\nDB Collector" as worker
+database "Source Database\n(MySQL/PG/Oracle)" as sourcedb
+
+autonumber
+
+== 配置数据库连接 ==
+
+user -> ui: 填写数据库连接信息\n(类型, 主机, 端口, 认证)
+note right of user
+  配置示例：
+  - 类型: MySQL
+  - 主机: partner-db.example.com
+  - 端口: 3306
+  - 数据库: sales_db
+  - 用户名: readonly_user
+  - 密码: ******
+end note
+
+ui -> gateway: POST /api/v1/datasources\n{type: "database", db_config: {...}}
+gateway -> gateway: 验证JWT Token
+gateway -> master: 创建数据库数据源请求
+
+master -> master: 加密密码\n(AES-256-GCM)
+master -> configdb: INSERT datasource\n(status: "draft", encrypted_password)
+configdb --> master: 返回datasource_id
+master --> gateway: 200 OK {datasource_id}
+gateway --> ui: 返回数据源ID
+ui --> user: 显示"数据源已创建"
+
+== 测试数据库连接 ==
+
+user -> ui: 点击"测试连接"按钮
+ui -> gateway: POST /api/v1/datasources/{id}/test-connection
+gateway -> master: 创建连接测试任务
+
+master -> mq: 发布测试任务到高优先级队列\n{task_id, datasource_id, action: "test_connection"}
+master --> gateway: 202 Accepted {task_id}
+gateway --> ui: 返回任务ID
+ui --> user: 显示"正在测试连接..."
+
+worker -> mq: 从队列获取任务
+mq --> worker: 返回测试任务
+
+worker -> configdb: 查询数据源配置\nSELECT * FROM datasources WHERE id = ?
+configdb --> worker: 返回配置（含加密密码）
+
+worker -> worker: 解密密码
+
+worker -> sourcedb: 建立数据库连接\nconnect(host, port, username, password)
+note right of worker
+  使用连接池：
+  - 最小连接数: 1
+  - 最大连接数: 5
+  - 连接超时: 30s
+  - 查询超时: 60s
+end note
+
+alt 连接成功
+    sourcedb --> worker: 连接建立成功
+
+    worker -> sourcedb: 执行测试查询\nSELECT 1
+    sourcedb --> worker: 返回结果
+
+    worker -> sourcedb: 获取数据库元信息\nSHOW TABLES / \\dt
+    sourcedb --> worker: 返回表列表
+
+    worker -> configdb: 保存测试结果\nINSERT test_results\n{status: "success", tables: [...]}
+
+    worker -> sourcedb: 关闭连接\nclose()
+
+else 连接失败
+    sourcedb --> worker: 连接错误\n(超时/认证失败/网络错误)
+
+    worker -> configdb: 保存失败结果\n{status: "failed", error: "..."}
+end
+
+worker -> master: 通过MQ回调上报结果
+
+== 轮询获取测试结果 ==
+
+ui -> gateway: GET /api/v1/tasks/{task_id}/result\n(轮询)
+gateway -> master: 查询测试结果
+master -> configdb: SELECT * FROM test_results\nWHERE task_id = ?
+configdb --> master: 返回结果
+master --> gateway: 200 OK {status, tables: [...]}
+gateway --> ui: 返回测试结果
+
+ui --> user: 显示测试结果\n✓ 连接成功\n发现50个表
+
+== 配置SQL查询 ==
+
+user -> ui: 编写SQL查询语句\n(支持变量)
+note right of user
+  SQL示例：
+  SELECT
+    product_id,
+    product_name,
+    sales_amount,
+    sales_date
+  FROM sales_records
+  WHERE sales_date >= '{start_date}'
+    AND sales_date < '{end_date}'
+  ORDER BY sales_date DESC
+  LIMIT 1000
+end note
+
+ui -> gateway: PUT /api/v1/datasources/{id}/query\n{sql: "...", variables: {...}}
+gateway -> master: 保存SQL配置
+master -> configdb: UPDATE datasource\nSET query_sql = ?, query_variables = ?
+master --> gateway: 200 OK
+gateway --> ui: SQL已保存
+ui --> user: 提示"配置已保存"
+
+== 测试SQL查询 ==
+
+user -> ui: 点击"测试查询"按钮\n(填写测试变量值)
+ui -> gateway: POST /api/v1/datasources/{id}/test-query\n{start_date: "2025-10-01", end_date: "2025-10-25"}
+gateway -> master: 创建查询测试任务
+
+master -> mq: 发布测试任务\n{task_id, datasource_id, action: "test_query"}
+master --> gateway: 202 Accepted {task_id}
+
+worker -> mq: 获取任务
+worker -> configdb: 查询配置
+configdb --> worker: 返回SQL和连接信息
+
+worker -> worker: 变量替换\n{start_date} → '2025-10-01'
+worker -> worker: SQL注入检查\n(参数化查询)
+
+worker -> sourcedb: 建立连接
+worker -> sourcedb: 执行查询\n(带超时: 60s)
+note right of worker
+  安全措施：
+  - 使用预编译语句
+  - 限制返回行数(LIMIT 100)
+  - 查询超时控制
+  - 只读事务
+end note
+
+sourcedb --> worker: 返回查询结果\n(前100行)
+
+worker -> worker: 推断字段类型\n(INT, VARCHAR, DATETIME等)
+
+worker -> configdb: 保存测试结果和schema\n{rows: 100, schema: [...], sample_data: [...]}
+
+worker -> sourcedb: 关闭连接
+
+== 获取查询结果 ==
+
+ui -> gateway: GET /api/v1/tasks/{task_id}/result
+gateway -> master: 查询结果
+master -> configdb: SELECT FROM test_results
+configdb --> master: 返回结果
+master --> gateway: 200 OK {rows: 100, schema: [...], data: [...]}
+gateway --> ui: 返回查询结果
+
+ui --> user: 展示查询结果\n- 查询到100条数据\n- 显示前10行预览\n- 显示字段schema
+
+== 配置字段映射 ==
+
+user -> ui: 配置源字段→目标字段映射
+note right of user
+  字段映射示例：
+  product_id → product_id (INT)
+  product_name → name (VARCHAR)
+  sales_amount → amount (DECIMAL)
+  sales_date → date (DATE)
+end note
+
+ui -> gateway: PUT /api/v1/datasources/{id}/field-mapping\n{mappings: [...]}
+gateway -> master: 保存字段映射
+master -> configdb: UPDATE datasource\nSET field_mapping = ?
+master --> gateway: 200 OK
+gateway --> ui: 映射已保存
+
+== 配置增量同步策略（可选）==
+
+user -> ui: 配置增量同步\n(基于时间戳字段)
+note right of user
+  增量配置：
+  - 增量字段: sales_date
+  - 增量方式: 大于上次同步时间
+  - 初始值: 2025-01-01
+end note
+
+ui -> gateway: PUT /api/v1/datasources/{id}/incremental\n{field: "sales_date", strategy: "gt_last_sync"}
+gateway -> master: 保存增量配置
+master -> configdb: UPDATE datasource\nSET incremental_config = ?
+master --> gateway: 200 OK
+
+== 发布数据源 ==
+
+user -> ui: 点击"发布"按钮
+ui -> gateway: PUT /api/v1/datasources/{id}/publish
+gateway -> master: 发布数据源
+master -> configdb: UPDATE datasource\nSET status = "active",\npublished_at = NOW()
+master --> gateway: 200 OK
+gateway --> ui: 数据源已发布
+ui --> user: 提示"数据源配置成功，可用于创建任务"
+
+@enduml
+```
+
+**关键技术点**
+
+1. **连接池管理**
+   - 使用成熟的连接池库（Go: `database/sql` 内置连接池）
+   - 配置合理的连接数（最小1，最大5-10，根据负载调整）
+   - 连接超时控制（连接超时30s，查询超时60s，可配置）
+   - 连接空闲回收（空闲超过10分钟自动关闭）
+   - 连接健康检查（Ping测试，失败自动重连）
+
+2. **SQL注入防护**
+   - 必须使用参数化查询/预编译语句（Prepared Statement）
+   - 禁止直接拼接SQL字符串
+   - 变量替换前进行类型检查和转义
+   - 限制SQL语句类型（只允许SELECT，禁止DDL/DML）
+   - 查询结果行数限制（测试时最多100行）
+
+3. **增量同步算法**
+   - **基于时间戳**：`WHERE update_time > last_sync_time`
+   - **基于自增ID**：`WHERE id > last_max_id`
+   - **基于删除标记**：`WHERE deleted_at IS NULL OR deleted_at > last_sync_time`
+   - 首次同步支持指定初始值
+   - 断点续传（记录上次同步位置到Redis）
+   - 避免数据重复（使用UPSERT或主键冲突检查）
+
+4. **大数据量处理**
+   - 分批查询（每批1000-10000行，可配置）
+   - 使用数据库游标（Cursor）流式读取
+   - 避免一次性加载全部数据到内存
+   - 支持LIMIT/OFFSET分页（注意性能问题）
+   - 更优：基于索引字段的范围查询（`id > last_id LIMIT 10000`）
+
+5. **跨数据库兼容性**
+   - 抽象统一的数据库接口
+   - 针对不同数据库类型的驱动：
+     - MySQL: `go-sql-driver/mysql`
+     - PostgreSQL: `lib/pq`
+     - Oracle: `godror`
+     - SQL Server: `denisenkom/go-mssqldb`
+   - 处理不同数据库的SQL方言差异
+   - 统一的数据类型映射（DB类型 → Go类型）
+
+6. **安全性考虑**
+   - 数据库密码AES-256-GCM加密存储
+   - 密钥管理（使用环境变量或密钥管理服务）
+   - 只使用只读账号（限制数据库权限）
+   - 网络隔离（Worker通过VPN/专线访问源数据库）
+   - 敏感数据脱敏（可选，如手机号、身份证号）
+   - 审计日志（记录所有数据库操作）
+
+---
+
 ### 3.2. 核心模块设计
 
 以下是系统的核心模块详细设计，各模块职责分明，通过定义好的接口进行协作。
