@@ -1,0 +1,279 @@
+@startuml
+title 手动触发任务执行时序图
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI" as ui
+participant "WebSocket\nServer" as ws
+participant "API Gateway" as gateway
+participant "Master\nTask Service" as master
+database "PostgreSQL" as db
+participant "Redis" as redis
+queue "RabbitMQ\nPriority Queue" as mq
+participant "Worker Node" as worker
+participant "Monitor\nService" as monitor
+
+autonumber
+
+== 建立WebSocket连接 ==
+
+user -> ui: 进入任务详情页面
+ui -> ws: 建立WebSocket连接\nws://server/task-logs/{task_id}
+activate ws
+ws -> ws: 验证JWT Token
+ws -> redis: SADD ws_connections:{task_id}\n{connection_id}
+activate redis
+redis --> ws: OK
+deactivate redis
+ws --> ui: WebSocket连接已建立
+note right of ws
+  WebSocket用途:
+  - 实时推送任务日志
+  - 推送任务状态变化
+  - 推送执行进度
+end note
+
+== 手动触发任务 ==
+
+user -> ui: 点击"立即执行"按钮
+ui -> ui: 弹出确认对话框
+user -> ui: 确认执行
+
+ui -> gateway: POST /api/v1/tasks/{task_id}/trigger\n{trigger_type: "manual"}
+activate gateway
+gateway -> gateway: 验证JWT Token
+gateway -> gateway: 提取用户信息(user_id)
+
+gateway -> master: TriggerTask(task_id, user_id, "manual")
+activate master
+
+== 权限与状态检查 ==
+
+master -> db: SELECT t.*, u.role\nFROM tasks t\nJOIN user_permissions u\nWHERE t.id = {task_id}\nAND u.user_id = {user_id}
+activate db
+db --> master: {task_info, user_role}
+deactivate db
+
+alt 用户无权限
+    master --> gateway: 403 Forbidden\n{error: "Permission denied"}
+    gateway --> ui: 显示错误
+    ui --> user: "您没有执行此任务的权限"
+    note right: 终止流程
+end
+
+alt 任务状态异常
+    master -> master: 检查任务状态
+    alt status = 'disabled'
+        master --> gateway: 400 Bad Request\n{error: "Task is disabled"}
+        gateway --> ui: 显示错误
+        ui --> user: "任务已禁用，无法执行"
+        note right: 终止流程
+    else status = 'deleted'
+        master --> gateway: 404 Not Found
+        gateway --> ui: 显示错误
+        ui --> user: "任务不存在"
+        note right: 终止流程
+    end
+end
+
+== 并发控制检查 ==
+
+master -> redis: GET task:{task_id}:running_count
+activate redis
+redis --> master: running_count = 2
+deactivate redis
+
+master -> db: SELECT max_concurrent_runs\nFROM task_configs\nWHERE task_id = {task_id}
+activate db
+db --> master: max_concurrent_runs = 3
+deactivate db
+
+alt running_count >= max_concurrent_runs
+    master --> gateway: 409 Conflict\n{error: "Max concurrent runs exceeded"}
+    gateway --> ui: 显示警告
+    ui --> user: "任务执行数已达上限(2/3)，\n请稍后再试"
+    note right: 终止流程
+end
+
+== 任务去重检查 ==
+
+master -> redis: EXISTS task:{task_id}:manual_trigger_lock
+activate redis
+redis --> master: 1 (锁存在)
+deactivate redis
+
+alt 锁存在(防抖动)
+    master --> gateway: 429 Too Many Requests\n{error: "Please wait 5 seconds"}
+    gateway --> ui: 显示提示
+    ui --> user: "请勿频繁点击，5秒后重试"
+    note right: 终止流程
+end
+
+' 设置防抖动锁
+master -> redis: SETEX task:{task_id}:manual_trigger_lock\n5 "locked"
+activate redis
+redis --> master: OK
+deactivate redis
+
+== 创建执行实例 ==
+
+master -> db: BEGIN TRANSACTION
+activate db
+
+master -> db: INSERT INTO task_runs\n(id, task_id, trigger_type='manual',\ntriggered_by={user_id},\nstatus='pending', priority=10)
+db --> master: run_id = "run_manual_xxx"
+
+master -> db: UPDATE tasks\nSET last_manual_run_at = NOW()
+db --> master: OK
+
+master -> db: COMMIT TRANSACTION
+db --> master: Transaction Committed
+deactivate db
+
+== 推送到高优先级队列 ==
+
+master -> redis: HSET task_run:{run_id}\nstatus=pending\ntrigger_type=manual\ntriggered_by={user_id}\nqueued_at={timestamp}
+activate redis
+redis --> master: OK
+deactivate redis
+
+master -> redis: INCR task:{task_id}:running_count
+activate redis
+redis --> master: 3
+deactivate redis
+
+master -> mq: Publish Task Message\n{run_id, task_id, config}\npriority=10 (最高优先级)
+activate mq
+note right of mq
+  手动触发任务特点:
+  - priority=10 (最高)
+  - 优先于所有定时任务
+  - 立即被Worker消费
+end note
+mq --> master: Message Published (ACK)
+deactivate mq
+
+master --> gateway: 200 OK\n{run_id, status: "pending"}
+deactivate master
+
+gateway --> ui: 任务已提交\n{run_id}
+deactivate gateway
+
+ui --> user: 显示"任务执行中...\n实时日志如下:"
+
+== Worker消费并执行任务 ==
+
+worker -> mq: Consume Task Message\n(优先级10，立即消费)
+activate worker
+activate mq
+mq --> worker: {run_id, task_id, config}
+deactivate mq
+
+worker -> db: UPDATE task_runs\nSET status='running',\nstart_time=NOW(),\nworker_id={worker_id}
+activate db
+db --> worker: OK
+deactivate db
+
+worker -> redis: HSET task_run:{run_id}\nstatus=running\nworker_id={worker_id}
+activate redis
+redis --> worker: OK
+deactivate redis
+
+' 通过Monitor服务推送状态变化
+worker -> monitor: Report Task Status Change\n{run_id, status: "running"}
+activate monitor
+
+monitor -> redis: GET ws_connections:{task_id}
+activate redis
+redis --> monitor: [connection_id_1, connection_id_2]
+deactivate redis
+
+monitor -> ws: Push Status Update\n{run_id, status: "running"}
+ws -> ui: WebSocket消息\n{"type": "status", "status": "running"}
+ui -> ui: 更新状态显示
+ui --> user: 状态: 运行中 ⏳
+
+monitor --> worker: ACK
+deactivate monitor
+
+== 实时日志推送 ==
+
+loop 执行过程中
+    worker -> worker: 执行采集、处理、存储
+
+    worker -> monitor: Push Log Entry\n{run_id, level: "INFO",\nmessage: "正在解析数据...",\ntimestamp}
+    activate monitor
+
+    monitor -> ws: Push Log Entry
+    ws -> ui: WebSocket消息\n{"type": "log", "level": "INFO",\n"msg": "正在解析数据..."}
+    ui -> ui: 追加到日志区域
+    ui --> user: [14:30:56] INFO 正在解析数据...
+
+    deactivate monitor
+end
+
+note right of worker
+  典型日志消息:
+  - "开始执行任务"
+  - "连接数据源成功"
+  - "发送HTTP请求..."
+  - "解析完成，提取到50条记录"
+  - "数据清洗完成"
+  - "写入数据库..."
+end note
+
+== 任务完成 ==
+
+worker -> db: UPDATE task_runs\nSET status='success',\nend_time=NOW(),\ndata_count=48,\nexecution_time_ms=12500
+activate db
+db --> worker: OK
+deactivate db
+
+worker -> redis: HSET task_run:{run_id}\nstatus=success\ndata_count=48
+activate redis
+redis --> worker: OK
+deactivate redis
+
+worker -> redis: DECR task:{task_id}:running_count
+activate redis
+redis --> worker: 2
+deactivate redis
+
+worker -> monitor: Report Task Success\n{run_id, data_count: 48,\nexecution_time: 12500}
+activate monitor
+
+monitor -> ws: Push Final Status\n{run_id, status: "success",\ndata_count: 48, duration: 12500}
+ws -> ui: WebSocket消息\n{"type": "complete",\n"status": "success", ...}
+
+ui -> ui: 显示执行结果摘要
+ui --> user: ✓ 执行成功\n采集数据: 48条\n耗时: 12.5秒
+
+monitor --> worker: ACK
+deactivate monitor
+
+deactivate worker
+
+== 关闭WebSocket连接 ==
+
+user -> ui: 关闭页面或跳转
+ui -> ws: 关闭WebSocket连接
+ws -> redis: SREM ws_connections:{task_id}\n{connection_id}
+activate redis
+redis --> ws: OK
+deactivate redis
+
+ws -> ws: 关闭连接
+deactivate ws
+
+note over ui, ws
+  WebSocket连接管理:
+  - 超时时间: 30分钟无消息自动断开
+  - 心跳: 客户端每30秒发送ping
+  - 重连: 断线后自动重连(最多3次)
+  - 清理: 连接断开时从Redis移除
+end note
+
+@enduml

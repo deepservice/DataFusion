@@ -1,0 +1,314 @@
+@startuml
+title 任务失败重试与告警时序图
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "Worker Node" as worker
+database "PostgreSQL" as db
+participant "Redis" as redis
+participant "Monitor\nService" as monitor
+participant "Alert Manager" as alert_mgr
+participant "Rule Engine" as rule_engine
+queue "RabbitMQ\nDelay Queue" as mq
+participant "Email Gateway" as email
+participant "SMS Gateway" as sms
+participant "DingTalk Bot" as dingtalk
+participant "WeChat Work Bot" as wechat
+
+autonumber
+
+== 任务执行失败 ==
+
+worker -> worker: 任务执行失败\n(网络超时/数据库连接失败等)
+activate worker
+
+note right of worker
+  常见失败原因:
+  - 网络超时
+  - 目标站点不可访问
+  - 数据库连接失败
+  - 数据解析错误
+  - 存储空间不足
+end note
+
+worker -> db: UPDATE task_runs\nSET status='failed',\nend_time=NOW(),\nerror_msg='{error_details}',\nretry_count=retry_count+1
+activate db
+db --> worker: OK
+deactivate db
+
+worker -> redis: HSET task_run:{run_id}\nstatus=failed\nerror={error_msg}\nfailed_at={timestamp}
+activate redis
+redis --> worker: OK
+deactivate redis
+
+== 读取重试策略 ==
+
+worker -> db: SELECT rp.*, tr.retry_count\nFROM task_retry_policies rp\nJOIN task_runs tr ON rp.task_id = tr.task_id\nWHERE tr.id = {run_id}
+activate db
+db --> worker: {\n  max_retries: 3,\n  backoff_type: "exponential",\n  base_delay_seconds: 300,\n  max_delay_seconds: 3600,\n  retry_count: 1\n}
+deactivate db
+
+== 判断是否重试 ==
+
+alt retry_count < max_retries
+    worker -> worker: 计算延迟时间
+    note right of worker
+      指数退避算法:
+      delay = min(
+        base_delay * (2 ^ retry_count),
+        max_delay
+      )
+
+      示例:
+      - 第1次重试: 300s (5分钟)
+      - 第2次重试: 600s (10分钟)
+      - 第3次重试: 1200s (20分钟)
+    end note
+
+    worker -> worker: delay = min(300 * 2^1, 3600) = 600秒
+
+    worker -> db: UPDATE task_runs\nSET status='retry_pending',\nnext_retry_at = NOW() + INTERVAL '600 seconds'
+    activate db
+    db --> worker: OK
+    deactivate db
+
+    worker -> redis: HSET task_run:{run_id}\nstatus=retry_pending\nnext_retry_at={timestamp+600}
+    activate redis
+    redis --> worker: OK
+    deactivate redis
+
+    ' 推送到延迟队列
+    worker -> mq: Publish Retry Message\n{\n  run_id: {run_id},\n  task_id: {task_id},\n  config: {...},\n  retry_count: 1\n}\ndelay=600秒\npriority=3
+    activate mq
+    note right of mq
+      RabbitMQ延迟队列实现:
+      - 使用x-delayed-message插件
+      - 或使用Dead Letter Exchange + TTL
+      - 延迟后自动投递到工作队列
+    end note
+    mq --> worker: Retry Message Published
+    deactivate mq
+
+    worker -> monitor: Report Retry Scheduled\n{run_id, retry_count: 1,\nnext_retry_at: {timestamp}}
+    activate monitor
+    monitor --> worker: ACK
+    deactivate monitor
+
+else retry_count >= max_retries
+    worker -> worker: 达到最大重试次数
+
+    worker -> db: UPDATE task_runs\nSET status='final_failed',\nfinal_failed_at=NOW()
+    activate db
+    db --> worker: OK
+    deactivate db
+
+    worker -> redis: HSET task_run:{run_id}\nstatus=final_failed\nfinal_failed_at={timestamp}
+    activate redis
+    redis --> worker: OK
+    deactivate redis
+
+    worker -> redis: DECR task:{task_id}:running_count
+    activate redis
+    redis --> worker: OK
+    deactivate redis
+
+    worker -> monitor: Report Final Failure\n{run_id, error: {error_msg},\ntotal_retries: 3}
+    activate monitor
+    note right: 触发严重告警
+    deactivate monitor
+end
+
+deactivate worker
+
+== 告警评估阶段 ==
+
+monitor -> monitor: 接收到任务失败事件
+activate monitor
+
+monitor -> db: SELECT t.*, tr.error_msg, tr.retry_count\nFROM tasks t\nJOIN task_runs tr ON t.id = tr.task_id\nWHERE tr.id = {run_id}
+activate db
+db --> monitor: {task_info, error_msg, retry_count}
+deactivate db
+
+monitor -> redis: GET task:{task_id}:failure_stats
+activate redis
+redis --> monitor: {\n  consecutive_failures: 2,\n  failure_count_24h: 5,\n  last_success_at: {timestamp}\n}
+deactivate redis
+
+' 更新失败统计
+monitor -> redis: HINCRBY task:{task_id}:failure_stats\nconsecutive_failures 1
+activate redis
+redis --> monitor: 3
+deactivate redis
+
+monitor -> redis: HINCRBY task:{task_id}:failure_stats\nfailure_count_24h 1
+activate redis
+redis --> monitor: 6
+deactivate redis
+
+monitor -> redis: EXPIRE task:{task_id}:failure_stats:failure_count_24h\n86400
+activate redis
+redis --> monitor: OK
+deactivate redis
+
+== 告警规则匹配 ==
+
+monitor -> alert_mgr: Evaluate Alert Rules\n{task_id, run_id, failure_stats}
+activate alert_mgr
+
+alert_mgr -> db: SELECT * FROM alert_rules\nWHERE task_id = {task_id}\nOR task_id IS NULL\nORDER BY priority DESC
+activate db
+db --> alert_mgr: [\n  {rule_id: 1, condition: "consecutive_failures >= 3",\n   severity: "critical", channels: ["email","sms","dingtalk"]},\n  {rule_id: 2, condition: "failure_count_24h >= 5",\n   severity: "warning", channels: ["email"]}\n]
+deactivate db
+
+alert_mgr -> rule_engine: Evaluate Conditions\n{failure_stats, rules}
+activate rule_engine
+
+rule_engine -> rule_engine: 使用表达式引擎(expr)评估规则
+note right of rule_engine
+  规则表达式示例:
+  - consecutive_failures >= 3
+  - failure_count_24h >= 5
+  - error_msg contains "timeout"
+  - last_success_at < now() - 3600
+
+  支持复杂逻辑:
+  - AND / OR / NOT
+  - 比较运算符
+  - 字符串匹配
+  - 时间运算
+end note
+
+rule_engine --> alert_mgr: 匹配的规则: [rule_id: 1, rule_id: 2]
+deactivate rule_engine
+
+== 告警去重与限流 ==
+
+loop 每个匹配的规则
+    alert_mgr -> redis: GET alert_sent:{task_id}:{rule_id}
+    activate redis
+    redis --> alert_mgr: last_sent_at = {timestamp-1800}
+    deactivate redis
+
+    alert_mgr -> alert_mgr: 检查静默期(默认1小时)
+    note right of alert_mgr
+      告警去重策略:
+      - 同一规则1小时内只发送一次
+      - 使用Redis记录发送时间
+      - 避免告警风暴
+    end note
+
+    alt 在静默期内
+        alert_mgr -> alert_mgr: 跳过此规则(已发送过)
+    else 超过静默期
+        alert_mgr -> redis: SETEX alert_sent:{task_id}:{rule_id}\n3600 {current_timestamp}
+        activate redis
+        redis --> alert_mgr: OK
+        deactivate redis
+
+        alert_mgr -> alert_mgr: 生成告警消息
+    end
+end
+
+== 多渠道告警通知 ==
+
+alt 规则1匹配(critical级别)
+    alert_mgr -> alert_mgr: 构造告警消息
+    note right of alert_mgr
+      告警内容:
+      - 任务名称: "每日医药资讯采集"
+      - 严重级别: Critical
+      - 失败原因: "Database connection timeout"
+      - 连续失败次数: 3次
+      - 最后成功时间: 2小时前
+      - 快捷操作: 查看详情/立即重试
+    end note
+
+    ' 发送邮件告警
+    alert_mgr -> email: Send Alert Email\n{\n  to: ["admin@example.com"],\n  subject: "[Critical] 任务连续失败3次",\n  body: {详细信息},\n  template: "task_failure"\n}
+    activate email
+    email -> email: 渲染HTML邮件模板
+    email -> email: 通过SMTP发送
+    email --> alert_mgr: Email sent successfully
+    deactivate email
+
+    ' 发送短信告警
+    alert_mgr -> sms: Send Alert SMS\n{\n  phone: ["+86138****1234"],\n  message: "【告警】任务'每日医药资讯采集'连续失败3次"\n}
+    activate sms
+    sms -> sms: 调用阿里云SMS API
+    sms --> alert_mgr: SMS sent (message_id: xxx)
+    deactivate sms
+
+    ' 发送钉钉告警
+    alert_mgr -> dingtalk: Send Robot Message\n{\n  webhook: "https://oapi.dingtalk.com/...",\n  msgtype: "markdown",\n  title: "任务失败告警",\n  text: {markdown格式消息}\n}
+    activate dingtalk
+    note right of dingtalk
+      钉钉消息格式:
+      ## 【Critical】任务连续失败
+
+      **任务名称**: 每日医药资讯采集
+      **失败原因**: Database connection timeout
+      **连续失败**: 3次
+      **最后成功**: 2小时前
+
+      [查看详情](https://xxx/tasks/123)
+    end note
+    dingtalk -> dingtalk: POST webhook
+    dingtalk --> alert_mgr: {errcode: 0, errmsg: "ok"}
+    deactivate dingtalk
+end
+
+alt 规则2匹配(warning级别)
+    ' 仅发送邮件告警
+    alert_mgr -> email: Send Warning Email\n{\n  subject: "[Warning] 任务24小时内失败6次",\n  ...\n}
+    activate email
+    email --> alert_mgr: Email sent
+    deactivate email
+end
+
+== 记录告警历史 ==
+
+alert_mgr -> db: INSERT INTO alert_history\n(\n  task_id, run_id, rule_id,\n  severity, channels, message,\n  sent_at, status='sent'\n)
+activate db
+db --> alert_mgr: alert_id = xxx
+deactivate db
+
+alert_mgr -> redis: LPUSH alert_history:{task_id}\n{alert_id, timestamp, severity}
+activate redis
+redis --> alert_mgr: OK
+deactivate redis
+
+alert_mgr -> redis: LTRIM alert_history:{task_id} 0 99
+activate redis
+note right: 只保留最近100条告警
+redis --> alert_mgr: OK
+deactivate redis
+
+alert_mgr --> monitor: Alert sent successfully\n{alert_ids: [xxx, yyy]}
+deactivate alert_mgr
+
+deactivate monitor
+
+== 降级与熔断（可选）==
+
+note over monitor
+  智能降级策略:
+
+  1. 连续失败5次 → 降低执行频率
+     - Cron从"每小时"改为"每4小时"
+     - 减少对目标系统压力
+
+  2. 连续失败10次 → 自动暂停任务
+     - 设置status='paused'
+     - 发送Critical告警
+     - 需人工介入恢复
+
+  3. 数据源级别熔断
+     - 同一数据源多个任务失败
+     - 标记数据源不可用
+     - 暂停相关所有任务
+end note
+
+@enduml

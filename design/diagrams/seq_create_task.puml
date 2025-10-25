@@ -1,71 +1,160 @@
 @startuml
-title 任务创建时序图
+title 定时任务创建与调度时序图
 
-actor 用户 as User
-participant "Web UI" as UI
-participant "API Gateway" as API
-participant "认证服务" as Auth
-participant "任务管理器" as TaskMgr
-database "PostgreSQL" as DB
-participant "调度引擎" as Scheduler
-participant "Redis" as Cache
-participant "etcd" as Etcd
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
 
-User -> UI: 填写任务配置信息
-activate UI
+actor User as user
+participant "Web UI" as ui
+participant "API Gateway" as gateway
+participant "Master\nTask Service" as master
+database "PostgreSQL" as db
+participant "Scheduler\nEngine" as scheduler
+participant "Redis" as redis
+participant "etcd" as etcd
 
-UI -> UI: 前端验证
-UI -> API: POST /api/v1/tasks\n{task_config}
-activate API
+autonumber
 
-API -> Auth: 验证Token
-activate Auth
-Auth -> Auth: 解析JWT
-Auth --> API: 返回用户信息
-deactivate Auth
+== 任务配置阶段 ==
 
-API -> TaskMgr: CreateTask(task_config, user_id)
-activate TaskMgr
+user -> ui: 填写任务配置\n(名称、数据源、调度策略等)
+note right of user
+  配置内容：
+  - 任务名称: "每日医药资讯采集"
+  - 数据源ID: ds_12345
+  - Cron: "0 0 8 * * ?" (每天8点)
+  - 重试策略: 最大3次,指数退避
+  - 告警: 邮件+短信
+end note
 
-TaskMgr -> TaskMgr: 验证配置参数
-TaskMgr -> TaskMgr: 生成任务ID
+ui -> ui: 前端验证(必填项、格式等)
+ui -> ui: Cron表达式可视化预览
 
-TaskMgr -> DB: INSERT INTO tasks\nVALUES (...)
-activate DB
-DB --> TaskMgr: 插入成功
-deactivate DB
+user -> ui: 点击"保存并启动"
 
-TaskMgr -> DB: INSERT INTO task_schedules\nVALUES (...)
-activate DB
-DB --> TaskMgr: 插入成功
-deactivate DB
+ui -> gateway: POST /api/v1/tasks\n{task_config}
+gateway -> gateway: 验证JWT Token
+gateway -> gateway: 限流检查(Rate Limiting)
+gateway -> master: CreateTask(task_config, user_id)
+activate master
 
-TaskMgr -> Scheduler: RegisterTask(task_id, schedule)
-activate Scheduler
+master -> master: 验证配置参数\n(数据源ID、Cron表达式等)
+master -> master: 解析Cron表达式
 
-Scheduler -> Scheduler: 解析Cron表达式
-Scheduler -> Scheduler: 添加到调度队列
-Scheduler -> Cache: SET task:{task_id}:status = "active"
-activate Cache
-Cache --> Scheduler: OK
-deactivate Cache
+alt Cron表达式无效
+    master --> gateway: 400 Bad Request\n{error: "Invalid cron expression"}
+    gateway --> ui: 显示错误提示
+    ui --> user: "Cron表达式格式错误"
+    note right: 提前终止流程
+end
 
-Scheduler -> Etcd: PUT /tasks/{task_id}
-activate Etcd
-Etcd --> Scheduler: OK
-deactivate Etcd
+master -> master: 生成任务ID (UUID)
+master -> master: 计算下次执行时间
 
-Scheduler --> TaskMgr: 注册成功
-deactivate Scheduler
+== 持久化任务配置 ==
 
-TaskMgr --> API: 返回任务信息\n{task_id, status, ...}
-deactivate TaskMgr
+master -> db: BEGIN TRANSACTION
+activate db
 
-API --> UI: HTTP 201 Created\n{task_id, ...}
-deactivate API
+master -> db: INSERT INTO tasks\n(id, name, datasource_id,\nstatus='active', created_by, ...)
+db --> master: OK
 
-UI --> User: 显示创建成功
-deactivate UI
+master -> db: INSERT INTO task_schedules\n(task_id, cron_expr,\nnext_run_time, timezone)
+db --> master: OK
+
+master -> db: INSERT INTO task_retry_policies\n(task_id, max_retries=3,\nbackoff_type='exponential')
+db --> master: OK
+
+master -> db: INSERT INTO task_alert_configs\n(task_id, channels=['email','sms'],\nrecipients)
+db --> master: OK
+
+master -> db: COMMIT TRANSACTION
+db --> master: Transaction Committed
+deactivate db
+
+== 注册到调度器 ==
+
+master -> scheduler: RegisterTask(task_id, schedule_config)
+activate scheduler
+
+scheduler -> scheduler: 验证调度配置
+
+' 分布式锁防止重复调度
+scheduler -> etcd: 尝试获取锁\nPUT /locks/scheduler/{task_id}\n(lease_ttl=10s)
+activate etcd
+
+alt 锁已被占用
+    etcd --> scheduler: 锁获取失败(已存在)
+    scheduler -> scheduler: 等待重试(最多3次)
+    scheduler -> etcd: 重新尝试获取锁
+end
+
+etcd --> scheduler: 锁获取成功(lease_id)
+deactivate etcd
+
+scheduler -> scheduler: 解析Cron表达式\n(使用robfig/cron库)
+scheduler -> scheduler: 计算下次执行时间
+scheduler -> scheduler: 添加到内存调度队列\n(优先级队列, 按next_run排序)
+
+note right of scheduler
+  调度器状态机:
+  idle → validating → scheduling → scheduled
+
+  内存数据结构:
+  - 优先级队列(heap)
+  - 按next_run_time排序
+  - 支持动态添加/删除
+end note
+
+' 状态同步到Redis (分布式环境)
+scheduler -> redis: HSET task:{task_id}\nstatus=scheduled\nnext_run={timestamp}
+activate redis
+redis --> scheduler: OK
+deactivate redis
+
+' 状态同步到etcd (服务发现)
+scheduler -> etcd: PUT /tasks/{task_id}\n{status, next_run, scheduler_node}
+activate etcd
+etcd --> scheduler: OK
+deactivate etcd
+
+scheduler -> etcd: 释放锁\nDELETE /locks/scheduler/{task_id}
+activate etcd
+etcd --> scheduler: 锁已释放
+deactivate etcd
+
+scheduler --> master: 注册成功\n{next_run_time, scheduler_node_id}
+deactivate scheduler
+
+== 返回响应 ==
+
+master -> redis: SET task:{task_id}:meta\n{task_config} (缓存)
+activate redis
+redis --> master: OK
+deactivate redis
+
+master --> gateway: 201 Created\n{task_id, status, next_run_time}
+deactivate master
+
+gateway --> ui: HTTP 201 Created\n{task: {...}}
+ui -> ui: 更新任务列表
+
+ui --> user: 显示创建成功\n"任务已创建，下次执行: 2025-10-26 08:00:00"
+
+== 后台调度器监控 ==
+
+note over scheduler
+  调度器持续运行:
+  1. 每秒检查队列头部任务
+  2. 如果next_run_time <= now，推送到RabbitMQ
+  3. 更新next_run_time (根据Cron计算)
+  4. 重新插入队列
+
+  高可用机制:
+  - 多个调度器节点竞争etcd锁
+  - 仅一个节点负责调度
+  - 其他节点standby (lease过期自动接管)
+end note
 
 @enduml
-

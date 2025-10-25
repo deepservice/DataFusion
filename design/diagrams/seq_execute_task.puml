@@ -1,152 +1,302 @@
 @startuml
 title 任务执行时序图
 
-participant "调度引擎" as Scheduler
-participant "RabbitMQ" as MQ
-participant "Worker节点" as Worker
-participant "采集器" as Collector
-participant "采集插件" as Plugin
-participant "处理器" as Processor
-participant "存储器" as Storage
-database "目标数据库" as TargetDB
-participant "监控服务" as Monitor
-database "PostgreSQL" as DB
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "Scheduler\nEngine" as scheduler
+queue "RabbitMQ\nPriority Queue" as mq
+participant "Worker Node" as worker
+participant "Collector\nEngine" as collector
+participant "Data Processor" as processor
+participant "Storage\nEngine" as storage
+database "PostgreSQL" as db
+database "Target DB/Storage" as target
+participant "Monitor\nService" as monitor
+participant "Redis" as redis
+
+autonumber
 
 == 任务调度阶段 ==
 
-Scheduler -> Scheduler: 定时器触发
-activate Scheduler
+scheduler -> scheduler: 定时器触发(每秒检查)
+activate scheduler
 
-Scheduler -> DB: SELECT * FROM tasks\nWHERE next_run_time <= NOW()
-activate DB
-DB --> Scheduler: 返回待执行任务列表
-deactivate DB
+scheduler -> scheduler: 从优先级队列获取\nnext_run_time <= NOW的任务
+
+scheduler -> db: SELECT * FROM tasks\nWHERE next_run_time <= NOW()\nAND status = 'active'\nLIMIT 100
+activate db
+db --> scheduler: 返回待执行任务列表\n[{task_id, config, priority}]
+deactivate db
 
 loop 每个待执行任务
-    Scheduler -> DB: INSERT INTO task_runs\n(task_id, status='pending')
-    activate DB
-    DB --> Scheduler: 返回run_id
-    deactivate DB
-    
-    Scheduler -> MQ: Publish Task Message\n{run_id, task_id, config}
-    activate MQ
-    MQ --> Scheduler: ACK
-    deactivate MQ
-    
-    Scheduler -> DB: UPDATE tasks\nSET next_run_time = ...
-    activate DB
-    DB --> Scheduler: OK
-    deactivate DB
+
+    scheduler -> db: BEGIN TRANSACTION
+    activate db
+
+    ' 创建任务执行记录
+    scheduler -> db: INSERT INTO task_runs\n(id, task_id, status='pending',\nscheduled_at, priority)
+    db --> scheduler: run_id = "run_xxx"
+
+    ' 更新任务下次执行时间
+    scheduler -> db: UPDATE tasks\nSET next_run_time = calculate_next(cron),\nlast_run_at = NOW()
+    db --> scheduler: OK
+
+    scheduler -> db: COMMIT TRANSACTION
+    db --> scheduler: Transaction Committed
+    deactivate db
+
+    ' 推送到优先级队列
+    scheduler -> mq: Publish Task Message\n{run_id, task_id, config}\npriority={task.priority}
+    activate mq
+    note right of mq
+      RabbitMQ优先级队列:
+      - 优先级范围: 0-10
+      - 手动触发任务: priority=10
+      - 定时任务: priority=5
+      - 重试任务: priority=3
+    end note
+    mq --> scheduler: Message Published (ACK)
+    deactivate mq
+
+    ' 更新Redis缓存状态
+    scheduler -> redis: HSET task_run:{run_id}\nstatus=pending\nqueued_at={timestamp}
+    activate redis
+    redis --> scheduler: OK
+    deactivate redis
+
 end
 
-deactivate Scheduler
+deactivate scheduler
+
+== Worker健康检查阶段 ==
+
+note over worker
+  Worker启动时注册:
+  1. 向Redis注册心跳
+  2. 每10秒发送heartbeat
+  3. 上报资源状态(CPU/内存)
+end note
+
+worker -> redis: SETEX worker:{worker_id}:heartbeat\n30 {timestamp, cpu, mem, status}
+activate redis
+redis --> worker: OK
+deactivate redis
 
 == 任务执行阶段 ==
 
-Worker -> MQ: Consume Task Message
-activate Worker
-activate MQ
-MQ --> Worker: {run_id, task_id, config}
-deactivate MQ
+worker -> mq: Consume Task Message\n(优先级排序)
+activate worker
+activate mq
+mq --> worker: {run_id, task_id, config}
+deactivate mq
 
-Worker -> DB: UPDATE task_runs\nSET status='running', start_time=NOW()
-activate DB
-DB --> Worker: OK
-deactivate DB
+worker -> redis: GET task_run:{run_id}
+activate redis
+redis --> worker: {status, queued_at}
+deactivate redis
 
-Worker -> Monitor: 上报任务开始事件
-activate Monitor
-Monitor --> Worker: ACK
-deactivate Monitor
+worker -> worker: 检查任务是否已被处理\n(防止重复消费)
 
-Worker -> Collector: Execute(config)
-activate Collector
-
-alt 网页采集
-    Collector -> Plugin: WebCollectorPlugin.Collect(url, rules)
-    activate Plugin
-    Plugin -> Plugin: 发送HTTP请求
-    Plugin -> Plugin: 解析HTML
-    Plugin --> Collector: 返回原始数据
-    deactivate Plugin
-else 数据库采集
-    Collector -> Plugin: DBCollectorPlugin.Query(conn, sql)
-    activate Plugin
-    Plugin -> Plugin: 连接数据库
-    Plugin -> Plugin: 执行查询
-    Plugin --> Collector: 返回查询结果
-    deactivate Plugin
+alt 任务已处理
+    worker -> mq: NACK + Requeue=false
+    note right: 丢弃重复消息
+    worker -> worker: 终止执行
 end
 
-Collector --> Worker: 返回原始数据
-deactivate Collector
+' 更新任务状态为running
+worker -> db: UPDATE task_runs\nSET status='running',\nstart_time=NOW(),\nworker_id='{worker_id}'
+activate db
+db --> worker: OK
+deactivate db
 
-Worker -> Processor: Process(raw_data, rules)
-activate Processor
+worker -> redis: HSET task_run:{run_id}\nstatus=running\nworker_id={worker_id}
+activate redis
+redis --> worker: OK
+deactivate redis
 
-Processor -> Processor: 数据解析
-Processor -> Processor: 数据清洗
-Processor -> Processor: 数据转换
-Processor -> Processor: 数据去重
+' 上报任务开始事件
+worker -> monitor: Report Task Start Event\n{run_id, task_id, worker_id}
+activate monitor
+monitor -> monitor: 记录开始时间\n增加运行任务计数
+monitor --> worker: Event Recorded
+deactivate monitor
 
-Processor --> Worker: 返回处理后数据
-deactivate Processor
+== 数据采集阶段 ==
 
-Worker -> Storage: Store(processed_data, config)
-activate Storage
+worker -> collector: Execute(config)
+activate collector
 
-alt 成功存储
-    Storage -> TargetDB: INSERT INTO ...
-    activate TargetDB
-    TargetDB --> Storage: 插入成功
-    deactivate TargetDB
-    
-    Storage --> Worker: 存储成功, count=N
-    deactivate Storage
-    
-    Worker -> DB: UPDATE task_runs\nSET status='success',\nend_time=NOW(),\ndata_count=N
-    activate DB
-    DB --> Worker: OK
-    deactivate DB
-    
-    Worker -> Monitor: 上报任务成功事件
-    activate Monitor
-    Monitor --> Worker: ACK
-    deactivate Monitor
-    
+collector -> collector: 加载数据源配置\n(从config或Redis缓存)
+
+alt 网页RPA采集
+    collector -> collector: 启动Playwright浏览器
+    collector -> collector: 渲染页面,提取数据
+    collector --> worker: 原始HTML数据
+
+else 数据库采集
+    collector -> collector: 建立DB连接
+    collector -> collector: 执行SQL查询
+    collector --> worker: 查询结果集
+
+else API采集
+    collector -> collector: 发送HTTP请求
+    collector -> collector: 处理分页/限流
+    collector --> worker: JSON响应数据
+end
+
+deactivate collector
+
+== 数据处理阶段 ==
+
+worker -> processor: Process(raw_data, rules)
+activate processor
+
+processor -> processor: 数据解析\n(HTML/JSON/XML)
+processor -> processor: 字段提取\n(XPath/JSONPath/CSS)
+processor -> processor: 数据清洗\n(去标签/格式转换/去重)
+processor -> processor: 数据验证\n(schema校验/业务规则)
+
+note right of processor
+  处理管道(Pipeline):
+  1. Parse: 解析原始格式
+  2. Extract: 提取字段
+  3. Clean: 清洗数据
+  4. Validate: 验证质量
+  5. Transform: 格式转换
+end note
+
+processor --> worker: 处理后的结构化数据\n{records: [...], stats: {...}}
+deactivate processor
+
+== 数据存储阶段 ==
+
+worker -> storage: Store(processed_data, config)
+activate storage
+
+alt 存储成功
+    storage -> target: BEGIN TRANSACTION
+    activate target
+
+    storage -> target: UPSERT INTO target_table\nVALUES (...)\nON CONFLICT DO UPDATE
+    target --> storage: 插入/更新成功 (N rows)
+
+    storage -> target: COMMIT TRANSACTION
+    target --> storage: Transaction Committed
+    deactivate target
+
+    storage --> worker: 存储成功\n{count: N, duplicates: M}
+    deactivate storage
+
+    ' 更新任务执行结果
+    worker -> db: UPDATE task_runs\nSET status='success',\nend_time=NOW(),\ndata_count=N,\nexecution_time_ms=...,\nerror_msg=NULL
+    activate db
+    db --> worker: OK
+    deactivate db
+
+    worker -> redis: HSET task_run:{run_id}\nstatus=success\ndata_count=N
+    activate redis
+    redis --> worker: OK
+    deactivate redis
+
+    ' 上报成功事件
+    worker -> monitor: Report Task Success Event\n{run_id, count: N, duration: ...}
+    activate monitor
+    monitor -> monitor: 更新任务成功率指标\n记录采集数据量
+    monitor --> worker: Event Recorded
+    deactivate monitor
+
 else 存储失败
-    Storage --> Worker: 存储失败, error
-    deactivate Storage
-    
-    Worker -> DB: UPDATE task_runs\nSET status='failed',\nend_time=NOW(),\nerror_msg=...
-    activate DB
-    DB --> Worker: OK
-    deactivate DB
-    
-    Worker -> Monitor: 上报任务失败事件
-    activate Monitor
-    Monitor -> Monitor: 检查告警规则
-    Monitor -> Monitor: 发送告警通知
-    Monitor --> Worker: ACK
-    deactivate Monitor
-    
-    alt 可重试
-        Worker -> Scheduler: 请求重新调度
-        activate Scheduler
-        Scheduler -> MQ: Publish Task Message\n(延迟队列)
-        activate MQ
-        MQ --> Scheduler: ACK
-        deactivate MQ
-        deactivate Scheduler
+    storage -> target: ROLLBACK TRANSACTION
+    activate target
+    target --> storage: Rolled Back
+    deactivate target
+
+    storage --> worker: 存储失败\n{error: "connection timeout"}
+    deactivate storage
+
+    ' 记录失败信息
+    worker -> db: UPDATE task_runs\nSET status='failed',\nend_time=NOW(),\nerror_msg='...',\nretry_count=retry_count+1
+    activate db
+    db --> worker: OK
+    deactivate db
+
+    worker -> redis: HSET task_run:{run_id}\nstatus=failed\nerror={error_msg}
+    activate redis
+    redis --> worker: OK
+    deactivate redis
+
+    ' 上报失败事件
+    worker -> monitor: Report Task Failure Event\n{run_id, error: ...}
+    activate monitor
+    monitor -> monitor: 检查告警规则\n(连续失败次数/失败率阈值)
+
+    alt 触发告警
+        monitor -> monitor: 发送告警通知\n(邮件/短信/钉钉)
+        note right: 详见3.1.2.4告警流程
+    end
+
+    monitor --> worker: Event Recorded
+    deactivate monitor
+
+    ' 判断是否需要重试
+    worker -> db: SELECT retry_count, max_retries\nFROM task_runs JOIN task_retry_policies\nWHERE run_id = '...'
+    activate db
+    db --> worker: {retry_count: 1, max_retries: 3}
+    deactivate db
+
+    alt retry_count < max_retries
+        worker -> worker: 计算延迟时间\n(指数退避: 2^retry_count * base_delay)
+
+        worker -> mq: Publish Retry Message\n{run_id, task_id, config}\ndelay={calculated_delay}\npriority=3
+        activate mq
+        note right of mq
+          使用RabbitMQ延迟队列:
+          - x-delayed-message插件
+          - 第1次重试: 5分钟后
+          - 第2次重试: 10分钟后
+          - 第3次重试: 20分钟后
+        end note
+        mq --> worker: Retry Message Published
+        deactivate mq
+
+        worker -> db: UPDATE task_runs\nSET status='retry_pending',\nnext_retry_at=NOW()+delay
+        activate db
+        db --> worker: OK
+        deactivate db
+    else
+        worker -> db: UPDATE task_runs\nSET status='final_failed'
+        activate db
+        db --> worker: OK
+        deactivate db
+
+        note right: 达到最大重试次数，\n标记为最终失败
     end
 end
 
-Worker -> MQ: ACK Message
-activate MQ
-MQ --> Worker: OK
-deactivate MQ
+' ACK消息
+worker -> mq: ACK Message
+activate mq
+mq --> worker: Message Acknowledged
+deactivate mq
 
-deactivate Worker
+' 更新Worker心跳
+worker -> redis: SETEX worker:{worker_id}:heartbeat\n30 {last_task: run_id, ...}
+activate redis
+redis --> worker: OK
+deactivate redis
+
+deactivate worker
+
+== 后台监控清理 ==
+
+note over monitor
+  Monitor服务持续任务:
+  1. 监控Worker心跳(超时则标记离线)
+  2. 检测僵尸任务(running超30分钟)
+  3. 清理过期的任务执行记录(>90天)
+  4. 统计任务成功率/平均耗时
+end note
 
 @enduml
-
