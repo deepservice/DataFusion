@@ -1,0 +1,232 @@
+@startuml
+title MCP数据订阅与实时推送流程
+
+autonumber
+
+actor "AI Application" as ai
+participant "MCP Gateway\n(WebSocket)" as mcp
+participant "Master\nSubscription Manager" as sub
+participant "Redis\n(Subscription Store)" as redis
+participant "PostgreSQL" as db
+participant "RabbitMQ\n(Event Stream)" as mq
+participant "Worker" as worker
+participant "WebSocket Server" as ws
+
+== 1. 建立WebSocket连接 ==
+
+ai -> mcp: WebSocket Upgrade Request\nwss://datafusion.com/mcp/ws?token={api_key}
+activate mcp
+
+mcp -> mcp: ValidateAPIKey(token)
+note right
+  验证API Key合法性
+  从JWT中提取client_id
+end note
+
+mcp -> ws: RegisterConnection(client_id, conn)
+activate ws
+ws -> ws: 存储连接映射\nconnections[client_id] = conn
+ws --> mcp: connection_id
+deactivate ws
+
+mcp --> ai: WebSocket Connected\n{connection_id: "conn-abc"}
+note left: 连接建立成功
+
+== 2. 创建订阅 ==
+
+ai -> mcp: MCP Request (via WebSocket):\ndata/subscribe\n{\n  "resource_uri": "datasource://医药资讯",\n  "filters": {\n    "keywords": ["新药审批", "临床试验"],\n    "since": "2025-10-26T00:00:00Z"\n  },\n  "notification_config": {\n    "batch_size": 10,\n    "max_delay": 60\n  }\n}
+
+mcp -> sub: CreateSubscription(client_id, request)
+activate sub
+
+sub -> sub: GenerateSubscriptionID()
+note right: subscription_id = "sub-xyz"
+
+sub -> db: INSERT INTO subscriptions\n(id, client_id, resource_uri, filters, config, created_at)
+activate db
+db --> sub: OK
+deactivate db
+
+sub -> redis: HSET subscriptions:active {sub_id} {config_json}
+activate redis
+note right
+  存储订阅配置：
+  Key: subscriptions:active
+  Field: sub-xyz
+  Value: JSON配置
+  TTL: 86400秒（24小时）
+end note
+redis --> sub: OK
+
+sub -> redis: SADD subscriptions:by_resource:医药资讯 sub-xyz
+note right: 按资源建立索引，快速查找
+redis --> sub: OK
+
+sub -> redis: HSET subscriptions:heartbeat sub-xyz {timestamp}
+note right: 记录心跳时间
+redis --> sub: OK
+deactivate redis
+
+sub -> mq: 订阅消息队列\nTopic: datasource.医药资讯.completed
+activate mq
+note right
+  订阅特定数据源的采集完成事件
+  Exchange: datasource.events (topic)
+  Routing Key: datasource.*.completed
+end note
+mq --> sub: Subscription Created
+deactivate mq
+
+sub --> mcp: 返回订阅ID和状态
+deactivate sub
+
+mcp --> ai: MCP Response:\n{\n  "subscription_id": "sub-xyz",\n  "status": "active",\n  "expires_at": "2025-10-27T10:00:00Z"\n}
+
+== 3. Worker采集数据并发布事件 ==
+
+worker -> worker: 执行采集任务\n(datasource_id = 医药资讯)
+note right
+  Worker定期采集数据
+  具体流程见3.1.1和3.1.2节
+end note
+
+worker -> db: INSERT INTO raw_data\n(datasource_id, content, collected_at)
+activate db
+db --> worker: 插入成功，返回record_ids
+deactivate db
+
+worker -> mq: PUBLISH datasource.events\nRouting Key: datasource.医药资讯.completed\n{\n  "datasource_id": "医药资讯",\n  "record_count": 5,\n  "record_ids": ["rec-1", "rec-2", ...],\n  "collected_at": "2025-10-26T10:30:00Z"\n}
+activate mq
+
+note over mq
+  发布采集完成事件
+  Exchange: datasource.events
+  Type: topic
+end note
+
+== 4. 订阅管理器匹配并推送 ==
+
+mq -> sub: 消费事件\ndatasource.医药资讯.completed
+activate sub
+
+sub -> redis: SMEMBERS subscriptions:by_resource:医药资讯
+activate redis
+redis --> sub: 返回订阅ID列表\n[sub-xyz, sub-abc, ...]
+deactivate redis
+
+loop 对每个订阅ID
+  sub -> redis: HGET subscriptions:active sub-xyz
+  activate redis
+  redis --> sub: 返回订阅配置
+  deactivate redis
+
+  sub -> sub: MatchFilters(event, subscription_config)
+  note right
+    检查是否满足推送条件：
+    1. 关键词匹配（keywords in content）
+    2. 时间范围（since <= collected_at）
+    3. 批量大小（累计达到batch_size）
+    4. 最大延迟（距上次推送 > max_delay）
+  end note
+
+  alt 满足推送条件
+    sub -> db: SELECT * FROM raw_data\nWHERE id IN ('rec-1', 'rec-2', ...)\n  AND content @> '{"keywords": ["新药审批"]}'
+    activate db
+    db --> sub: 返回匹配的数据记录
+    deactivate db
+
+    sub -> sub: TransformToMCPFormat(records)
+    note right: 转换为MCP标准格式
+
+    sub -> ws: PushToClient(client_id, data)
+    activate ws
+
+    ws -> mcp: 通过WebSocket推送
+    deactivate ws
+
+    mcp --> ai: WebSocket Message:\n{\n  "type": "data.notification",\n  "subscription_id": "sub-xyz",\n  "data": [\n    {\n      "id": "rec-1",\n      "source": "datasource://医药资讯",\n      "content": {...},\n      "collected_at": "2025-10-26T10:30:00Z"\n    },\n    ...\n  ],\n  "count": 3\n}
+
+    ai -> ai: 处理推送的新数据
+    note left
+      实时更新AI的知识库
+      或触发下游工作流
+    end note
+
+    sub -> redis: HSET subscriptions:last_push sub-xyz {timestamp}
+    activate redis
+    note right: 更新最后推送时间
+    redis --> sub: OK
+    deactivate redis
+
+  else 不满足推送条件
+    sub -> sub: 记录到待推送队列
+    note right: 等待batch_size或max_delay满足
+  end
+end
+
+deactivate mq
+deactivate sub
+
+== 5. 心跳与订阅续期 ==
+
+ai -> mcp: MCP Request: subscription/heartbeat\n{subscription_id: "sub-xyz"}
+activate mcp
+
+mcp -> sub: UpdateHeartbeat(subscription_id)
+activate sub
+
+sub -> redis: HSET subscriptions:heartbeat sub-xyz {timestamp}
+activate redis
+redis --> sub: OK
+
+sub -> redis: EXPIRE subscriptions:active 86400
+note right: 续期订阅TTL
+redis --> sub: OK
+deactivate redis
+
+sub --> mcp: 返回续期状态
+deactivate sub
+
+mcp --> ai: MCP Response:\n{\n  "status": "active",\n  "expires_at": "2025-10-27T10:35:00Z"\n}
+deactivate mcp
+
+== 6. 取消订阅 ==
+
+ai -> mcp: MCP Request: subscription/cancel\n{subscription_id: "sub-xyz"}
+activate mcp
+
+mcp -> sub: CancelSubscription(subscription_id)
+activate sub
+
+sub -> redis: HDEL subscriptions:active sub-xyz
+activate redis
+redis --> sub: OK
+
+sub -> redis: SREM subscriptions:by_resource:医药资讯 sub-xyz
+redis --> sub: OK
+deactivate redis
+
+sub -> db: UPDATE subscriptions\nSET status = 'cancelled', cancelled_at = NOW()\nWHERE id = 'sub-xyz'
+activate db
+db --> sub: OK
+deactivate db
+
+sub -> mq: 取消订阅消息队列
+activate mq
+mq --> sub: OK
+deactivate mq
+
+sub --> mcp: 返回取消状态
+deactivate sub
+
+mcp --> ai: MCP Response:\n{\n  "status": "cancelled",\n  "cancelled_at": "2025-10-26T10:40:00Z"\n}
+deactivate mcp
+
+ai -> mcp: WebSocket Close
+mcp -> ws: CloseConnection(client_id)
+activate ws
+ws -> ws: 删除连接映射
+ws --> mcp: OK
+deactivate ws
+
+@enduml

@@ -1,0 +1,290 @@
+@startuml
+title 移动端任务监控与推送通知流程
+
+autonumber
+
+actor "Mobile User" as user
+participant "Mobile App\n(iOS/Android)" as app
+participant "Push Service\n(FCM/APNs)" as push
+participant "Gateway" as gateway
+participant "Master\nDevice Manager" as device
+participant "PostgreSQL" as db
+participant "Redis\n(Push Dedup)" as redis
+participant "RabbitMQ" as mq
+participant "Worker" as worker
+participant "Monitor" as monitor
+participant "Alert Manager" as alert
+
+== 1. 用户登录与设备注册 ==
+
+user -> app: 打开App，输入账号密码
+activate app
+
+app -> gateway: POST /api/v1/auth/login\n{username, password}
+activate gateway
+
+gateway -> gateway: 验证用户身份
+gateway --> app: 返回JWT Token和用户信息
+deactivate gateway
+
+app -> app: 获取设备Token
+note right
+  iOS: 请求APNs设备Token
+  Android: 请求FCM Registration Token
+end note
+
+app -> gateway: POST /api/v1/devices/register\n{\n  "device_token": "fcm-token-xyz",\n  "device_type": "android",\n  "device_info": {\n    "os_version": "14.0",\n    "app_version": "1.2.0"\n  }\n}
+activate gateway
+
+gateway -> device: RegisterDevice(user_id, device_token, device_info)
+activate device
+
+device -> db: INSERT INTO devices\n(user_id, device_token, device_type, device_info)\nON CONFLICT (device_token) DO UPDATE
+activate db
+note right
+  使用UPSERT确保幂等性
+  同一设备多次注册会更新记录
+end note
+db --> device: device_id
+deactivate db
+
+device -> redis: SADD devices:user:{user_id} {device_id}
+activate redis
+note right: 建立用户到设备的映射
+redis --> device: OK
+
+device -> redis: SETEX device:token:{device_id} 2592000 {device_token}
+note right: 缓存设备Token，TTL=30天
+redis --> device: OK
+deactivate redis
+
+device --> gateway: 返回设备ID
+deactivate device
+
+gateway --> app: 200 OK {device_id}
+deactivate gateway
+
+app --> user: 登录成功，进入主页
+deactivate app
+
+== 2. 任务执行失败触发告警 ==
+
+worker -> worker: 执行采集任务失败\n(task_id = "task-123")
+note right
+  Worker执行任务时出现错误
+  如网络超时、目标网站不可用等
+end note
+
+worker -> db: UPDATE tasks\nSET status = 'failed', error_message = '...'\nWHERE id = 'task-123'
+activate db
+db --> worker: OK
+deactivate db
+
+worker -> mq: PUBLISH task.events\nRouting Key: task.failed\n{\n  "task_id": "task-123",\n  "datasource_name": "医药资讯",\n  "error_message": "Connection timeout",\n  "failed_at": "2025-10-26T15:30:00Z",\n  "retry_count": 3\n}
+activate mq
+
+== 3. 告警管理器处理失败事件 ==
+
+mq -> alert: 消费事件 task.failed
+activate alert
+
+alert -> db: SELECT * FROM tasks\nJOIN datasources ON tasks.datasource_id = datasources.id\nWHERE tasks.id = 'task-123'
+activate db
+db --> alert: 返回任务详情和数据源信息
+deactivate db
+
+alert -> alert: EvaluateAlertRules(task)
+note right
+  根据规则判断是否需要推送：
+  1. 连续失败次数 >= 3次
+  2. 关键任务（priority = high）
+  3. 用户订阅了该任务的告警
+end note
+
+alt 需要发送告警
+  alert -> db: SELECT user_id FROM alert_subscriptions\nWHERE datasource_id = 'ds-123'\n  AND channel = 'push'
+  activate db
+  db --> alert: 返回订阅用户列表\n[user-456, user-789]
+  deactivate db
+
+  loop 对每个用户
+    alert -> redis: GET push:dedup:user-456:task-123
+    activate redis
+
+    alt 去重检查：1小时内未推送
+      redis --> alert: nil (未找到)
+
+      alert -> redis: SMEMBERS devices:user:user-456
+      redis --> alert: 返回设备ID列表\n[device-abc, device-def]
+      deactivate redis
+
+      loop 对每个设备
+        alert -> redis: GET device:token:device-abc
+        activate redis
+        redis --> alert: 返回device_token
+        deactivate redis
+
+        alert -> push: 发送推送通知
+        activate push
+
+        alt Android设备 (FCM)
+          push -> push: 调用Firebase Cloud Messaging API\nPOST https://fcm.googleapis.com/v1/projects/{project}/messages:send\n{\n  "message": {\n    "token": "fcm-token-xyz",\n    "notification": {\n      "title": "任务失败告警",\n      "body": "数据源【医药资讯】采集失败，已重试3次"\n    },\n    "data": {\n      "type": "task_failed",\n      "task_id": "task-123",\n      "datasource_id": "ds-123",\n      "deep_link": "datafusion://task/task-123"\n    }\n  }\n}
+          note right
+            FCM推送优势：
+            - 自动管理连接和重试
+            - 支持主题订阅
+            - 免费（有配额限制）
+          end note
+        else iOS设备 (APNs)
+          push -> push: 调用Apple Push Notification Service\nPOST https://api.push.apple.com/3/device/{device_token}\n{\n  "aps": {\n    "alert": {\n      "title": "任务失败告警",\n      "body": "数据源【医药资讯】采集失败，已重试3次"\n    },\n    "sound": "default",\n    "badge": 1\n  },\n  "task_id": "task-123",\n  "datasource_id": "ds-123",\n  "deep_link": "datafusion://task/task-123"\n}
+          note right
+            APNs推送优势：
+            - 低延迟、高可靠
+            - 原生集成好
+            - 免费
+          end note
+        end
+
+        push --> alert: 推送成功\n{message_id: "msg-xyz"}
+        deactivate push
+
+        alert -> db: INSERT INTO push_notifications\n(user_id, device_id, message_id, title, body, sent_at)
+        activate db
+        db --> alert: OK
+        deactivate db
+      end
+
+      alert -> redis: SETEX push:dedup:user-456:task-123 3600 1
+      activate redis
+      note right: 去重标记，TTL=3600秒（1小时）
+      redis --> alert: OK
+      deactivate redis
+
+    else 已推送过
+      redis --> alert: 1 (已存在)
+      deactivate redis
+      alert -> alert: 跳过推送（去重）
+    end
+  end
+
+else 不满足告警条件
+  alert -> alert: 记录日志，不发送推送
+end
+
+deactivate mq
+deactivate alert
+
+== 4. 用户接收推送并处理 ==
+
+push -> app: 系统推送通知到设备
+activate app
+note right
+  通知出现在系统通知栏
+  即使App未运行也能收到
+end note
+
+app --> user: 显示推送通知
+user -> app: 点击通知
+
+app -> app: 解析Deep Link\ndatafusion://task/task-123
+note right
+  Deep Link跳转逻辑：
+  1. 启动App（如未运行）
+  2. 导航到任务详情页
+  3. 传递task_id参数
+end note
+
+app -> gateway: GET /api/v1/tasks/task-123
+activate gateway
+
+gateway -> db: SELECT * FROM tasks\nWHERE id = 'task-123'
+activate db
+db --> gateway: 返回任务详情
+deactivate db
+
+gateway --> app: 返回任务详情\n{\n  "id": "task-123",\n  "datasource_name": "医药资讯",\n  "status": "failed",\n  "error_message": "Connection timeout",\n  "retry_count": 3,\n  "next_retry_at": "2025-10-26T16:00:00Z"\n}
+deactivate gateway
+
+app --> user: 显示任务详情页
+deactivate app
+
+== 5. 用户手动重试任务 ==
+
+user -> app: 点击"立即重试"按钮
+activate app
+
+app -> gateway: POST /api/v1/tasks/task-123/retry\n{priority: "high"}
+activate gateway
+
+gateway -> device: ValidateUser(user_id, task_id)
+activate device
+note right: 验证用户是否有权限操作该任务
+device --> gateway: OK
+deactivate device
+
+gateway -> db: UPDATE tasks\nSET status = 'pending', retry_count = retry_count + 1\nWHERE id = 'task-123'
+activate db
+db --> gateway: OK
+deactivate db
+
+gateway -> mq: PUBLISH task.queue.high\n{\n  "task_id": "task-123",\n  "priority": "high",\n  "triggered_by": "user-456",\n  "triggered_from": "mobile"\n}
+activate mq
+note right
+  发送到高优先级队列
+  手动重试任务优先执行
+end note
+mq --> gateway: OK
+deactivate mq
+
+gateway --> app: 200 OK\n{status: "pending", message: "任务已加入队列"}
+deactivate gateway
+
+app --> user: 显示"重试成功，任务执行中..."
+deactivate app
+
+== 6. Worker执行重试任务 ==
+
+mq -> worker: 消费高优先级任务
+activate worker
+
+worker -> worker: ExecuteTask(task_id)
+note right: 执行采集任务
+
+alt 执行成功
+  worker -> db: UPDATE tasks\nSET status = 'completed', completed_at = NOW()
+  activate db
+  db --> worker: OK
+  deactivate db
+
+  worker -> push: 发送成功通知（可选）
+  activate push
+  push --> worker: OK
+  deactivate push
+
+else 执行失败
+  worker -> db: UPDATE tasks\nSET status = 'failed', retry_count = retry_count + 1
+  activate db
+  db --> worker: OK
+  deactivate db
+
+  worker -> alert: 触发告警（循环回步骤2）
+end
+
+deactivate worker
+
+== 7. 实时状态更新（WebSocket可选） ==
+
+note over app, monitor
+  如果App保持前台运行，
+  可通过WebSocket实时推送任务状态更新
+  避免用户手动刷新页面
+end note
+
+monitor -> app: WebSocket推送\n{\n  "type": "task.status_changed",\n  "task_id": "task-123",\n  "status": "completed",\n  "completed_at": "2025-10-26T15:35:00Z"\n}
+activate app
+
+app -> app: 更新UI显示任务状态
+app --> user: 实时显示"任务已完成"
+deactivate app
+
+@enduml

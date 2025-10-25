@@ -1,0 +1,160 @@
+@startuml
+title MCP协议资源发现与数据查询流程
+
+autonumber
+
+actor "AI Application" as ai
+participant "MCP Gateway\n(Go MCP SDK)" as mcp
+participant "Master\nMCP Service" as master
+participant "PostgreSQL" as db
+participant "Redis\n(Query Cache)" as redis
+participant "Resource Manager" as resource
+
+== 1. 资源发现 ==
+
+ai -> mcp: MCP Request: resources/list\n{type: "datasource"}
+activate mcp
+
+mcp -> master: ListResources(type)
+activate master
+
+master -> db: SELECT * FROM datasources\nWHERE enabled = true
+activate db
+db --> master: 返回数据源列表
+deactivate db
+
+master -> master: MapToMCPResources()
+note right
+  将数据源映射为MCP资源格式：
+  {
+    "uri": "datasource://医药资讯",
+    "name": "医药资讯采集",
+    "description": "每日采集医药行业新闻",
+    "mimeType": "application/json"
+  }
+end note
+
+master --> mcp: 返回MCP资源列表
+deactivate master
+
+mcp --> ai: MCP Response:\n{\n  "resources": [...]\n}
+deactivate mcp
+
+ai -> ai: 解析资源列表，选择目标资源
+
+== 2. 数据查询（带缓存） ==
+
+ai -> mcp: MCP Request: data/query\n{\n  "resource_uri": "datasource://医药资讯",\n  "filters": {"keyword": "新药审批"},\n  "limit": 50, "offset": 0\n}
+activate mcp
+
+mcp -> master: QueryData(resource_uri, filters, pagination)
+activate master
+
+master -> master: ParseResourceURI(uri)
+note right
+  解析URI获取数据源ID：
+  datasource://医药资讯 → datasource_id = "uuid-123"
+end note
+
+master -> redis: GET cache:query:{hash(query_params)}
+activate redis
+alt 缓存命中
+  redis --> master: 返回缓存的查询结果
+  note right: TTL=300秒（5分钟）
+  master --> mcp: 返回数据（from cache）
+  mcp --> ai: MCP Response:\n{\n  "data": [...],\n  "total": 123,\n  "cached": true\n}
+else 缓存未命中
+  redis --> master: nil
+  deactivate redis
+
+  master -> db: SELECT * FROM raw_data\nWHERE datasource_id = 'uuid-123'\n  AND content @> '{"keyword": "新药审批"}'\nLIMIT 50 OFFSET 0
+  activate db
+  note right
+    使用PostgreSQL的JSONB索引加速查询
+    GIN索引：raw_data(content jsonb_path_ops)
+  end note
+
+  db --> master: 返回数据记录列表
+  deactivate db
+
+  master -> master: TransformToMCPFormat()
+  note right
+    标准化为MCP数据格式：
+    {
+      "id": "record-uuid",
+      "source": "datasource://医药资讯",
+      "content": {...},
+      "metadata": {
+        "collected_at": "2025-10-26T10:00:00Z",
+        "schema": {...}
+      }
+    }
+  end note
+
+  master -> db: SELECT COUNT(*) FROM raw_data\nWHERE datasource_id = 'uuid-123'\n  AND content @> '{"keyword": "新药审批"}'
+  activate db
+  db --> master: total = 123
+  deactivate db
+
+  master -> redis: SETEX cache:query:{hash} 300 {data, total}
+  activate redis
+  note right: 缓存查询结果，TTL=300秒
+  redis --> master: OK
+  deactivate redis
+
+  master --> mcp: 返回数据和元信息
+  deactivate master
+
+  mcp --> ai: MCP Response:\n{\n  "data": [\n    {\n      "id": "record-uuid",\n      "source": "datasource://医药资讯",\n      "content": {...},\n      "metadata": {...}\n    },\n    ...\n  ],\n  "pagination": {\n    "total": 123,\n    "limit": 50,\n    "offset": 0,\n    "has_more": true\n  },\n  "cached": false\n}
+  deactivate mcp
+end
+
+ai -> ai: 处理返回的数据
+note left
+  AI应用可以：
+  1. 解析content字段提取信息
+  2. 根据metadata理解数据结构
+  3. 使用pagination进行分页查询
+end note
+
+== 3. Schema查询（可选） ==
+
+ai -> mcp: MCP Request: schema/get\n{resource_uri: "datasource://医药资讯"}
+activate mcp
+
+mcp -> master: GetResourceSchema(uri)
+activate master
+
+master -> resource: GetSchema(datasource_id)
+activate resource
+
+resource -> db: SELECT field_mappings FROM datasources\nWHERE id = 'uuid-123'
+activate db
+db --> resource: 返回字段映射配置
+deactivate db
+
+resource -> resource: GenerateJSONSchema()
+note right
+  生成标准JSON Schema：
+  {
+    "type": "object",
+    "properties": {
+      "title": {"type": "string"},
+      "content": {"type": "string"},
+      "publish_date": {"type": "string", "format": "date-time"}
+    }
+  }
+end note
+
+resource --> master: 返回Schema
+deactivate resource
+
+master --> mcp: 返回Schema
+deactivate master
+
+mcp --> ai: MCP Response:\n{\n  "schema": {...},\n  "sample": {...}\n}
+deactivate mcp
+
+ai -> ai: 理解数据结构，优化后续查询
+
+@enduml

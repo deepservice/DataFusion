@@ -1161,6 +1161,206 @@ helm install datafusion ./datafusion-chart \
 
 ---
 
+#### 3.1.4. 系统集成场景
+
+这类场景涵盖DataFusion与外部系统的集成能力，包括通过MCP协议为AI应用提供数据服务，以及通过移动端应用实现随时随地的任务监控和管理。这些集成能力扩展了系统的应用范围，使DataFusion不仅是数据采集平台，也是企业数据服务的基础设施。
+
+##### 3.1.4.1. MCP协议资源发现与数据查询流程
+
+**场景描述**：AI应用通过MCP（Model Context Protocol）协议连接到DataFusion，首先调用`resources/list`接口发现所有可用的数据源资源，然后使用`data/query`接口查询符合条件的采集数据。查询支持过滤、分页和字段选择，返回标准化的JSON格式数据，并包含完整的元信息和Schema描述。系统使用Redis缓存查询结果，提升频繁查询的响应速度。
+
+**参与组件**：AI Application、MCP Gateway (Go MCP SDK)、Master (MCP Service)、PostgreSQL、Redis (Query Cache)、Resource Manager
+
+**时序图**
+
+![MCP协议资源发现与数据查询流程](diagrams/seq_mcp_query.png)
+
+**关键技术点**：
+
+1. **MCP Go SDK集成（Anthropic规范）**：
+   - 基于Anthropic的MCP规范实现服务端：https://github.com/anthropics/mcp-golang
+   - 实现标准接口：`resources/list`、`data/query`、`schema/get`
+   - 支持JSON-RPC 2.0协议通信
+   - 提供错误码标准化：参考MCP规范的错误码定义（-32700至-32000）
+   - 兼容主流MCP客户端：LangChain MCP、Semantic Kernel等
+
+2. **resources/list资源发现接口**：
+   - 返回所有启用的数据源列表（`enabled = true`）
+   - 资源URI格式：`datasource://{datasource_name}`
+   - 提供资源元信息：名称、描述、MIME类型、更新时间
+   - 支持type过滤：`datasource`、`task`、`collection`
+   - 分页支持：`limit`和`offset`参数
+
+3. **data/query标准化查询接口**：
+   - 查询参数：
+     - `resource_uri`：资源标识符（必填）
+     - `filters`：过滤条件（JSON对象，支持JSONB查询）
+     - `fields`：返回字段列表（可选，不指定则返回全部字段）
+     - `limit`/`offset`：分页参数（默认50条/页，最大1000条）
+     - `sort`：排序字段和方向（如`collected_at:desc`）
+   - 返回格式：
+     - `data`：数据记录数组，每条记录包含`id`、`source`、`content`、`metadata`
+     - `pagination`：分页信息（total、limit、offset、has_more）
+     - `cached`：是否来自缓存
+
+4. **数据映射层（Task → MCP Resource）**：
+   - 数据源（datasource）映射为MCP Resource
+   - 采集任务（task）映射为MCP Resource（可选）
+   - 数据记录（raw_data）映射为MCP Data对象
+   - 统一资源标识符（URI）：`{type}://{identifier}`
+   - 自动生成资源描述：从数据源配置中提取name和description
+
+5. **查询缓存策略（Redis）**：
+   - 缓存Key生成：`cache:query:{hash(resource_uri + filters + pagination)}`
+   - 使用SHA256哈希确保Key唯一性
+   - TTL设置：300秒（5分钟）
+   - 缓存内容：JSON格式的查询结果（data + pagination）
+   - 缓存失效：数据源更新时主动清除相关缓存
+   - 缓存穿透保护：空结果也缓存（TTL=60秒）
+
+6. **JSON Schema自动推断**：
+   - 从`field_mappings`配置生成JSON Schema
+   - 支持常见数据类型：string、number、boolean、object、array
+   - 提供字段描述和示例值
+   - 支持嵌套对象和数组结构
+   - Schema版本管理：记录schema_version字段
+   - 提供sample数据：返回1-3条样本记录帮助AI理解数据结构
+
+##### 3.1.4.2. MCP数据订阅与实时推送流程
+
+**场景描述**：AI应用通过WebSocket连接到MCP Gateway，使用`data/subscribe`接口订阅特定数据源的更新事件。订阅配置包括资源URI、过滤条件（如关键词、时间范围）、推送策略（批量大小、最大延迟）。Worker完成数据采集后，会发布事件到RabbitMQ，Subscription Manager消费事件并匹配所有相关订阅，将新数据通过WebSocket实时推送给AI应用。订阅支持心跳续期和主动取消。
+
+**参与组件**：AI Application、MCP Gateway (WebSocket)、Master (Subscription Manager)、Redis (Subscription Store)、PostgreSQL、RabbitMQ (Event Stream)、Worker、WebSocket Server
+
+**时序图**
+
+![MCP数据订阅与实时推送流程](diagrams/seq_mcp_subscribe.png)
+
+**关键技术点**：
+
+1. **data/subscribe订阅管理**：
+   - WebSocket连接建立：`wss://datafusion.com/mcp/ws?token={api_key}`
+   - 订阅请求参数：
+     - `resource_uri`：订阅的资源标识符
+     - `filters`：推送过滤条件（keywords、date_range、custom_filters）
+     - `notification_config`：推送配置（batch_size、max_delay、priority）
+   - 返回subscription_id：用于后续管理（续期、取消）
+   - 订阅生命周期：创建 → 活跃 → 暂停 → 取消
+   - 支持一个客户端创建多个订阅
+
+2. **Redis订阅存储（Hash + TTL）**：
+   - 主存储：`HSET subscriptions:active {subscription_id} {config_json}`
+   - 资源索引：`SADD subscriptions:by_resource:{resource_name} {subscription_id}`
+   - 客户端索引：`SADD subscriptions:by_client:{client_id} {subscription_id}`
+   - 心跳记录：`HSET subscriptions:heartbeat {subscription_id} {timestamp}`
+   - TTL管理：订阅默认24小时过期，通过心跳续期
+   - 最后推送时间：`HSET subscriptions:last_push {subscription_id} {timestamp}`
+
+3. **推送条件匹配引擎**：
+   - 关键词匹配：使用PostgreSQL的全文搜索（`@@ to_tsquery`）
+   - 时间范围过滤：`collected_at >= since AND collected_at <= until`
+   - 自定义过滤器：支持JSONB路径查询（`content @> filter_json`）
+   - 批量策略：累计达到batch_size条数据后推送
+   - 延迟策略：距离上次推送超过max_delay秒后推送（即使未达到batch_size）
+   - 优先级支持：high优先级订阅立即推送（忽略batch_size）
+
+4. **WebSocket连接池管理**：
+   - 连接映射：`connections[client_id] = WebSocketConnection`
+   - 连接验证：JWT Token验证，提取client_id
+   - 心跳检测：每30秒ping/pong检查连接活跃度
+   - 断线重连：客户端重连时恢复订阅（基于subscription_id）
+   - 连接限制：单个客户端最多10个并发连接
+   - 优雅关闭：连接关闭时自动暂停订阅（保留24小时）
+
+5. **订阅心跳与自动清理**：
+   - 心跳接口：`subscription/heartbeat {subscription_id}`
+   - 心跳间隔：建议5分钟一次
+   - 超时清理：超过1小时无心跳的订阅自动暂停
+   - 垃圾回收：超过24小时的暂停订阅自动删除
+   - 后台任务：每小时扫描一次`subscriptions:heartbeat`，清理过期订阅
+   - 清理通知：通过WebSocket发送`subscription.expired`事件
+
+6. **推送限流（Rate Limiting）**：
+   - 令牌桶算法：每个订阅独立限流
+   - 默认速率：最多每秒推送10条消息
+   - Burst支持：允许短时间内推送最多50条消息
+   - Redis实现：`HSET rate_limit:sub:{id} tokens {count}`
+   - 限流响应：超过限制时延迟推送，记录到队列（FIFO）
+   - 监控告警：限流触发时记录日志，Dashboard展示限流统计
+
+##### 3.1.4.3. 移动端任务监控与推送通知流程
+
+**场景描述**：用户在移动App上登录后，系统注册设备Token（Firebase FCM用于Android，APNs用于iOS）。当采集任务失败时，Alert Manager根据告警规则判断是否需要推送通知，通过Redis去重检查（1小时内相同任务不重复推送），然后调用FCM/APNs发送推送通知。用户点击通知后，App通过Deep Link跳转到任务详情页，查看失败原因并可快速重试任务（发送到高优先级队列）。
+
+**参与组件**：Mobile User、Mobile App (iOS/Android)、Push Service (FCM/APNs)、Gateway、Master (Device Manager)、PostgreSQL、Redis (Push Dedup)、RabbitMQ、Worker、Monitor、Alert Manager
+
+**时序图**
+
+![移动端任务监控与推送通知流程](diagrams/seq_mobile_push.png)
+
+**关键技术点**：
+
+1. **设备Token注册与管理**：
+   - 注册接口：`POST /api/v1/devices/register`
+   - 请求参数：
+     - `device_token`：FCM Registration Token或APNs Device Token
+     - `device_type`：android或ios
+     - `device_info`：操作系统版本、App版本、设备型号等
+   - 幂等性保证：使用`ON CONFLICT (device_token) DO UPDATE`
+   - 用户设备映射：`SADD devices:user:{user_id} {device_id}`
+   - Token缓存：`SETEX device:token:{device_id} 2592000 {token}`（TTL=30天）
+   - Token刷新：App启动时检查Token变化，变化则重新注册
+
+2. **Firebase Cloud Messaging (Android)**：
+   - API端点：`https://fcm.googleapis.com/v1/projects/{project}/messages:send`
+   - 认证方式：OAuth 2.0服务账号（service account JSON）
+   - 消息格式：
+     - `notification`：标题、正文、图标、声音
+     - `data`：自定义数据（task_id、datasource_id、deep_link）
+     - `android`：Android特定配置（优先级、TTL）
+   - 优势：自动管理连接重试、支持主题订阅、免费使用
+   - 限制：每分钟最多600,000条消息（可申请提额）
+
+3. **Apple Push Notification Service (iOS)**：
+   - API端点：`https://api.push.apple.com/3/device/{device_token}`
+   - 认证方式：Token-based认证（.p8密钥文件）或Certificate-based认证（.p12证书）
+   - 消息格式：
+     - `aps.alert`：标题、正文
+     - `aps.sound`：通知声音
+     - `aps.badge`：App图标角标数字
+     - 自定义字段：task_id、datasource_id、deep_link
+   - 优势：低延迟（通常<1秒）、高可靠、原生集成好
+   - 限制：消息大小最多4KB
+
+4. **Deep Link跳转（datafusion://）**：
+   - URL Scheme：`datafusion://task/{task_id}`
+   - 支持的路径：
+     - `datafusion://task/{task_id}`：跳转到任务详情页
+     - `datafusion://datasource/{datasource_id}`：跳转到数据源详情页
+     - `datafusion://alert/{alert_id}`：跳转到告警详情页
+   - iOS实现：在`AppDelegate`中处理`application(_:open:options:)`
+   - Android实现：在`AndroidManifest.xml`配置`<intent-filter>`，Activity中解析Intent
+   - Web回退：如果App未安装，Deep Link重定向到Web页面
+
+5. **推送消息去重（Redis）**：
+   - 去重Key：`push:dedup:{user_id}:{task_id}`
+   - TTL设置：3600秒（1小时）
+   - 去重逻辑：发送推送前检查Key是否存在，存在则跳过
+   - 去重范围：同一任务、同一用户、1小时内
+   - 目的：避免短时间内重复推送相同任务失败通知
+   - 例外：优先级为critical的告警不去重
+
+6. **快速重试机制（高优先级队列）**：
+   - 重试接口：`POST /api/v1/tasks/{task_id}/retry`
+   - 权限验证：确认用户有权限操作该任务
+   - 优先级队列：发送到`task.queue.high`，Worker优先消费
+   - 任务状态更新：`status = 'pending'`，`retry_count++`
+   - 审计日志：记录`triggered_by`（用户ID）和`triggered_from`（mobile）
+   - WebSocket实时推送：如果用户保持前台运行，实时推送任务状态变化
+   - 成功通知（可选）：任务执行成功后可选择发送成功推送
+
+---
+
 ### 3.2. 核心模块设计
 
 以下是系统的核心模块详细设计，各模块职责分明，通过定义好的接口进行协作。
