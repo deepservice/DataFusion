@@ -388,23 +388,218 @@ helm install datafusion ./datafusion-chart \
 
 ### 3.1. 核心场景时序图
 
-为了更清晰地展示系统在关键场景下的交互流程，我们提供了以下时序图。
+为了更清晰地展示系统在关键场景下的交互流程，本节提供了完整的技术时序图。这些时序图覆盖了从数据采集、任务管理、数据处理到系统集成的全部核心场景，每个时序图都详细描述了组件间的交互细节、数据流转路径和异常处理逻辑，为开发团队提供清晰的实现指导。
 
-#### 3.1.1. 任务创建场景
+时序图按功能分为四大类：
+- **数据采集场景**：涵盖网页RPA采集、数据库同步、API采集和智能字段识别
+- **任务管理场景**：包括任务创建、调度执行、手动触发和失败重试
+- **数据处理场景**：覆盖数据清洗、查询导出和错误修正
+- **系统集成场景**：支持MCP协议集成和移动端监控
 
-用户通过 Web UI 创建一个新的数据采集任务的完整流程：
+#### 3.1.1. 数据采集场景
 
-![任务创建时序图](diagrams/seq_create_task.png)
+数据采集是DataFusion的核心能力，本节展示四种主要数据采集方式的完整技术流程。
 
-该时序图展示了从用户提交任务配置，到系统完成任务注册和调度配置的全过程，涉及认证、数据持久化、调度器注册等关键步骤。
+##### 3.1.1.1. 网页数据源配置与RPA采集流程
 
-#### 3.1.2. 任务执行场景
+**场景描述**
 
-调度器触发任务执行，Worker 节点完成数据采集、处理和存储的完整流程：
+用户通过Web UI配置一个网页数据源，系统使用RPA技术（Playwright/Puppeteer）进行测试采集，验证配置正确性。此场景涵盖从用户提交配置、系统启动无头浏览器、渲染目标网页、提取数据、到返回测试结果的完整流程。
 
-![任务执行时序图](diagrams/seq_execute_task.png)
+**参与组件**
+- Web UI (Vue.js)
+- API Gateway  (Gin/Go)
+- Master节点 - 数据源管理服务
+- PostgreSQL (配置存储)
+- RabbitMQ (任务队列)
+- Worker节点 - RPA采集器
+- Playwright/Puppeteer (无头浏览器引擎)
+- Target Website (目标网站)
 
-该时序图详细描述了任务从调度、分发、执行、到结果上报的全过程，包括成功和失败两种情况的处理逻辑，以及重试和告警机制。
+**时序图**
+
+![网页数据源配置与RPA采集时序图](diagrams/seq_web_rpa_collection.png)
+
+```plantuml
+@startuml seq_web_rpa_collection
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI" as ui
+participant "API Gateway" as gateway
+participant "Master\nDataSource Service" as master
+database "PostgreSQL" as db
+queue "RabbitMQ" as mq
+participant "Worker\nRPA Collector" as worker
+participant "Playwright\nHeadless Browser" as playwright
+participant "Target Website" as website
+
+autonumber
+
+== 配置数据源 ==
+
+user -> ui: 填写网页数据源配置\n(URL, 请求头, 代理等)
+ui -> gateway: POST /api/v1/datasources\n{type: "web_rpa", config: {...}}
+gateway -> gateway: 验证JWT Token
+gateway -> master: 创建数据源请求
+master -> db: INSERT datasource配置\n(status: "draft")
+master --> gateway: 返回数据源ID
+gateway --> ui: 200 OK {datasource_id}
+ui --> user: 显示数据源ID
+
+== 配置字段提取规则 ==
+
+user -> ui: 配置字段提取规则\n(CSS选择器/XPath/正则)
+note right of user
+  用户配置示例：
+  - title: CSS ".article-title"
+  - date: XPath "//span[@class='time']"
+  - content: CSS ".article-content"
+end note
+
+ui -> gateway: PUT /api/v1/datasources/{id}/rules\n{fields: [...]}
+gateway -> master: 更新提取规则
+master -> db: UPDATE datasource\nSET extraction_rules = {...}
+master --> gateway: 200 OK
+gateway --> ui: 配置已保存
+ui --> user: 提示保存成功
+
+== 测试采集 ==
+
+user -> ui: 点击"测试采集"按钮
+ui -> gateway: POST /api/v1/datasources/{id}/test
+gateway -> master: 创建测试任务
+
+master -> mq: 发布测试任务到高优先级队列\n{task_id, datasource_id, type: "test"}
+note right of mq
+  任务消息包含：
+  - 数据源配置（URL、请求头）
+  - 提取规则（CSS/XPath/正则）
+  - RPA配置（浏览器类型、超时）
+end note
+
+master --> gateway: 202 Accepted {task_id}
+gateway --> ui: 返回任务ID
+ui --> user: 显示"正在测试..."
+
+== Worker执行RPA采集 ==
+
+worker -> mq: 从队列获取任务\n(long polling)
+mq --> worker: 返回任务消息
+
+worker -> db: 查询数据源配置\nSELECT * FROM datasources WHERE id = ?
+db --> worker: 返回配置详情
+
+worker -> playwright: 启动无头浏览器\nlaunchBrowser({headless: true})
+playwright --> worker: 返回浏览器实例
+
+worker -> playwright: 创建新页面\nnewPage()
+playwright --> worker: 返回页面实例
+
+worker -> playwright: 设置User-Agent和请求头\nsetUserAgent(), setExtraHTTPHeaders()
+
+worker -> playwright: 访问目标URL\ngoto(url, {waitUntil: 'domcontentloaded'})
+playwright -> website: HTTP GET请求
+website --> playwright: 返回HTML响应
+
+playwright -> playwright: 渲染页面，执行JavaScript
+playwright -> playwright: 等待页面加载完成
+
+playwright --> worker: 页面加载成功
+
+worker -> playwright: 提取字段数据\nevaluate(CSS选择器/XPath)
+note right of worker
+  根据用户配置的规则提取：
+  - title: page.$('.article-title')
+  - date: page.$x('//span[@class="time"]')
+  - content: page.$('.article-content')
+end note
+
+playwright --> worker: 返回提取的数据数组
+
+worker -> worker: 应用数据清洗规则\n(去除HTML标签、格式转换)
+
+worker -> playwright: 关闭浏览器\nbrowser.close()
+
+== 返回测试结果 ==
+
+worker -> db: 保存测试结果\nINSERT INTO test_results\n{task_id, data: [...], status: "success"}
+
+worker -> master: 通过RabbitMQ回调\n上报任务完成状态
+note right of worker
+  结果包含：
+  - 提取到的数据条数
+  - 前3条数据示例
+  - 执行耗时
+  - 是否有错误
+end note
+
+master -> db: UPDATE datasource\nSET test_status = "success",\nlast_test_time = NOW()
+
+== 轮询获取结果（或WebSocket推送） ==
+
+ui -> gateway: GET /api/v1/tasks/{task_id}/result\n(轮询或WebSocket)
+gateway -> master: 查询任务结果
+master -> db: SELECT * FROM test_results\nWHERE task_id = ?
+db --> master: 返回测试结果数据
+master --> gateway: 返回结果JSON
+gateway --> ui: 200 OK {status: "success", data: [...]}
+
+ui --> user: 展示测试结果\n- 提取到50条数据\n- 显示前3条预览\n- 执行耗时: 3.5秒
+
+== 保存数据源 ==
+
+user -> ui: 点击"保存"按钮
+ui -> gateway: PUT /api/v1/datasources/{id}/publish
+gateway -> master: 发布数据源
+master -> db: UPDATE datasource\nSET status = "active",\npublished_at = NOW()
+master --> gateway: 200 OK
+gateway --> ui: 数据源已发布
+ui --> user: 提示"数据源配置成功"
+
+@enduml
+```
+
+**关键技术点**
+
+1. **异步测试执行**
+   - 测试采集任务通过RabbitMQ高优先级队列异步执行
+   - 前端通过轮询或WebSocket获取实时结果
+   - 超时时间默认30秒，可配置
+
+2. **RPA引擎选型**
+   - 优先使用Playwright（支持多浏览器、重试机制更强）
+   - Puppeteer作为备选（稳定性好、社区成熟）
+   - 支持Headless模式（生产环境）和Headed模式（调试）
+
+3. **数据提取引擎**
+   - CSS选择器：使用Chromium内置选择器引擎（最快）
+   - XPath：使用浏览器原生xpath解析器
+   - 正则表达式：在提取结果上二次处理
+   - 支持组合使用（先CSS定位容器，再XPath提取细节）
+
+4. **错误处理**
+   - 页面加载超时：重试3次，指数退避（5s, 10s, 20s）
+   - 元素未找到：记录警告，继续执行其他字段提取
+   - 浏览器崩溃：重启浏览器实例，重新执行
+   - 网络错误：检测代理可用性，切换备用代理
+
+5. **性能优化**
+   - 禁用图片加载（可选，节省带宽）
+   - 禁用CSS/字体加载（可选，加速渲染）
+   - 使用浏览器缓存（同一域名多次访问）
+   - Worker节点池化管理（预启动浏览器实例）
+
+6. **安全性考虑**
+   - Cookie加密存储在PostgreSQL
+   - 代理认证信息使用AES加密
+   - 限制目标URL白名单（防止SSRF攻击）
+   - 资源配额控制（单次采集最大内存/CPU使用）
+
+---
 
 ### 3.2. 核心模块设计
 
