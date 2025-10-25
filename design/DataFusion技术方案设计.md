@@ -993,6 +993,910 @@ helm install datafusion ./datafusion-chart \
 
 ---
 
+#### 3.1.3. 数据处理场景
+
+这类场景涵盖数据采集后的处理、查询、导出和数据质量管理。用户可以配置清洗规则对原始数据进行预处理，查询和导出采集结果，或标记错误数据触发重新采集。
+
+##### 3.1.3.1. 数据清洗规则配置与执行流程
+
+**场景描述**：用户为数据源配置清洗规则（如去除HTML标签、格式化日期、数据类型转换等），系统在采集时自动应用规则。用户可先在测试模式下预览清洗效果，确认无误后保存，Worker在后续采集中会自动应用这些规则。
+
+**参与组件**：Web UI、Gateway、Master (Cleaner Service)、PostgreSQL、Redis、RabbitMQ、Worker、Data Processor
+
+**时序图**：
+
+```plantuml
+@startuml
+!theme plain
+skinparam backgroundColor #FFFFFF
+title 数据清洗规则配置与执行流程
+
+autonumber
+
+actor User as user
+participant "Web UI" as ui
+participant "Gateway" as gateway
+participant "Master\nCleaner Service" as cleaner
+participant "PostgreSQL" as db
+participant "Redis\n(Rule Cache)" as redis
+participant "RabbitMQ" as mq
+participant "Worker" as worker
+participant "Data Processor\n(expr Engine)" as processor
+
+== 1. 配置清洗规则 ==
+
+user -> ui: 点击"添加清洗规则"
+activate ui
+
+ui -> gateway: POST /api/cleaner/rules\n{datasource_id, field, rule_type, expression}
+activate gateway
+
+gateway -> cleaner: CreateCleanRule(request)
+activate cleaner
+
+note over cleaner
+  支持的规则类型：
+  - trim: 去除首尾空白
+  - replace: 正则替换
+  - extract: 正则提取
+  - format_date: 日期格式化
+  - to_number: 类型转换
+  - remove_html: 移除HTML标签
+  - custom_expr: 自定义表达式
+end note
+
+cleaner -> cleaner: ValidateExpression(rule_type, expression)
+note right
+  使用expr-lang进行语法校验
+  例如：
+  - "trim(field)"
+  - "replace(field, '[^0-9]', '')"
+  - "format_date(field, '2006-01-02')"
+end note
+
+cleaner -> db: INSERT INTO cleaner_rules\n(datasource_id, field, rule_type, expression, enabled)
+activate db
+db --> cleaner: 返回rule_id
+deactivate db
+
+cleaner -> redis: DEL cache:rules:datasource:{datasource_id}
+note right: 清除缓存，强制重新加载
+
+cleaner --> gateway: 返回rule详情
+deactivate cleaner
+gateway --> ui: 200 OK {rule_id, ...}
+deactivate gateway
+
+ui --> user: 显示规则已创建
+deactivate ui
+
+== 2. 测试清洗规则（预览效果） ==
+
+user -> ui: 点击"测试规则"，输入样本数据
+activate ui
+
+ui -> gateway: POST /api/cleaner/rules/{rule_id}/test\n{sample_data: "  <b>123</b> "}
+activate gateway
+
+gateway -> cleaner: TestCleanRule(rule_id, sample_data)
+activate cleaner
+
+cleaner -> db: SELECT * FROM cleaner_rules WHERE id = ?
+activate db
+db --> cleaner: 返回rule详情
+deactivate db
+
+cleaner -> processor: ApplyRule(rule, sample_data)
+activate processor
+
+processor -> processor: ParseExpression(rule.expression)
+note right
+  使用expr-lang解析表达式
+  编译为AST（Abstract Syntax Tree）
+end note
+
+processor -> processor: ExecuteExpression(ast, sample_data)
+note right
+  例如：remove_html + trim
+  输入: "  <b>123</b> "
+  步骤1: remove_html -> "  123 "
+  步骤2: trim -> "123"
+end note
+
+processor --> cleaner: 返回清洗后的数据 "123"
+deactivate processor
+
+cleaner --> gateway: 返回测试结果\n{before: "  <b>123</b> ", after: "123"}
+deactivate cleaner
+
+gateway --> ui: 200 OK {test_result}
+deactivate gateway
+
+ui --> user: 对比显示清洗前后数据
+deactivate ui
+
+== 3. 保存并启用规则 ==
+
+user -> ui: 确认无误，点击"启用规则"
+activate ui
+
+ui -> gateway: PATCH /api/cleaner/rules/{rule_id}\n{enabled: true}
+activate gateway
+
+gateway -> cleaner: EnableCleanRule(rule_id)
+activate cleaner
+
+cleaner -> db: UPDATE cleaner_rules\nSET enabled = true, updated_at = NOW()
+activate db
+db --> cleaner: 更新成功
+deactivate db
+
+cleaner -> redis: DEL cache:rules:datasource:{datasource_id}
+note right: 再次清除缓存
+
+cleaner -> redis: PUBLISH channel:rule_update\n{datasource_id: xxx, action: 'enabled'}
+note right
+  发布规则更新事件
+  所有Worker会订阅此频道
+end note
+
+cleaner --> gateway: 规则已启用
+deactivate cleaner
+
+gateway --> ui: 200 OK
+deactivate gateway
+
+ui --> user: 显示"规则已启用"
+deactivate ui
+
+== 4. Worker采集时自动应用规则 ==
+
+note over mq: 任务调度器推送采集任务到队列
+
+mq -> worker: 消费任务消息\n{task_id, datasource_id, ...}
+activate worker
+
+worker -> worker: 加载数据源配置
+worker -> redis: GET cache:rules:datasource:{datasource_id}
+activate redis
+
+alt 缓存未命中
+    redis --> worker: nil
+    worker -> db: SELECT * FROM cleaner_rules\nWHERE datasource_id = ? AND enabled = true
+    activate db
+    db --> worker: 返回规则列表 [rule1, rule2, ...]
+    deactivate db
+
+    worker -> redis: SETEX cache:rules:datasource:{datasource_id}\n3600, [rules...]
+    redis --> worker: 缓存已设置
+else 缓存命中
+    redis --> worker: 返回规则列表
+end
+
+deactivate redis
+
+worker -> worker: 执行采集逻辑\n（RPA/DB/API）
+note right
+  采集到原始数据
+  例如：{"title": "  <b>Product</b> ", "price": "$99.99"}
+end note
+
+worker -> processor: ApplyAllRules(rules, raw_data)
+activate processor
+
+loop 遍历每个字段的规则
+    processor -> processor: 应用规则链（管道式处理）
+    note right
+      title字段：
+      1. remove_html: "<b>Product</b>" -> "Product"
+      2. trim: "  Product " -> "Product"
+
+      price字段：
+      1. replace('[^0-9.]', ''): "$99.99" -> "99.99"
+      2. to_number: "99.99" -> 99.99
+    end note
+end
+
+processor --> worker: 返回清洗后的数据\n{"title": "Product", "price": 99.99}
+deactivate processor
+
+worker -> db: INSERT INTO raw_data (cleaned_data)\nVALUES (?)
+activate db
+db --> worker: 插入成功
+deactivate db
+
+worker -> db: UPDATE tasks SET status = 'completed'\nWHERE id = ?
+db --> worker: 更新成功
+deactivate db
+
+worker --> mq: ACK消息
+deactivate worker
+
+@enduml
+```
+
+![数据清洗规则配置与执行流程](diagrams/seq_data_cleaning.png)
+
+**关键技术点**：
+
+1. **清洗规则DSL（expr-lang）**：
+   - 使用Go的`expr-lang`库实现灵活的表达式引擎
+   - 支持内置函数（trim、replace、extract、format_date等）
+   - 语法校验确保表达式安全可执行
+   - 示例：`trim(replace(field, '[^A-Za-z0-9]', ''))`
+
+2. **管道式处理（Pipeline）**：
+   - 同一字段可配置多条规则，按顺序串联执行
+   - 前一条规则的输出作为后一条规则的输入
+   - 规则优先级：数据类型转换 > 格式化 > 内容清洗
+   - 支持短路机制：规则执行失败时记录警告但不中断流程
+
+3. **规则缓存与热更新**：
+   - Redis缓存规则列表，TTL=3600秒（1小时）
+   - 规则变更时清除缓存并发布Pub/Sub事件
+   - Worker订阅`channel:rule_update`频道，接收到事件立即刷新缓存
+   - 避免每次采集都查询数据库，提升性能
+
+4. **测试模式与预览**：
+   - 用户可输入样本数据测试清洗效果
+   - 实时预览清洗前后对比，支持多条规则串联测试
+   - 确认无误后再启用，降低配置错误风险
+   - 测试结果不持久化，仅用于UI显示
+
+5. **错误处理与回退**：
+   - 表达式执行失败时记录详细错误日志（字段名、规则、原始值）
+   - 采用宽松策略：清洗失败保留原始值，不阻塞采集任务
+   - 记录清洗失败统计（PostgreSQL的`cleaner_errors`表）
+   - 支持全局开关：`cleaner.fail_strategy=skip/stop`
+
+6. **性能优化**：
+   - 表达式编译结果缓存（编译一次，多次执行）
+   - 支持批量清洗：一次处理1000条数据，减少函数调用开销
+   - 异步清洗模式：先存储原始数据，后台异步应用规则（可选）
+   - 监控清洗耗时，超过阈值（100ms）触发告警
+
+---
+
+##### 3.1.3.2. 数据查询与导出流程
+
+**场景描述**：用户在Web界面查询已采集的数据，应用筛选条件（如时间范围、关键词搜索）、排序和分页，查看结果后可选择导出为CSV格式。系统采用流式导出避免内存溢出，生成临时文件后返回下载链接，定时清理过期文件。
+
+**参与组件**：Web UI、Gateway、Master (Query Service)、PostgreSQL、Redis、Object Storage (MinIO)、Async Task Queue
+
+**时序图**：
+
+```plantuml
+@startuml
+!theme plain
+skinparam backgroundColor #FFFFFF
+title 数据查询与导出流程
+
+autonumber
+
+actor User as user
+participant "Web UI" as ui
+participant "Gateway" as gateway
+participant "Master\nQuery Service" as query
+participant "PostgreSQL" as db
+participant "Redis\n(Query Cache)" as redis
+participant "Async Task Queue\n(RabbitMQ)" as mq
+participant "Export Worker" as worker
+participant "Object Storage\n(MinIO)" as storage
+
+== 1. 数据查询（分页） ==
+
+user -> ui: 打开"数据查看"页面，输入筛选条件
+activate ui
+
+note over user
+  筛选条件示例：
+  - 数据源: datasource_id=123
+  - 时间范围: 2025-01-01 ~ 2025-01-31
+  - 关键词: title LIKE '%手机%'
+  - 排序: created_at DESC
+  - 分页: page=1, page_size=50
+end note
+
+ui -> gateway: GET /api/data/query?\ndatasource_id=123&start_date=2025-01-01&\nend_date=2025-01-31&keyword=手机&\npage=1&page_size=50&order_by=created_at DESC
+activate gateway
+
+gateway -> query: QueryData(filters, pagination)
+activate query
+
+query -> query: BuildQuerySQL(filters)
+note right
+  动态构建SQL：
+  SELECT * FROM raw_data
+  WHERE datasource_id = $1
+  AND created_at BETWEEN $2 AND $3
+  AND title LIKE $4
+  ORDER BY created_at DESC
+  LIMIT 50 OFFSET 0
+end note
+
+query -> query: GenerateCacheKey(filters, pagination)
+note right
+  Redis缓存Key:
+  query:cache:md5(datasource_id+date_range+keyword+page)
+end note
+
+query -> redis: GET query:cache:{cache_key}
+activate redis
+
+alt 缓存命中（5分钟内查询过）
+    redis --> query: 返回缓存的数据 + total_count
+    query --> gateway: 返回查询结果（缓存）
+else 缓存未命中
+    redis --> query: nil
+    deactivate redis
+
+    query -> db: 执行查询SQL + COUNT查询
+    activate db
+    db --> query: 返回数据列表 + total_count
+    deactivate db
+
+    query -> redis: SETEX query:cache:{cache_key}\n300, {data, total_count}
+    activate redis
+    note right: 缓存5分钟
+    redis --> query: 缓存已设置
+    deactivate redis
+
+    query --> gateway: 返回查询结果
+end
+
+deactivate query
+
+gateway --> ui: 200 OK\n{data: [...], total: 1234, page: 1, page_size: 50}
+deactivate gateway
+
+ui --> user: 表格展示数据，显示分页控件（共25页）
+deactivate ui
+
+== 2. 导出数据（CSV） ==
+
+user -> ui: 勾选"导出全部数据"，点击"导出CSV"
+activate ui
+
+ui -> ui: 显示确认弹窗\n"共1234条数据，预计耗时30秒"
+user -> ui: 确认导出
+
+ui -> gateway: POST /api/data/export\n{datasource_id, filters, format: 'csv'}
+activate gateway
+
+gateway -> query: CreateExportTask(request)
+activate query
+
+query -> query: ValidateFilters(filters)
+note right
+  验证导出条件：
+  - 单次导出不超过10万条
+  - 需要包含数据源ID
+  - 格式支持：csv/xlsx/json
+end note
+
+query -> db: INSERT INTO export_tasks\n(user_id, datasource_id, filters, status, format)\nVALUES (?, ?, ?, 'pending', 'csv')
+activate db
+db --> query: 返回task_id=789
+deactivate db
+
+query -> mq: 发送导出任务消息\n{task_id: 789, datasource_id: 123, filters, format: 'csv'}
+activate mq
+note right
+  推送到export队列
+  优先级：normal
+end note
+mq --> query: 消息已发送
+deactivate mq
+
+query --> gateway: 返回task_id
+deactivate query
+
+gateway --> ui: 202 Accepted {task_id: 789, estimated_time: 30}
+deactivate gateway
+
+ui -> ui: 显示导出进度弹窗\n"正在导出，请稍候..."
+ui -> gateway: WebSocket连接\nSubscribe: /tasks/789/progress
+activate gateway
+gateway --> ui: 连接成功
+deactivate gateway
+
+ui --> user: 显示进度条（初始0%）
+deactivate ui
+
+== 3. Worker异步执行导出 ==
+
+mq -> worker: 消费导出任务消息\n{task_id: 789, ...}
+activate worker
+
+worker -> db: UPDATE export_tasks\nSET status = 'processing', started_at = NOW()
+activate db
+db --> worker: 更新成功
+deactivate db
+
+worker -> gateway: WebSocket推送进度\n{task_id: 789, progress: 0, status: 'processing'}
+gateway -> ui: 实时推送进度更新
+ui --> user: 更新进度条（0%）
+
+worker -> db: 执行流式查询（游标）\nDECLARE cursor FOR SELECT * FROM raw_data WHERE ...
+activate db
+
+loop 分批读取（每批1000条）
+    db --> worker: 返回一批数据（1000条）
+
+    worker -> worker: FormatAsCSV(batch_data)
+    note right
+      转换为CSV格式：
+      "id","title","price","created_at"
+      "1","Product A","99.99","2025-01-15"
+      ...
+    end note
+
+    worker -> worker: 写入临时文件\n/tmp/export_789.csv（追加模式）
+
+    worker -> worker: 计算进度\nprogress = processed / total * 100
+
+    worker -> gateway: WebSocket推送进度\n{task_id: 789, progress: 25, status: 'processing'}
+    gateway -> ui: 实时推送
+    ui --> user: 更新进度条（25%）
+end
+
+deactivate db
+
+worker -> worker: 关闭临时文件
+
+worker -> storage: 上传文件到MinIO\nPUT /exports/2025/01/export_789.csv
+activate storage
+storage --> worker: 返回文件URL\nhttps://storage.example.com/exports/2025/01/export_789.csv
+deactivate storage
+
+worker -> db: UPDATE export_tasks\nSET status = 'completed', file_url = ?, \ncompleted_at = NOW(), file_size = ?
+activate db
+db --> worker: 更新成功
+deactivate db
+
+worker -> worker: 删除临时文件\nrm /tmp/export_789.csv
+
+worker -> gateway: WebSocket推送完成通知\n{task_id: 789, progress: 100, status: 'completed', file_url}
+deactivate worker
+
+gateway -> ui: 实时推送完成
+ui -> ui: 显示"导出完成！"，提供下载按钮
+ui --> user: 点击"下载CSV"，浏览器下载文件
+
+== 4. 定时清理过期文件（每天凌晨） ==
+
+note over worker: 定时任务（Cron: 0 0 * * *）
+
+activate worker
+worker -> db: SELECT * FROM export_tasks\nWHERE status = 'completed'\nAND completed_at < NOW() - INTERVAL '7 days'
+activate db
+db --> worker: 返回过期任务列表
+deactivate db
+
+loop 遍历过期任务
+    worker -> storage: DELETE /exports/2025/01/export_456.csv
+    activate storage
+    storage --> worker: 删除成功
+    deactivate storage
+
+    worker -> db: UPDATE export_tasks\nSET file_url = NULL, status = 'expired'
+    activate db
+    db --> worker: 更新成功
+    deactivate db
+end
+
+worker -> worker: 记录清理日志\n"Cleaned 5 expired export files"
+deactivate worker
+
+@enduml
+```
+
+![数据查询与导出流程](diagrams/seq_data_export.png)
+
+**关键技术点**：
+
+1. **高效分页查询**：
+   - 使用`LIMIT/OFFSET`实现分页，但`OFFSET`较大时性能下降
+   - 优化方案：使用游标分页（Cursor-based Pagination）
+   - 示例：`WHERE id > last_id ORDER BY id LIMIT 50`（避免OFFSET）
+   - COUNT查询优化：先从Redis缓存读取，5分钟更新一次
+   - 索引优化：为常用筛选字段（datasource_id、created_at）创建复合索引
+
+2. **流式导出（Streaming Export）**：
+   - 使用PostgreSQL游标（DECLARE CURSOR）避免一次性加载所有数据
+   - 分批读取（每批1000条），边读边写临时文件，内存占用恒定
+   - 临时文件路径：`/tmp/export_{task_id}.csv`，导出完成后删除
+   - 支持断点续传：任务失败时记录已导出行数，重试时从断点继续
+   - 大文件压缩：超过10MB自动压缩为`.csv.gz`格式
+
+3. **异步任务队列**：
+   - 导出任务推送到RabbitMQ的`export`队列，避免阻塞HTTP请求
+   - 返回`202 Accepted`和`task_id`，前端轮询或WebSocket获取进度
+   - Worker池：启动3个Export Worker并发处理导出任务
+   - 任务优先级：手动触发导出 > 定时导出
+   - 超时控制：单个导出任务最长执行10分钟，超时则标记失败
+
+4. **WebSocket实时进度推送**：
+   - 前端建立WebSocket连接订阅`/tasks/{task_id}/progress`
+   - Worker每处理1000条数据推送一次进度更新
+   - 推送内容：`{progress: 25, processed: 250, total: 1000, eta: '15s'}`
+   - 连接断开重连机制：前端每5秒重试，最多重试3次
+   - 进度计算：`progress = (processed_rows / total_rows) * 100`
+
+5. **临时文件清理机制**：
+   - 导出文件保留7天，过期自动删除（节省存储空间）
+   - 定时任务：每天凌晨执行清理（Cron表达式：`0 0 * * *`）
+   - 清理流程：查询`export_tasks`表 → 删除MinIO文件 → 更新状态为`expired`
+   - 用户下载后可选择"立即删除"，释放存储空间
+   - 异常处理：MinIO删除失败时记录日志，不中断清理流程
+
+6. **查询缓存策略**：
+   - Redis缓存查询结果，TTL=300秒（5分钟）
+   - 缓存Key：`query:cache:md5(datasource_id+filters+page)`
+   - 数据更新时清除相关缓存：`DEL query:cache:datasource:{id}:*`
+   - 热点数据预热：常用查询结果预加载到缓存
+   - 缓存击穿防护：使用分布式锁（Redis `SETNX`），避免并发查询DB
+
+---
+
+##### 3.1.3.3. 错误数据标记与重新采集流程
+
+**场景描述**：用户在数据查看页面发现某些数据异常（如字段为空、格式错误、内容不完整），可以标记为错误数据并触发重新采集。系统会创建补采任务，Worker重新访问数据源获取最新数据，更新原有记录，保留历史版本用于审计。
+
+**参与组件**：Web UI、Gateway、Master (Data Manager)、PostgreSQL、Redis、RabbitMQ、Worker、Data Collector
+
+**时序图**：
+
+```plantuml
+@startuml
+!theme plain
+skinparam backgroundColor #FFFFFF
+title 错误数据标记与重新采集流程
+
+autonumber
+
+actor User as user
+participant "Web UI" as ui
+participant "Gateway" as gateway
+participant "Master\nData Manager" as manager
+participant "PostgreSQL" as db
+participant "Redis\n(Lock & Cache)" as redis
+participant "RabbitMQ" as mq
+participant "Worker" as worker
+participant "Data Collector\n(RPA/DB/API)" as collector
+
+== 1. 用户标记错误数据 ==
+
+user -> ui: 查看数据详情，发现错误\n（例如：title字段为空）
+activate ui
+
+ui -> ui: 显示数据行，提供"标记为错误"按钮
+user -> ui: 点击"标记为错误"
+
+ui -> ui: 弹出确认对话框\n"请选择错误原因"
+note right
+  错误原因选项：
+  - 字段缺失
+  - 格式错误
+  - 内容不完整
+  - 采集失败
+  - 其他（需填写备注）
+end note
+
+user -> ui: 选择"字段缺失"，填写备注\n"title字段为空，需要重新采集"
+
+ui -> gateway: POST /api/data/{data_id}/mark-error\n{reason: 'field_missing', note: '...'}
+activate gateway
+
+gateway -> manager: MarkDataAsError(data_id, reason, note)
+activate manager
+
+manager -> db: BEGIN TRANSACTION
+
+manager -> db: SELECT * FROM raw_data WHERE id = ?\nFOR UPDATE
+activate db
+db --> manager: 返回数据记录详情
+deactivate db
+
+alt 数据不存在
+    manager --> gateway: 404 Not Found
+    gateway --> ui: 错误提示
+    ui --> user: "数据不存在"
+else 数据已标记为错误
+    manager --> gateway: 409 Conflict
+    gateway --> ui: 错误提示
+    ui --> user: "该数据已标记为错误，请勿重复操作"
+else 正常标记
+    manager -> db: UPDATE raw_data\nSET status = 'error', error_reason = ?,\nerror_note = ?, marked_at = NOW(), marked_by = ?
+    activate db
+    db --> manager: 更新成功
+    deactivate db
+
+    manager -> db: INSERT INTO data_history\n(data_id, snapshot, status, created_at)\nVALUES (?, json_data, 'error', NOW())
+    activate db
+    note right
+      保存数据快照到历史表
+      用于审计和版本回溯
+    end note
+    db --> manager: 历史记录已保存
+    deactivate db
+
+    manager -> db: COMMIT TRANSACTION
+
+    manager -> redis: DEL cache:data:{data_id}
+    note right: 清除数据缓存
+
+    manager --> gateway: 标记成功
+end
+
+deactivate manager
+
+gateway --> ui: 200 OK
+deactivate gateway
+
+ui --> user: 显示"已标记为错误数据"
+deactivate ui
+
+== 2. 触发重新采集 ==
+
+user -> ui: 点击"重新采集此数据"
+activate ui
+
+ui -> gateway: POST /api/data/{data_id}/re-collect
+activate gateway
+
+gateway -> manager: CreateReCollectTask(data_id)
+activate manager
+
+manager -> db: SELECT raw_data.*, datasources.*\nFROM raw_data\nJOIN datasources ON raw_data.datasource_id = datasources.id\nWHERE raw_data.id = ?
+activate db
+db --> manager: 返回数据记录 + 数据源配置
+deactivate db
+
+manager -> manager: ExtractSourceIdentifier(data)
+note right
+  根据数据源类型提取标识符：
+  - 网页: URL
+  - 数据库: 主键ID
+  - API: Resource ID
+end note
+
+manager -> redis: SETNX lock:recollect:{data_id} 1 EX 300
+activate redis
+note right
+  设置分布式锁（5分钟）
+  防止重复提交补采任务
+end note
+
+alt 锁获取失败（已有补采任务）
+    redis --> manager: 0（锁已存在）
+    manager --> gateway: 409 Conflict "重新采集任务正在执行"
+    gateway --> ui: 错误提示
+    ui --> user: "该数据正在重新采集，请稍候"
+else 锁获取成功
+    redis --> manager: 1（锁设置成功）
+    deactivate redis
+
+    manager -> db: INSERT INTO tasks\n(datasource_id, type, priority, source_identifier, \nrelated_data_id, created_by)\nVALUES (?, 're-collect', 'high', ?, ?, ?)
+    activate db
+    note right
+      创建补采任务：
+      - type: 're-collect'（区别于常规采集）
+      - priority: 'high'（高优先级）
+      - related_data_id: 关联原数据记录
+    end note
+    db --> manager: 返回task_id=456
+    deactivate db
+
+    manager -> db: UPDATE raw_data\nSET status = 're-collecting', \nre_collect_task_id = 456
+    activate db
+    db --> manager: 更新成功
+    deactivate db
+
+    manager -> mq: 发送补采任务消息\n{task_id: 456, type: 're-collect', \npriority: 'high', source_identifier, datasource_config}
+    activate mq
+    note right
+      推送到高优先级队列
+      x-priority: 10
+    end note
+    mq --> manager: 消息已发送
+    deactivate mq
+
+    manager --> gateway: 返回task_id
+end
+
+deactivate manager
+
+gateway --> ui: 202 Accepted {task_id: 456}
+deactivate gateway
+
+ui -> ui: 显示"正在重新采集，请稍候..."
+ui --> user: 轮询任务状态
+deactivate ui
+
+== 3. Worker执行重新采集 ==
+
+mq -> worker: 消费补采任务（高优先级队列）\n{task_id: 456, type: 're-collect', ...}
+activate worker
+
+worker -> db: UPDATE tasks SET status = 'running',\nstarted_at = NOW(), worker_id = ?
+activate db
+db --> worker: 更新成功
+deactivate db
+
+worker -> collector: ReCollectData(datasource_config, source_identifier)
+activate collector
+
+note over collector
+  根据数据源类型重新采集：
+  - 网页: 使用Playwright重新访问URL
+  - 数据库: 使用主键ID重新查询
+  - API: 重新调用API接口
+end note
+
+alt 采集成功
+    collector --> worker: 返回新数据\n{"title": "New Product", "price": 99.99, ...}
+
+    worker -> worker: ApplyCleanRules(new_data)
+    note right
+      应用数据清洗规则
+      （如果已配置）
+    end note
+
+    worker -> db: BEGIN TRANSACTION
+
+    worker -> db: UPDATE raw_data\nSET data = ?, status = 'normal', \nerror_reason = NULL, error_note = NULL,\nre_collected_at = NOW(), version = version + 1\nWHERE id = ?
+    activate db
+    db --> worker: 更新成功
+    deactivate db
+
+    worker -> db: INSERT INTO data_history\n(data_id, snapshot, status, version, created_at)\nVALUES (?, new_data, 'normal', version+1, NOW())
+    activate db
+    note right
+      保存新版本快照
+      支持版本对比和回滚
+    end note
+    db --> worker: 历史记录已保存
+    deactivate db
+
+    worker -> db: UPDATE tasks SET status = 'completed',\ncompleted_at = NOW()
+    db --> worker: 更新成功
+    deactivate db
+
+    worker -> db: COMMIT TRANSACTION
+
+    worker -> redis: DEL lock:recollect:{data_id}
+    activate redis
+    note right: 释放分布式锁
+    redis --> worker: 锁已释放
+    deactivate redis
+
+    worker -> redis: DEL cache:data:{data_id}
+    note right: 清除数据缓存
+    redis --> worker: 缓存已清除
+    deactivate redis
+
+    worker --> mq: ACK消息
+
+else 采集失败
+    collector --> worker: 采集失败（网站不可访问）
+    deactivate collector
+
+    worker -> db: UPDATE raw_data\nSET status = 'error', \nerror_reason = 'recollect_failed',\nerror_note = '重新采集失败：网站不可访问'
+    activate db
+    db --> worker: 更新成功
+    deactivate db
+
+    worker -> db: UPDATE tasks SET status = 'failed',\nerror_message = '采集失败：网站不可访问'
+    db --> worker: 更新成功
+    deactivate db
+
+    worker -> redis: DEL lock:recollect:{data_id}
+    activate redis
+    redis --> worker: 锁已释放
+    deactivate redis
+
+    worker --> mq: ACK消息
+end
+
+deactivate worker
+
+== 4. 用户查看重新采集结果 ==
+
+user -> ui: 刷新页面或收到WebSocket推送
+activate ui
+
+ui -> gateway: GET /api/data/{data_id}
+activate gateway
+
+gateway -> manager: GetDataDetail(data_id)
+activate manager
+
+manager -> redis: GET cache:data:{data_id}
+activate redis
+
+alt 缓存命中
+    redis --> manager: 返回数据
+else 缓存未命中
+    redis --> manager: nil
+    deactivate redis
+
+    manager -> db: SELECT * FROM raw_data WHERE id = ?
+    activate db
+    db --> manager: 返回最新数据
+    deactivate db
+
+    manager -> redis: SETEX cache:data:{data_id} 3600, data
+    activate redis
+    redis --> manager: 缓存已设置
+    deactivate redis
+end
+
+manager --> gateway: 返回数据详情\n{status: 'normal', version: 2, re_collected_at: ...}
+deactivate manager
+
+gateway --> ui: 200 OK {data, history_versions: [v1, v2]}
+deactivate gateway
+
+ui -> ui: 展示最新数据，标记"已重新采集"
+ui -> ui: 提供"查看历史版本"按钮（版本对比）
+
+ui --> user: 显示采集成功，数据已更新
+deactivate ui
+
+@enduml
+```
+
+![错误数据标记与重新采集流程](diagrams/seq_data_recollect.png)
+
+**关键技术点**：
+
+1. **数据版本管理**：
+   - 每次重新采集后`version`字段自增（初始为1）
+   - `data_history`表保存所有历史版本快照（JSON格式）
+   - 支持版本对比：前端可并排显示v1 vs v2差异
+   - 支持版本回滚：管理员可回滚到任意历史版本（需审批）
+   - 历史数据保留策略：默认保留30天，超过后自动归档
+
+2. **幂等性保证（分布式锁）**：
+   - 使用Redis `SETNX`设置分布式锁，Key为`lock:recollect:{data_id}`
+   - 锁有效期5分钟，防止Worker崩溃导致死锁
+   - 同一数据同时只能有一个补采任务执行
+   - 任务完成后显式释放锁（`DEL lock:recollect:{data_id}`）
+   - 锁冲突时返回`409 Conflict`，前端提示用户"正在处理"
+
+3. **高优先级队列**：
+   - 补采任务使用RabbitMQ的`x-priority`参数设置优先级（1-10）
+   - 补采任务优先级=10（最高），常规采集任务优先级=5
+   - Worker优先消费高优先级消息，确保快速响应用户操作
+   - 队列配置：`x-max-priority: 10`（声明队列时设置）
+   - 避免饥饿：高优先级任务过多时，定期插入普通任务
+
+4. **数据源标识符提取**：
+   - 不同数据源类型需要不同的标识符来定位原始数据：
+     - **网页RPA**：存储原始URL（`source_identifier='https://example.com/product/123'`）
+     - **数据库**：存储主键值（`source_identifier='id=123'`）
+     - **API**：存储Resource ID（`source_identifier='/api/products/123'`）
+   - 标识符存储在`raw_data.source_identifier`字段
+   - 重新采集时使用标识符精确定位数据源
+
+5. **错误原因分类与统计**：
+   - 预定义错误原因枚举：`field_missing`、`format_error`、`incomplete`、`collect_failed`、`other`
+   - 用户可选择原因并填写备注，便于分析常见问题
+   - 后台统计各数据源的错误率：`error_rate = error_count / total_count`
+   - 错误率超过阈值（10%）触发告警，提示检查数据源配置
+   - Dashboard展示错误热力图：按数据源、时间维度聚合
+
+6. **事务一致性**：
+   - 使用PostgreSQL事务确保操作原子性：
+     - 更新`raw_data`状态 + 插入`data_history` + 更新`tasks`状态
+   - 任何步骤失败都会回滚，避免数据不一致
+   - 使用`SELECT ... FOR UPDATE`行锁，防止并发修改
+   - 事务隔离级别：`READ COMMITTED`（PostgreSQL默认）
+   - 死锁检测：PostgreSQL自动检测并回滚一个事务
+
+---
+
 ### 3.2. 核心模块设计
 
 以下是系统的核心模块详细设计，各模块职责分明，通过定义好的接口进行协作。

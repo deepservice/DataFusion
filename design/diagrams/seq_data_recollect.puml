@@ -1,0 +1,295 @@
+@startuml
+title 错误数据标记与重新采集流程
+
+autonumber
+
+actor User as user
+participant "Web UI" as ui
+participant "Gateway" as gateway
+participant "Master\nData Manager" as manager
+participant "PostgreSQL" as db
+participant "Redis\n(Lock & Cache)" as redis
+participant "RabbitMQ" as mq
+participant "Worker" as worker
+participant "Data Collector\n(RPA/DB/API)" as collector
+
+== 1. 用户标记错误数据 ==
+
+user -> ui: 查看数据详情，发现错误\n（例如：title字段为空）
+activate ui
+
+ui -> ui: 显示数据行，提供"标记为错误"按钮
+user -> ui: 点击"标记为错误"
+
+ui -> ui: 弹出确认对话框\n"请选择错误原因"
+note right
+  错误原因选项：
+  - 字段缺失
+  - 格式错误
+  - 内容不完整
+  - 采集失败
+  - 其他（需填写备注）
+end note
+
+user -> ui: 选择"字段缺失"，填写备注\n"title字段为空，需要重新采集"
+
+ui -> gateway: POST /api/data/{data_id}/mark-error\n{reason: 'field_missing', note: '...'}
+activate gateway
+
+gateway -> manager: MarkDataAsError(data_id, reason, note)
+activate manager
+
+manager -> db: BEGIN TRANSACTION
+
+manager -> db: SELECT * FROM raw_data WHERE id = ?\nFOR UPDATE
+activate db
+db --> manager: 返回数据记录详情
+deactivate db
+
+alt 数据不存在
+    manager --> gateway: 404 Not Found
+    gateway --> ui: 错误提示
+    ui --> user: "数据不存在"
+else 数据已标记为错误
+    manager --> gateway: 409 Conflict
+    gateway --> ui: 错误提示
+    ui --> user: "该数据已标记为错误，请勿重复操作"
+else 正常标记
+    manager -> db: UPDATE raw_data\nSET status = 'error', error_reason = ?,\nerror_note = ?, marked_at = NOW(), marked_by = ?
+    activate db
+    db --> manager: 更新成功
+    deactivate db
+
+    manager -> db: INSERT INTO data_history\n(data_id, snapshot, status, created_at)\nVALUES (?, json_data, 'error', NOW())
+    activate db
+    note right
+      保存数据快照到历史表
+      用于审计和版本回溯
+    end note
+    db --> manager: 历史记录已保存
+    deactivate db
+
+    manager -> db: COMMIT TRANSACTION
+
+    manager -> redis: DEL cache:data:{data_id}
+    note right: 清除数据缓存
+
+    manager --> gateway: 标记成功
+end
+
+deactivate manager
+
+gateway --> ui: 200 OK
+deactivate gateway
+
+ui --> user: 显示"已标记为错误数据"
+deactivate ui
+
+== 2. 触发重新采集 ==
+
+user -> ui: 点击"重新采集此数据"
+activate ui
+
+ui -> gateway: POST /api/data/{data_id}/re-collect
+activate gateway
+
+gateway -> manager: CreateReCollectTask(data_id)
+activate manager
+
+manager -> db: SELECT raw_data.*, datasources.*\nFROM raw_data\nJOIN datasources ON raw_data.datasource_id = datasources.id\nWHERE raw_data.id = ?
+activate db
+db --> manager: 返回数据记录 + 数据源配置
+deactivate db
+
+manager -> manager: ExtractSourceIdentifier(data)
+note right
+  根据数据源类型提取标识符：
+  - 网页: URL
+  - 数据库: 主键ID
+  - API: Resource ID
+end note
+
+manager -> redis: SETNX lock:recollect:{data_id} 1 EX 300
+activate redis
+note right
+  设置分布式锁（5分钟）
+  防止重复提交补采任务
+end note
+
+alt 锁获取失败（已有补采任务）
+    redis --> manager: 0（锁已存在）
+    manager --> gateway: 409 Conflict "重新采集任务正在执行"
+    gateway --> ui: 错误提示
+    ui --> user: "该数据正在重新采集，请稍候"
+else 锁获取成功
+    redis --> manager: 1（锁设置成功）
+    deactivate redis
+
+    manager -> db: INSERT INTO tasks\n(datasource_id, type, priority, source_identifier, \nrelated_data_id, created_by)\nVALUES (?, 're-collect', 'high', ?, ?, ?)
+    activate db
+    note right
+      创建补采任务：
+      - type: 're-collect'（区别于常规采集）
+      - priority: 'high'（高优先级）
+      - related_data_id: 关联原数据记录
+    end note
+    db --> manager: 返回task_id=456
+    deactivate db
+
+    manager -> db: UPDATE raw_data\nSET status = 're-collecting', \nre_collect_task_id = 456
+    activate db
+    db --> manager: 更新成功
+    deactivate db
+
+    manager -> mq: 发送补采任务消息\n{task_id: 456, type: 're-collect', \npriority: 'high', source_identifier, datasource_config}
+    activate mq
+    note right
+      推送到高优先级队列
+      x-priority: 10
+    end note
+    mq --> manager: 消息已发送
+    deactivate mq
+
+    manager --> gateway: 返回task_id
+end
+
+deactivate manager
+
+gateway --> ui: 202 Accepted {task_id: 456}
+deactivate gateway
+
+ui -> ui: 显示"正在重新采集，请稍候..."
+ui --> user: 轮询任务状态
+deactivate ui
+
+== 3. Worker执行重新采集 ==
+
+mq -> worker: 消费补采任务（高优先级队列）\n{task_id: 456, type: 're-collect', ...}
+activate worker
+
+worker -> db: UPDATE tasks SET status = 'running',\nstarted_at = NOW(), worker_id = ?
+activate db
+db --> worker: 更新成功
+deactivate db
+
+worker -> collector: ReCollectData(datasource_config, source_identifier)
+activate collector
+
+note over collector
+  根据数据源类型重新采集：
+  - 网页: 使用Playwright重新访问URL
+  - 数据库: 使用主键ID重新查询
+  - API: 重新调用API接口
+end note
+
+alt 采集成功
+    collector --> worker: 返回新数据\n{"title": "New Product", "price": 99.99, ...}
+
+    worker -> worker: ApplyCleanRules(new_data)
+    note right
+      应用数据清洗规则
+      （如果已配置）
+    end note
+
+    worker -> db: BEGIN TRANSACTION
+
+    worker -> db: UPDATE raw_data\nSET data = ?, status = 'normal', \nerror_reason = NULL, error_note = NULL,\nre_collected_at = NOW(), version = version + 1\nWHERE id = ?
+    activate db
+    db --> worker: 更新成功
+    deactivate db
+
+    worker -> db: INSERT INTO data_history\n(data_id, snapshot, status, version, created_at)\nVALUES (?, new_data, 'normal', version+1, NOW())
+    activate db
+    note right
+      保存新版本快照
+      支持版本对比和回滚
+    end note
+    db --> worker: 历史记录已保存
+    deactivate db
+
+    worker -> db: UPDATE tasks SET status = 'completed',\ncompleted_at = NOW()
+    db --> worker: 更新成功
+    deactivate db
+
+    worker -> db: COMMIT TRANSACTION
+
+    worker -> redis: DEL lock:recollect:{data_id}
+    activate redis
+    note right: 释放分布式锁
+    redis --> worker: 锁已释放
+    deactivate redis
+
+    worker -> redis: DEL cache:data:{data_id}
+    note right: 清除数据缓存
+    redis --> worker: 缓存已清除
+    deactivate redis
+
+    worker --> mq: ACK消息
+
+else 采集失败
+    collector --> worker: 采集失败（网站不可访问）
+    deactivate collector
+
+    worker -> db: UPDATE raw_data\nSET status = 'error', \nerror_reason = 'recollect_failed',\nerror_note = '重新采集失败：网站不可访问'
+    activate db
+    db --> worker: 更新成功
+    deactivate db
+
+    worker -> db: UPDATE tasks SET status = 'failed',\nerror_message = '采集失败：网站不可访问'
+    db --> worker: 更新成功
+    deactivate db
+
+    worker -> redis: DEL lock:recollect:{data_id}
+    activate redis
+    redis --> worker: 锁已释放
+    deactivate redis
+
+    worker --> mq: ACK消息
+end
+
+deactivate worker
+
+== 4. 用户查看重新采集结果 ==
+
+user -> ui: 刷新页面或收到WebSocket推送
+activate ui
+
+ui -> gateway: GET /api/data/{data_id}
+activate gateway
+
+gateway -> manager: GetDataDetail(data_id)
+activate manager
+
+manager -> redis: GET cache:data:{data_id}
+activate redis
+
+alt 缓存命中
+    redis --> manager: 返回数据
+else 缓存未命中
+    redis --> manager: nil
+    deactivate redis
+
+    manager -> db: SELECT * FROM raw_data WHERE id = ?
+    activate db
+    db --> manager: 返回最新数据
+    deactivate db
+
+    manager -> redis: SETEX cache:data:{data_id} 3600, data
+    activate redis
+    redis --> manager: 缓存已设置
+    deactivate redis
+end
+
+manager --> gateway: 返回数据详情\n{status: 'normal', version: 2, re_collected_at: ...}
+deactivate manager
+
+gateway --> ui: 200 OK {data, history_versions: [v1, v2]}
+deactivate gateway
+
+ui -> ui: 展示最新数据，标记"已重新采集"
+ui -> ui: 提供"查看历史版本"按钮（版本对比）
+
+ui --> user: 显示采集成功，数据已更新
+deactivate ui
+
+@enduml

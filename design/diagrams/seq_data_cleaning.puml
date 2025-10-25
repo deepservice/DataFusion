@@ -1,0 +1,205 @@
+@startuml
+title 数据清洗规则配置与执行流程
+
+autonumber
+
+actor User as user
+participant "Web UI" as ui
+participant "Gateway" as gateway
+participant "Master\nCleaner Service" as cleaner
+participant "PostgreSQL" as db
+participant "Redis\n(Rule Cache)" as redis
+participant "RabbitMQ" as mq
+participant "Worker" as worker
+participant "Data Processor\n(expr Engine)" as processor
+
+== 1. 配置清洗规则 ==
+
+user -> ui: 点击"添加清洗规则"
+activate ui
+
+ui -> gateway: POST /api/cleaner/rules\n{datasource_id, field, rule_type, expression}
+activate gateway
+
+gateway -> cleaner: CreateCleanRule(request)
+activate cleaner
+
+note over cleaner
+  支持的规则类型：
+  - trim: 去除首尾空白
+  - replace: 正则替换
+  - extract: 正则提取
+  - format_date: 日期格式化
+  - to_number: 类型转换
+  - remove_html: 移除HTML标签
+  - custom_expr: 自定义表达式
+end note
+
+cleaner -> cleaner: ValidateExpression(rule_type, expression)
+note right
+  使用expr-lang进行语法校验
+  例如：
+  - "trim(field)"
+  - "replace(field, '[^0-9]', '')"
+  - "format_date(field, '2006-01-02')"
+end note
+
+cleaner -> db: INSERT INTO cleaner_rules\n(datasource_id, field, rule_type, expression, enabled)
+activate db
+db --> cleaner: 返回rule_id
+deactivate db
+
+cleaner -> redis: DEL cache:rules:datasource:{datasource_id}
+note right: 清除缓存，强制重新加载
+
+cleaner --> gateway: 返回rule详情
+deactivate cleaner
+gateway --> ui: 200 OK {rule_id, ...}
+deactivate gateway
+
+ui --> user: 显示规则已创建
+deactivate ui
+
+== 2. 测试清洗规则（预览效果） ==
+
+user -> ui: 点击"测试规则"，输入样本数据
+activate ui
+
+ui -> gateway: POST /api/cleaner/rules/{rule_id}/test\n{sample_data: "  <b>123</b> "}
+activate gateway
+
+gateway -> cleaner: TestCleanRule(rule_id, sample_data)
+activate cleaner
+
+cleaner -> db: SELECT * FROM cleaner_rules WHERE id = ?
+activate db
+db --> cleaner: 返回rule详情
+deactivate db
+
+cleaner -> processor: ApplyRule(rule, sample_data)
+activate processor
+
+processor -> processor: ParseExpression(rule.expression)
+note right
+  使用expr-lang解析表达式
+  编译为AST（Abstract Syntax Tree）
+end note
+
+processor -> processor: ExecuteExpression(ast, sample_data)
+note right
+  例如：remove_html + trim
+  输入: "  <b>123</b> "
+  步骤1: remove_html -> "  123 "
+  步骤2: trim -> "123"
+end note
+
+processor --> cleaner: 返回清洗后的数据 "123"
+deactivate processor
+
+cleaner --> gateway: 返回测试结果\n{before: "  <b>123</b> ", after: "123"}
+deactivate cleaner
+
+gateway --> ui: 200 OK {test_result}
+deactivate gateway
+
+ui --> user: 对比显示清洗前后数据
+deactivate ui
+
+== 3. 保存并启用规则 ==
+
+user -> ui: 确认无误，点击"启用规则"
+activate ui
+
+ui -> gateway: PATCH /api/cleaner/rules/{rule_id}\n{enabled: true}
+activate gateway
+
+gateway -> cleaner: EnableCleanRule(rule_id)
+activate cleaner
+
+cleaner -> db: UPDATE cleaner_rules\nSET enabled = true, updated_at = NOW()
+activate db
+db --> cleaner: 更新成功
+deactivate db
+
+cleaner -> redis: DEL cache:rules:datasource:{datasource_id}
+note right: 再次清除缓存
+
+cleaner -> redis: PUBLISH channel:rule_update\n{datasource_id: xxx, action: 'enabled'}
+note right
+  发布规则更新事件
+  所有Worker会订阅此频道
+end note
+
+cleaner --> gateway: 规则已启用
+deactivate cleaner
+
+gateway --> ui: 200 OK
+deactivate gateway
+
+ui --> user: 显示"规则已启用"
+deactivate ui
+
+== 4. Worker采集时自动应用规则 ==
+
+note over mq: 任务调度器推送采集任务到队列
+
+mq -> worker: 消费任务消息\n{task_id, datasource_id, ...}
+activate worker
+
+worker -> worker: 加载数据源配置
+worker -> redis: GET cache:rules:datasource:{datasource_id}
+activate redis
+
+alt 缓存未命中
+    redis --> worker: nil
+    worker -> db: SELECT * FROM cleaner_rules\nWHERE datasource_id = ? AND enabled = true
+    activate db
+    db --> worker: 返回规则列表 [rule1, rule2, ...]
+    deactivate db
+
+    worker -> redis: SETEX cache:rules:datasource:{datasource_id}\n3600, [rules...]
+    redis --> worker: 缓存已设置
+else 缓存命中
+    redis --> worker: 返回规则列表
+end
+
+deactivate redis
+
+worker -> worker: 执行采集逻辑\n（RPA/DB/API）
+note right
+  采集到原始数据
+  例如：{"title": "  <b>Product</b> ", "price": "$99.99"}
+end note
+
+worker -> processor: ApplyAllRules(rules, raw_data)
+activate processor
+
+loop 遍历每个字段的规则
+    processor -> processor: 应用规则链（管道式处理）
+    note right
+      title字段：
+      1. remove_html: "<b>Product</b>" -> "Product"
+      2. trim: "  Product " -> "Product"
+
+      price字段：
+      1. replace('[^0-9.]', ''): "$99.99" -> "99.99"
+      2. to_number: "99.99" -> 99.99
+    end note
+end
+
+processor --> worker: 返回清洗后的数据\n{"title": "Product", "price": 99.99}
+deactivate processor
+
+worker -> db: INSERT INTO raw_data (cleaned_data)\nVALUES (?)
+activate db
+db --> worker: 插入成功
+deactivate db
+
+worker -> db: UPDATE tasks SET status = 'completed'\nWHERE id = ?
+db --> worker: 更新成功
+deactivate db
+
+worker --> mq: ACK消息
+deactivate worker
+
+@enduml

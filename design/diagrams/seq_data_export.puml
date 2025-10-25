@@ -1,0 +1,221 @@
+@startuml
+title 数据查询与导出流程
+
+autonumber
+
+actor User as user
+participant "Web UI" as ui
+participant "Gateway" as gateway
+participant "Master\nQuery Service" as query
+participant "PostgreSQL" as db
+participant "Redis\n(Query Cache)" as redis
+participant "Async Task Queue\n(RabbitMQ)" as mq
+participant "Export Worker" as worker
+participant "Object Storage\n(MinIO)" as storage
+
+== 1. 数据查询（分页） ==
+
+user -> ui: 打开"数据查看"页面，输入筛选条件
+activate ui
+
+note over user
+  筛选条件示例：
+  - 数据源: datasource_id=123
+  - 时间范围: 2025-01-01 ~ 2025-01-31
+  - 关键词: title LIKE '%手机%'
+  - 排序: created_at DESC
+  - 分页: page=1, page_size=50
+end note
+
+ui -> gateway: GET /api/data/query?\ndatasource_id=123&start_date=2025-01-01&\nend_date=2025-01-31&keyword=手机&\npage=1&page_size=50&order_by=created_at DESC
+activate gateway
+
+gateway -> query: QueryData(filters, pagination)
+activate query
+
+query -> query: BuildQuerySQL(filters)
+note right
+  动态构建SQL：
+  SELECT * FROM raw_data
+  WHERE datasource_id = $1
+  AND created_at BETWEEN $2 AND $3
+  AND title LIKE $4
+  ORDER BY created_at DESC
+  LIMIT 50 OFFSET 0
+end note
+
+query -> query: GenerateCacheKey(filters, pagination)
+note right
+  Redis缓存Key:
+  query:cache:md5(datasource_id+date_range+keyword+page)
+end note
+
+query -> redis: GET query:cache:{cache_key}
+activate redis
+
+alt 缓存命中（5分钟内查询过）
+    redis --> query: 返回缓存的数据 + total_count
+    query --> gateway: 返回查询结果（缓存）
+else 缓存未命中
+    redis --> query: nil
+    deactivate redis
+
+    query -> db: 执行查询SQL + COUNT查询
+    activate db
+    db --> query: 返回数据列表 + total_count
+    deactivate db
+
+    query -> redis: SETEX query:cache:{cache_key}\n300, {data, total_count}
+    activate redis
+    note right: 缓存5分钟
+    redis --> query: 缓存已设置
+    deactivate redis
+
+    query --> gateway: 返回查询结果
+end
+
+deactivate query
+
+gateway --> ui: 200 OK\n{data: [...], total: 1234, page: 1, page_size: 50}
+deactivate gateway
+
+ui --> user: 表格展示数据，显示分页控件（共25页）
+deactivate ui
+
+== 2. 导出数据（CSV） ==
+
+user -> ui: 勾选"导出全部数据"，点击"导出CSV"
+activate ui
+
+ui -> ui: 显示确认弹窗\n"共1234条数据，预计耗时30秒"
+user -> ui: 确认导出
+
+ui -> gateway: POST /api/data/export\n{datasource_id, filters, format: 'csv'}
+activate gateway
+
+gateway -> query: CreateExportTask(request)
+activate query
+
+query -> query: ValidateFilters(filters)
+note right
+  验证导出条件：
+  - 单次导出不超过10万条
+  - 需要包含数据源ID
+  - 格式支持：csv/xlsx/json
+end note
+
+query -> db: INSERT INTO export_tasks\n(user_id, datasource_id, filters, status, format)\nVALUES (?, ?, ?, 'pending', 'csv')
+activate db
+db --> query: 返回task_id=789
+deactivate db
+
+query -> mq: 发送导出任务消息\n{task_id: 789, datasource_id: 123, filters, format: 'csv'}
+activate mq
+note right
+  推送到export队列
+  优先级：normal
+end note
+mq --> query: 消息已发送
+deactivate mq
+
+query --> gateway: 返回task_id
+deactivate query
+
+gateway --> ui: 202 Accepted {task_id: 789, estimated_time: 30}
+deactivate gateway
+
+ui -> ui: 显示导出进度弹窗\n"正在导出，请稍候..."
+ui -> gateway: WebSocket连接\nSubscribe: /tasks/789/progress
+activate gateway
+gateway --> ui: 连接成功
+deactivate gateway
+
+ui --> user: 显示进度条（初始0%）
+deactivate ui
+
+== 3. Worker异步执行导出 ==
+
+mq -> worker: 消费导出任务消息\n{task_id: 789, ...}
+activate worker
+
+worker -> db: UPDATE export_tasks\nSET status = 'processing', started_at = NOW()
+activate db
+db --> worker: 更新成功
+deactivate db
+
+worker -> gateway: WebSocket推送进度\n{task_id: 789, progress: 0, status: 'processing'}
+gateway -> ui: 实时推送进度更新
+ui --> user: 更新进度条（0%）
+
+worker -> db: 执行流式查询（游标）\nDECLARE cursor FOR SELECT * FROM raw_data WHERE ...
+activate db
+
+loop 分批读取（每批1000条）
+    db --> worker: 返回一批数据（1000条）
+
+    worker -> worker: FormatAsCSV(batch_data)
+    note right
+      转换为CSV格式：
+      "id","title","price","created_at"
+      "1","Product A","99.99","2025-01-15"
+      ...
+    end note
+
+    worker -> worker: 写入临时文件\n/tmp/export_789.csv（追加模式）
+
+    worker -> worker: 计算进度\nprogress = processed / total * 100
+
+    worker -> gateway: WebSocket推送进度\n{task_id: 789, progress: 25, status: 'processing'}
+    gateway -> ui: 实时推送
+    ui --> user: 更新进度条（25%）
+end
+
+deactivate db
+
+worker -> worker: 关闭临时文件
+
+worker -> storage: 上传文件到MinIO\nPUT /exports/2025/01/export_789.csv
+activate storage
+storage --> worker: 返回文件URL\nhttps://storage.example.com/exports/2025/01/export_789.csv
+deactivate storage
+
+worker -> db: UPDATE export_tasks\nSET status = 'completed', file_url = ?, \ncompleted_at = NOW(), file_size = ?
+activate db
+db --> worker: 更新成功
+deactivate db
+
+worker -> worker: 删除临时文件\nrm /tmp/export_789.csv
+
+worker -> gateway: WebSocket推送完成通知\n{task_id: 789, progress: 100, status: 'completed', file_url}
+deactivate worker
+
+gateway -> ui: 实时推送完成
+ui -> ui: 显示"导出完成！"，提供下载按钮
+ui --> user: 点击"下载CSV"，浏览器下载文件
+
+== 4. 定时清理过期文件（每天凌晨） ==
+
+note over worker: 定时任务（Cron: 0 0 * * *）
+
+activate worker
+worker -> db: SELECT * FROM export_tasks\nWHERE status = 'completed'\nAND completed_at < NOW() - INTERVAL '7 days'
+activate db
+db --> worker: 返回过期任务列表
+deactivate db
+
+loop 遍历过期任务
+    worker -> storage: DELETE /exports/2025/01/export_456.csv
+    activate storage
+    storage --> worker: 删除成功
+    deactivate storage
+
+    worker -> db: UPDATE export_tasks\nSET file_url = NULL, status = 'expired'
+    activate db
+    db --> worker: 更新成功
+    deactivate db
+end
+
+worker -> worker: 记录清理日志\n"Cleaned 5 expired export files"
+deactivate worker
+
+@enduml
