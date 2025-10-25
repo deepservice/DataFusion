@@ -1,5 +1,6 @@
-@startuml seq_api_collection
-!theme plain
+@startuml
+title API数据源配置与采集流程
+
 skinparam backgroundColor #FFFFFF
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true

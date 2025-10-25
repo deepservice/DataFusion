@@ -1,5 +1,6 @@
-@startuml seq_dom_parsing
-!theme plain
+@startuml
+title 页面DOM解析与智能字段识别流程
+
 skinparam backgroundColor #FFFFFF
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true

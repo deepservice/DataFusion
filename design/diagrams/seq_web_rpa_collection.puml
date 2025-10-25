@@ -1,5 +1,6 @@
-@startuml seq_web_rpa_collection
-!theme plain
+@startuml
+title 网页数据源配置与RPA采集时序图
+
 skinparam backgroundColor #FFFFFF
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true

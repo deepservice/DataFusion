@@ -1,5 +1,6 @@
-@startuml seq_db_sync
-!theme plain
+@startuml
+title 数据库数据源配置与同步时序图
+
 skinparam backgroundColor #FFFFFF
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true
