@@ -28,7 +28,7 @@
 *   **可维护性 (Maintainability):** 遵循清晰的代码规范，提供完善的日志、监控和文档，简化系统的日常运维和问题排查。
 *   **安全性 (Security):** 在数据传输、存储和访问等各个环节实施严格的安全措施，保护敏感信息，防止未授权访问和攻击。
 
-## 2. 系统架构
+## 2. 系统总体设计
 
 ### 2.1. 总体架构设计
 
@@ -110,27 +110,323 @@
 | **监控** | Prometheus + Grafana | 开源的监控和可视化解决方案，能够提供强大的系统和服务监控能力。 |
 | **日志** | ELK Stack (Elasticsearch, Logstash, Kibana) | 集中式的日志收集、存储和查询方案，便于问题排查和系统审计。 |
 
+### 2.3. 部署架构
+
+系统支持两种部署方式，以适应不同规模和场景的需求。两种方式下的服务副本数均可根据实际需求灵活配置。
+
+#### 2.3.1. 部署方式对比
+
+| 对比项 | Docker Compose部署 | Kubernetes + Helm部署 |
+|--------|-------------------|---------------------|
+| 适用场景 | 开发测试、小规模生产 | 中大规模生产环境 |
+| 部署复杂度 | 低，快速部署 | 中，需要K8s集群 |
+| 高可用性 | 需手动配置 | 自动故障恢复 |
+| 弹性伸缩 | 手动调整副本数 | 支持HPA自动扩缩容 |
+| 运维成本 | 低 | 中 |
+| 推荐规模 | <100任务，1-5台服务器 | >100任务，集群化部署 |
+
+#### 2.3.2. Docker Compose部署方案
+
+![Docker Compose部署架构图](diagrams/docker_compose_deployment.png)
+
+Docker Compose部署方式适用于开发测试环境和小规模生产场景，提供快速部署能力。
+
+##### 2.3.2.1. 单机部署架构
+
+所有服务部署在单台主机上，适合开发测试和演示环境。
+
+**服务组成与默认配置:**
+*   Web UI: 1-2副本（可配置）
+*   API Gateway: 1-3副本（可配置）
+*   Master服务: 3副本（可配置）
+*   Worker服务: 1-10副本（可配置，根据任务量调整）
+*   PostgreSQL: 1副本
+*   Redis: 1副本
+*   RabbitMQ: 1副本
+*   etcd: 1副本
+*   Prometheus: 1副本
+*   Grafana: 1副本
+
+**资源要求:**
+*   最低配置: 2C4G, 50GB磁盘
+*   推荐配置: 4C8G, 100GB SSD
+*   高负载配置: 8C16G, 200GB SSD
+
+**服务通信:**
+*   使用Docker bridge网络实现服务间通信
+*   通过服务名进行DNS解析
+*   端口映射: Web UI(8080), API Gateway(8000), Grafana(3000)等
+
+**数据持久化:**
+*   数据库数据: `/data/postgres`
+*   Redis数据: `/data/redis`
+*   日志文件: `/var/log/datafusion`
+*   配置文件: `/etc/datafusion`
+
+##### 2.3.2.2. 多机分布式部署架构
+
+适用于需要一定高可用性但不具备K8s条件的小规模生产环境。
+
+**节点角色划分（可根据实际情况调整）:**
+
+**管理节点（1-2台）:**
+*   Master服务: 3副本（可配置）
+*   API Gateway: 2-3副本（可配置）
+*   Web UI: 1-2副本（可配置）
+*   etcd: 1副本（多机可部署3副本集群）
+
+**基础设施节点（1-3台）:**
+*   PostgreSQL: 1主1从（可配置）
+*   Redis: 单机或3节点Cluster（可配置）
+*   RabbitMQ: 1-3节点（可配置）
+
+**Worker节点（可扩展）:**
+*   Worker服务: 每节点1-5副本（可配置）
+*   根据任务量动态增减节点
+
+**跨主机通信:**
+*   方式1: Docker Swarm overlay网络
+*   方式2: 主机网络 + 环境变量配置服务地址
+
+**高可用配置（可选）:**
+*   PostgreSQL: 主从复制
+*   Redis: Sentinel或Cluster模式
+*   RabbitMQ: 镜像队列
+*   etcd: 3节点集群
+
+**副本数配置方式:**
+```yaml
+# docker-compose.yml 示例
+services:
+  master:
+    image: datafusion/master:latest
+    deploy:
+      replicas: ${MASTER_REPLICAS:-3}  # 可通过环境变量配置，默认3
+
+  worker:
+    image: datafusion/worker:latest
+    deploy:
+      replicas: ${WORKER_REPLICAS:-5}  # 可通过环境变量配置，默认5
+
+  api-gateway:
+    image: datafusion/api-gateway:latest
+    deploy:
+      replicas: ${API_REPLICAS:-2}  # 可通过环境变量配置，默认2
+```
+
+**部署步骤:**
+1.  准备服务器环境（Docker 20.10+, Docker Compose 2.0+）
+2.  配置网络连通性和防火墙规则
+3.  根据需求调整配置文件中的副本数参数
+4.  依次启动各节点服务
+5.  验证服务健康状态和集群连通性
+
+#### 2.3.3. Kubernetes + Helm部署方案
+
+![Kubernetes部署架构图](diagrams/deployment_diagram.png)
+
+Kubernetes部署方式提供企业级的高可用、自动伸缩和运维能力，推荐用于生产环境。
+
+##### 2.3.3.1. 集群化部署架构
+
+**命名空间划分:**
+*   `datafusion-app`: 应用服务层
+*   `datafusion-infra`: 基础设施层
+*   `datafusion-monitor`: 监控服务层
+
+**无状态服务（Deployment）及默认副本配置:**
+*   Web UI: 2副本（可配置）
+*   API Gateway: 3副本（可配置）
+*   Master: 3副本（可配置）
+*   Worker: 5副本，支持HPA自动扩展至50副本（可配置min/max）
+
+**有状态服务（StatefulSet）:**
+*   etcd: 3副本（可配置）
+*   RabbitMQ: 3副本（可配置）
+*   Redis: 6副本Cluster模式（可配置）
+*   PostgreSQL: 可使用云RDS或StatefulSet部署1主1从（可配置）
+
+**资源配置（默认值，可调整）:**
+*   Master: request 1C2G, limit 2C4G
+*   Worker: request 2C4G, limit 4C8G
+*   API Gateway: request 1C2G, limit 2C4G
+*   Web UI: request 0.5C1G, limit 1C2G
+
+##### 2.3.3.2. Helm Chart配置
+
+**副本数配置（values.yaml）:**
+```yaml
+# 副本数配置
+replicaCount:
+  master: 3              # Master副本数，可配置
+  apiGateway: 3          # API Gateway副本数，可配置
+  webui: 2               # Web UI副本数，可配置
+  worker:
+    min: 5               # Worker最小副本数，可配置
+    max: 50              # Worker最大副本数，可配置（HPA）
+
+# 弹性伸缩配置
+autoscaling:
+  enabled: true          # 是否启用HPA
+  minReplicas: 5         # 最小副本数，可配置
+  maxReplicas: 50        # 最大副本数，可配置
+  targetCPUUtilizationPercentage: 70     # CPU使用率目标，可配置
+  targetMemoryUtilizationPercentage: 80  # 内存使用率目标，可配置
+
+# 资源配置（可根据实际情况调整）
+resources:
+  master:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+  worker:
+    requests:
+      cpu: 2000m
+      memory: 4Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+```
+
+**多环境配置示例:**
+*   `values-dev.yaml`: 开发环境（最小副本数，降低资源配置）
+*   `values-prod.yaml`: 生产环境（完整副本数，完整资源配置）
+
+**部署命令:**
+```bash
+# 使用默认配置部署
+helm install datafusion ./datafusion-chart
+
+# 自定义副本数部署
+helm install datafusion ./datafusion-chart \
+  --set replicaCount.master=5 \
+  --set replicaCount.worker.min=10 \
+  --set replicaCount.worker.max=100
+
+# 使用环境配置文件部署
+helm install datafusion ./datafusion-chart \
+  --values values-prod.yaml
+```
+
+##### 2.3.3.3. 核心特性
+
+**集群化部署:**
+*   所有无状态服务（Master, API, WebUI, Worker）以多副本形式部署
+*   通过K8s的Deployment和Service实现负载均衡和故障转移
+*   副本数可通过Helm values灵活配置
+
+**有状态服务:**
+*   数据库、消息队列、etcd等使用StatefulSet部署
+*   或直接使用云厂商托管服务（推荐）
+*   支持PVC持久化存储，数据可靠性高
+
+**弹性伸缩:**
+*   Worker节点支持HPA (Horizontal Pod Autoscaler)
+*   根据CPU/内存使用率或自定义指标（如任务队列长度）自动扩缩容
+*   最小/最大副本数可在values.yaml中配置
+
+**滚动更新:**
+*   支持零停机滚动更新
+*   可配置更新策略（maxSurge, maxUnavailable）
+*   快速回滚能力
+
+**配置管理:**
+*   使用K8s的ConfigMap和Secret管理应用配置和敏感信息
+*   通过Helm统一管理多环境配置
+*   配置变更自动触发Pod重启（可选）
+
+#### 2.3.4. 部署方式选择建议
+
+**选择Docker Compose的场景:**
+*   ✅ 开发测试环境
+*   ✅ 快速POC验证
+*   ✅ 小规模生产（<100任务，1-5台服务器）
+*   ✅ 无Kubernetes基础设施
+*   ✅ 运维团队对Docker熟悉，对K8s不熟悉
+
+**选择Kubernetes + Helm的场景:**
+*   ✅ 中大规模生产环境（>100任务）
+*   ✅ 需要高可用和自动故障恢复
+*   ✅ 任务量波动大，需要弹性伸缩
+*   ✅ 已有K8s集群基础设施
+*   ✅ 需要滚动更新和快速回滚能力
+*   ✅ 多环境管理需求（dev/staging/prod）
+
+#### 2.3.5. 副本数配置原则
+
+**默认配置说明:**
+*   文档中提供的副本数为推荐的默认值
+*   实际部署时应根据业务规模和资源情况灵活调整
+*   两种部署方式均支持通过配置文件调整副本数
+
+**配置调整建议:**
+
+**小规模场景（<50任务）:**
+*   Master: 1-3副本
+*   Worker: 1-5副本
+*   API Gateway: 1-2副本
+
+**中等规模（50-200任务）:**
+*   Master: 3副本
+*   Worker: 5-20副本
+*   API Gateway: 2-3副本
+
+**大规模场景（>200任务）:**
+*   Master: 3-5副本
+*   Worker: 20-50副本（配置HPA）
+*   API Gateway: 3-5副本
+
+**性能监控指标:**
+*   根据CPU/内存使用率动态调整
+*   关注任务队列长度和处理延迟
+*   Worker利用率保持在70-80%最佳
+
 ## 3. 模块设计
 
-**DataFusion** 系统主要由以下核心模块组成，各模块职责分明，通过定义好的接口进行协作。
+### 3.1. 核心场景时序图
+
+为了更清晰地展示系统在关键场景下的交互流程，我们提供了以下时序图。
+
+#### 3.1.1. 任务创建场景
+
+用户通过 Web UI 创建一个新的数据采集任务的完整流程：
+
+![任务创建时序图](diagrams/seq_create_task.png)
+
+该时序图展示了从用户提交任务配置，到系统完成任务注册和调度配置的全过程，涉及认证、数据持久化、调度器注册等关键步骤。
+
+#### 3.1.2. 任务执行场景
+
+调度器触发任务执行，Worker 节点完成数据采集、处理和存储的完整流程：
+
+![任务执行时序图](diagrams/seq_execute_task.png)
+
+该时序图详细描述了任务从调度、分发、执行、到结果上报的全过程，包括成功和失败两种情况的处理逻辑，以及重试和告警机制。
+
+### 3.2. 核心模块设计
+
+以下是系统的核心模块详细设计，各模块职责分明，通过定义好的接口进行协作。
 
 ![组件关系图](diagrams/component_diagram.png)
 
-### 3.1. 任务管理模块 (Task Manager)
+#### 3.2.1. 任务管理模块 (Task Manager)
 
 这是系统的核心控制模块，负责任务的全生命周期管理。
 
 *   **功能:** 提供任务的增删改查、启动、停止等操作接口。维护任务的元数据，包括任务类型、数据源配置、采集规则、调度策略、存储方式等。
 *   **实现:** 基于 Go 开发，通过 RESTful API 对外提供服务。任务元数据持久化到 PostgreSQL 数据库。
 
-### 3.2. 调度引擎模块 (Scheduler)
+#### 3.2.2. 调度引擎模块 (Scheduler)
 
 负责根据任务配置的调度策略，准时地触发任务执行。
 
 *   **功能:** 解析任务的 Cron 表达式或定时配置，在指定时间生成待执行的任务实例，并将其推送到任务队列中。
 *   **实现:** 基于 Go 开发，可使用 `robfig/cron` 等库实现定时调度。调度器会从数据库加载任务配置，并将待执行任务信息发送到 RabbitMQ。
 
-#### 3.2.1. 并发控制机制
+##### 3.2.2.1. 并发控制机制
 
 ![并发控制机制流程图](diagrams/concurrency_control_flow.png)
 
@@ -165,7 +461,7 @@
    }
    ```
 
-#### 3.2.2. 任务优先级队列
+##### 3.2.2.2. 任务优先级队列
 
 ![任务优先级队列架构图](diagrams/priority_queue_architecture.png)
 
@@ -200,14 +496,14 @@
    })
    ```
 
-### 3.3. 数据采集模块 (Collector)
+#### 3.2.3. 数据采集模块 (Collector)
 
 这是 Worker 节点的核心，负责执行具体的数据采集工作。
 
 *   **功能:** 从任务队列中获取任务，根据任务类型调用相应的采集插件。支持RPA采集、API采集、数据库采集等多种方式。
 *   **实现:** 采用插件化架构。核心框架由 Go 实现，负责与 Master 通信、管理插件生命周期。具体的采集逻辑封装在独立的插件中（可由 Python 或 Go 编写），通过 gRPC 或标准输入输出与主框架通信。
 
-#### 3.3.1. RPA采集技术方案
+##### 3.2.3.1. RPA采集技术方案
 
 ![RPA采集流程时序图](diagrams/rpa_collection_sequence.png)
 
@@ -302,7 +598,7 @@
    }
    ```
 
-#### 3.3.2. API采集技术方案
+##### 3.2.3.2. API采集技术方案
 
 ![API采集流程时序图](diagrams/api_collection_sequence.png)
 
@@ -441,7 +737,7 @@
    }
    ```
 
-#### 3.3.3. 采集器插件架构
+##### 3.2.3.3. 采集器插件架构
 
 ![采集器插件架构图](diagrams/collector_plugin_detail.png)
 
@@ -504,7 +800,7 @@
    *   放置在指定的plugins目录
    *   系统启动时自动加载和注册
 
-### 3.4. 数据处理模块 (Processor)
+#### 3.2.4. 数据处理模块 (Processor)
 
 ![数据处理模块流程图](diagrams/data_processor_flow.png)
 
@@ -513,7 +809,7 @@
 *   **功能:** 调用解析插件，对原始数据（HTML, JSON, XML 等）进行解析，提取目标字段。执行数据清洗、格式转换、去重等操作。
 *   **实现:** 同样采用插件化设计。解析规则（如 XPath, CSS Selector, 正则表达式）作为任务配置的一部分，由解析插件加载并执行。
 
-### 3.5. 数据存储模块 (Storage)
+#### 3.2.5. 数据存储模块 (Storage)
 
 ![数据存储模块架构图](diagrams/storage_architecture.png)
 
@@ -522,7 +818,7 @@
 *   **功能:** 将结构化数据写入到配置的目标存储系统。
 *   **实现:** 采用插件化架构，支持多种存储目标。每个插件负责与一种特定的存储系统（如 PostgreSQL, MongoDB, CSV 文件）进行交互。
 
-### 3.6. 监控告警模块 (Monitor & Alerter)
+#### 3.2.6. 监控告警模块 (Monitor & Alerter)
 
 ![监控告警架构图](diagrams/monitoring_alerting_architecture.png)
 
@@ -531,13 +827,13 @@
 *   **功能:** 收集系统和任务的运行指标（Metrics），如任务成功率、采集耗时、数据量、节点资源使用率等。当指标超过预设阈值时，触发告警。
 *   **实现:** 各个模块通过 Prometheus 客户端库暴露指标。Prometheus Server 定期抓取这些指标。Grafana 用于指标的可视化展示。Alertmanager 负责根据告警规则发送通知。
 
-### 3.7. Worker 内部流程
+#### 3.2.7. Worker 内部流程
 
 Worker 节点是数据采集的执行单元，其内部流程如下图所示：
 
 ![Worker内部流程图](diagrams/worker_flow.png)
 
-### 3.8. 插件架构
+#### 3.2.8. 插件架构
 
 为了实现系统的可扩展性，**DataFusion** 采用了插件化架构设计。核心功能模块（采集器、解析器、存储器）均通过插件接口进行扩展：
 
@@ -545,7 +841,15 @@ Worker 节点是数据采集的执行单元，其内部流程如下图所示：
 
 插件系统的设计使得开发者可以方便地扩展新的数据源类型、解析规则和存储目标，而无需修改核心代码。
 
-## 4. 数据库设计
+### 3.3. 核心类设计
+
+系统的核心业务逻辑通过以下类和接口进行建模：
+
+![类图](diagrams/class_diagram.png)
+
+类图展示了系统的主要领域模型，包括任务管理域、数据源域、采集器域、处理器域、存储器域和调度域。各个类之间通过清晰的接口和依赖关系进行协作，体现了面向对象设计的封装、继承和多态原则。
+
+### 3.4. 数据库设计
 
 系统的核心业务数据将存储在 PostgreSQL 数据库中。以下是 E-R 设计：
 
@@ -589,285 +893,91 @@ Worker 节点是数据采集的执行单元，其内部流程如下图所示：
 
 *   **`alert_records`:** 告警记录表，记录触发的告警事件。
 
-## 5. 部署架构
+### 3.5. 安全设计
 
-系统支持两种部署方式，以适应不同规模和场景的需求。两种方式下的服务副本数均可根据实际需求灵活配置。
+#### 3.5.1. 认证与授权
 
-### 5.1. 部署方式对比
+![认证授权流程图](diagrams/auth_flow.png)
 
-| 对比项 | Docker Compose部署 | Kubernetes + Helm部署 |
-|--------|-------------------|---------------------|
-| 适用场景 | 开发测试、小规模生产 | 中大规模生产环境 |
-| 部署复杂度 | 低，快速部署 | 中，需要K8s集群 |
-| 高可用性 | 需手动配置 | 自动故障恢复 |
-| 弹性伸缩 | 手动调整副本数 | 支持HPA自动扩缩容 |
-| 运维成本 | 低 | 中 |
-| 推荐规模 | <100任务，1-5台服务器 | >100任务，集群化部署 |
+*   **用户认证:** 支持多种认证方式：
+    - **本地用户认证:** 采用用户名密码+JWT机制。用户登录后获取有效期为24小时的Token，后续请求在HTTP Header的`Authorization`字段中携带。
+    - **OAuth 2.0 SSO:** 支持与企业统一认证平台、企业微信、钉钉等OAuth提供商集成，实现单点登录。
+    - **LDAP认证:** 支持企业LDAP目录服务集成，使用企业域账号登录。
+    - 认证方式通过`users.auth_source`字段标识，OAuth/LDAP用户默认分配`business_operator`角色。
 
-### 5.2. Docker Compose部署方案
+*   **API 认证:** 对于第三方系统的 API 调用，采用 API Key 认证。每个 API Key 关联到特定用户，并可配置权限范围和过期时间。
 
-![Docker Compose部署架构图](diagrams/docker_compose_deployment.png)
+*   **权限控制:** 基于 RBAC (Role-Based Access Control) 模型。系统预定义5种用户角色，不同角色拥有不同的操作权限：
 
-Docker Compose部署方式适用于开发测试环境和小规模生产场景，提供快速部署能力。
+| 角色 | 角色标识 | 权限范围 | 典型场景 |
+|------|---------|---------|---------|
+| 系统管理员 | `admin` | 所有权限，包括用户管理、系统配置、OAuth提供商配置 | 系统运维人员 |
+| 数据分析师 | `data_analyst` | 任务查看、数据查看、报表导出 | 数据分析人员 |
+| 算法工程师 | `algorithm_engineer` | 任务管理、数据管理、数据源管理 | 算法建模人员 |
+| 业务运营 | `business_operator` | 任务查看、任务执行、数据查看（**OAuth/LDAP用户默认角色**） | 业务运营人员 |
+| 开发工程师 | `developer` | API调用、任务管理、插件开发 | 系统集成开发人员 |
 
-#### 5.2.1. 单机部署架构
+#### 3.5.2. 数据安全
 
-所有服务部署在单台主机上，适合开发测试和演示环境。
+*   **敏感信息加密:** 数据库连接密码、API Key 等敏感信息在存储时使用 AES-256 算法加密，密钥通过环境变量或密钥管理服务（如 K8s Secret）注入。
+*   **传输加密:** 所有外部通信（Web UI、API 调用）强制使用 HTTPS/TLS 1.3。
+*   **SQL 注入防护:** 所有数据库操作使用参数化查询，禁止拼接 SQL 语句。
+*   **XSS 防护:** 前端对所有用户输入进行转义和过滤。
 
-**服务组成与默认配置:**
-*   Web UI: 1-2副本（可配置）
-*   API Gateway: 1-3副本（可配置）
-*   Master服务: 3副本（可配置）
-*   Worker服务: 1-10副本（可配置，根据任务量调整）
-*   PostgreSQL: 1副本
-*   Redis: 1副本
-*   RabbitMQ: 1副本
-*   etcd: 1副本
-*   Prometheus: 1副本
-*   Grafana: 1副本
+### 3.6. 监控与运维
 
-**资源要求:**
-*   最低配置: 2C4G, 50GB磁盘
-*   推荐配置: 4C8G, 100GB SSD
-*   高负载配置: 8C16G, 200GB SSD
+#### 3.6.1. 监控指标
 
-**服务通信:**
-*   使用Docker bridge网络实现服务间通信
-*   通过服务名进行DNS解析
-*   端口映射: Web UI(8080), API Gateway(8000), Grafana(3000)等
+系统需要监控的关键指标包括：
 
-**数据持久化:**
-*   数据库数据: `/data/postgres`
-*   Redis数据: `/data/redis`
-*   日志文件: `/var/log/datafusion`
-*   配置文件: `/etc/datafusion`
+| 类别 | 指标名称 | 说明 |
+| :--- | :--- | :--- |
+| **任务指标** | `task_total` | 任务总数 |
+| | `task_run_total` | 任务执行总次数 |
+| | `task_run_success_rate` | 任务执行成功率 |
+| | `task_run_duration_seconds` | 任务执行耗时（直方图） |
+| | `task_data_count` | 任务采集数据量 |
+| **系统指标** | `worker_count` | Worker 节点数量 |
+| | `worker_cpu_usage` | Worker CPU 使用率 |
+| | `worker_memory_usage` | Worker 内存使用率 |
+| | `queue_length` | 任务队列长度 |
+| | `api_request_total` | API 请求总数 |
+| | `api_request_duration_seconds` | API 请求耗时 |
 
-#### 5.2.2. 多机分布式部署架构
+#### 3.6.2. 日志规范
 
-适用于需要一定高可用性但不具备K8s条件的小规模生产环境。
+*   **日志级别:** DEBUG, INFO, WARN, ERROR, FATAL
+*   **日志格式:** 统一采用 JSON 格式，包含时间戳、级别、模块、消息、上下文等字段
+*   **日志收集:** 所有服务的日志通过 Filebeat 收集并发送到 Elasticsearch
+*   **日志保留:** 生产环境日志保留 30 天，归档后保留 1 年
 
-**节点角色划分（可根据实际情况调整）:**
+#### 3.6.3. 告警规则
 
-**管理节点（1-2台）:**
-*   Master服务: 3副本（可配置）
-*   API Gateway: 2-3副本（可配置）
-*   Web UI: 1-2副本（可配置）
-*   etcd: 1副本（多机可部署3副本集群）
+| 告警名称 | 触发条件 | 级别 | 通知方式 |
+| :--- | :--- | :--- | :--- |
+| Worker 节点下线 | Worker 心跳超时 > 1 分钟 | 严重 | 邮件 + 短信 |
+| 任务失败率过高 | 近 10 分钟任务失败率 > 20% | 警告 | 邮件 |
+| 任务队列积压 | 队列长度 > 1000 | 警告 | 邮件 |
+| 磁盘空间不足 | 磁盘使用率 > 85% | 严重 | 邮件 + 短信 |
+| 数据库连接失败 | 数据库连接失败 | 严重 | 邮件 + 短信 + 钉钉 |
 
-**基础设施节点（1-3台）:**
-*   PostgreSQL: 1主1从（可配置）
-*   Redis: 单机或3节点Cluster（可配置）
-*   RabbitMQ: 1-3节点（可配置）
+#### 3.6.4. 运维工具
 
-**Worker节点（可扩展）:**
-*   Worker服务: 每节点1-5副本（可配置）
-*   根据任务量动态增减节点
+系统需要提供以下运维工具和命令：
 
-**跨主机通信:**
-*   方式1: Docker Swarm overlay网络
-*   方式2: 主机网络 + 环境变量配置服务地址
+*   `datafusion-cli task list`: 列出所有任务
+*   `datafusion-cli task run <task_id>`: 手动触发任务
+*   `datafusion-cli task logs <task_run_id>`: 查看任务日志
+*   `datafusion-cli worker list`: 列出所有 Worker 节点
+*   `datafusion-cli health check`: 系统健康检查
+*   `datafusion-cli diagnose connectivity`: 诊断目标网站可访问性
+*   `datafusion-cli diagnose database`: 诊断数据库连接状态
 
-**高可用配置（可选）:**
-*   PostgreSQL: 主从复制
-*   Redis: Sentinel或Cluster模式
-*   RabbitMQ: 镜像队列
-*   etcd: 3节点集群
-
-**副本数配置方式:**
-```yaml
-# docker-compose.yml 示例
-services:
-  master:
-    image: datafusion/master:latest
-    deploy:
-      replicas: ${MASTER_REPLICAS:-3}  # 可通过环境变量配置，默认3
-
-  worker:
-    image: datafusion/worker:latest
-    deploy:
-      replicas: ${WORKER_REPLICAS:-5}  # 可通过环境变量配置，默认5
-
-  api-gateway:
-    image: datafusion/api-gateway:latest
-    deploy:
-      replicas: ${API_REPLICAS:-2}  # 可通过环境变量配置，默认2
-```
-
-**部署步骤:**
-1.  准备服务器环境（Docker 20.10+, Docker Compose 2.0+）
-2.  配置网络连通性和防火墙规则
-3.  根据需求调整配置文件中的副本数参数
-4.  依次启动各节点服务
-5.  验证服务健康状态和集群连通性
-
-### 5.3. Kubernetes + Helm部署方案
-
-![Kubernetes部署架构图](diagrams/deployment_diagram.png)
-
-Kubernetes部署方式提供企业级的高可用、自动伸缩和运维能力，推荐用于生产环境。
-
-#### 5.3.1. 集群化部署架构
-
-**命名空间划分:**
-*   `datafusion-app`: 应用服务层
-*   `datafusion-infra`: 基础设施层
-*   `datafusion-monitor`: 监控服务层
-
-**无状态服务（Deployment）及默认副本配置:**
-*   Web UI: 2副本（可配置）
-*   API Gateway: 3副本（可配置）
-*   Master: 3副本（可配置）
-*   Worker: 5副本，支持HPA自动扩展至50副本（可配置min/max）
-
-**有状态服务（StatefulSet）:**
-*   etcd: 3副本（可配置）
-*   RabbitMQ: 3副本（可配置）
-*   Redis: 6副本Cluster模式（可配置）
-*   PostgreSQL: 可使用云RDS或StatefulSet部署1主1从（可配置）
-
-**资源配置（默认值，可调整）:**
-*   Master: request 1C2G, limit 2C4G
-*   Worker: request 2C4G, limit 4C8G
-*   API Gateway: request 1C2G, limit 2C4G
-*   Web UI: request 0.5C1G, limit 1C2G
-
-#### 5.3.2. Helm Chart配置
-
-**副本数配置（values.yaml）:**
-```yaml
-# 副本数配置
-replicaCount:
-  master: 3              # Master副本数，可配置
-  apiGateway: 3          # API Gateway副本数，可配置
-  webui: 2               # Web UI副本数，可配置
-  worker:
-    min: 5               # Worker最小副本数，可配置
-    max: 50              # Worker最大副本数，可配置（HPA）
-
-# 弹性伸缩配置
-autoscaling:
-  enabled: true          # 是否启用HPA
-  minReplicas: 5         # 最小副本数，可配置
-  maxReplicas: 50        # 最大副本数，可配置
-  targetCPUUtilizationPercentage: 70     # CPU使用率目标，可配置
-  targetMemoryUtilizationPercentage: 80  # 内存使用率目标，可配置
-
-# 资源配置（可根据实际情况调整）
-resources:
-  master:
-    requests:
-      cpu: 1000m
-      memory: 2Gi
-    limits:
-      cpu: 2000m
-      memory: 4Gi
-  worker:
-    requests:
-      cpu: 2000m
-      memory: 4Gi
-    limits:
-      cpu: 4000m
-      memory: 8Gi
-```
-
-**多环境配置示例:**
-*   `values-dev.yaml`: 开发环境（最小副本数，降低资源配置）
-*   `values-prod.yaml`: 生产环境（完整副本数，完整资源配置）
-
-**部署命令:**
-```bash
-# 使用默认配置部署
-helm install datafusion ./datafusion-chart
-
-# 自定义副本数部署
-helm install datafusion ./datafusion-chart \
-  --set replicaCount.master=5 \
-  --set replicaCount.worker.min=10 \
-  --set replicaCount.worker.max=100
-
-# 使用环境配置文件部署
-helm install datafusion ./datafusion-chart \
-  --values values-prod.yaml
-```
-
-#### 5.3.3. 核心特性
-
-**集群化部署:**
-*   所有无状态服务（Master, API, WebUI, Worker）以多副本形式部署
-*   通过K8s的Deployment和Service实现负载均衡和故障转移
-*   副本数可通过Helm values灵活配置
-
-**有状态服务:**
-*   数据库、消息队列、etcd等使用StatefulSet部署
-*   或直接使用云厂商托管服务（推荐）
-*   支持PVC持久化存储，数据可靠性高
-
-**弹性伸缩:**
-*   Worker节点支持HPA (Horizontal Pod Autoscaler)
-*   根据CPU/内存使用率或自定义指标（如任务队列长度）自动扩缩容
-*   最小/最大副本数可在values.yaml中配置
-
-**滚动更新:**
-*   支持零停机滚动更新
-*   可配置更新策略（maxSurge, maxUnavailable）
-*   快速回滚能力
-
-**配置管理:**
-*   使用K8s的ConfigMap和Secret管理应用配置和敏感信息
-*   通过Helm统一管理多环境配置
-*   配置变更自动触发Pod重启（可选）
-
-### 5.4. 部署方式选择建议
-
-**选择Docker Compose的场景:**
-*   ✅ 开发测试环境
-*   ✅ 快速POC验证
-*   ✅ 小规模生产（<100任务，1-5台服务器）
-*   ✅ 无Kubernetes基础设施
-*   ✅ 运维团队对Docker熟悉，对K8s不熟悉
-
-**选择Kubernetes + Helm的场景:**
-*   ✅ 中大规模生产环境（>100任务）
-*   ✅ 需要高可用和自动故障恢复
-*   ✅ 任务量波动大，需要弹性伸缩
-*   ✅ 已有K8s集群基础设施
-*   ✅ 需要滚动更新和快速回滚能力
-*   ✅ 多环境管理需求（dev/staging/prod）
-
-### 5.5. 副本数配置原则
-
-**默认配置说明:**
-*   文档中提供的副本数为推荐的默认值
-*   实际部署时应根据业务规模和资源情况灵活调整
-*   两种部署方式均支持通过配置文件调整副本数
-
-**配置调整建议:**
-
-**小规模场景（<50任务）:**
-*   Master: 1-3副本
-*   Worker: 1-5副本
-*   API Gateway: 1-2副本
-
-**中等规模（50-200任务）:**
-*   Master: 3副本
-*   Worker: 5-20副本
-*   API Gateway: 2-3副本
-
-**大规模场景（>200任务）:**
-*   Master: 3-5副本
-*   Worker: 20-50副本（配置HPA）
-*   API Gateway: 3-5副本
-
-**性能监控指标:**
-*   根据CPU/内存使用率动态调整
-*   关注任务队列长度和处理延迟
-*   Worker利用率保持在70-80%最佳
-
-## 6. API 设计
+## 4. API 设计
 
 系统提供一套完整的 RESTful API，支持第三方系统集成、自动化管理和企业SSO对接。所有API采用统一的设计规范、认证机制和错误处理体系。
 
-### 6.1. API 设计原则
+### 4.1. API 设计原则
 
 *   **RESTful风格:** 使用标准HTTP方法（GET、POST、PUT、DELETE），资源路径清晰明确
 *   **版本控制:** API路径包含版本号 `/api/v1/`，保证向后兼容
@@ -877,7 +987,7 @@ helm install datafusion ./datafusion-chart \
 *   **过滤排序:** 支持通用的 `filter`、`sort`、`order` 查询参数
 *   **国际化支持:** 错误消息支持多语言，通过 `Accept-Language` Header控制
 
-### 6.2. 全局统一响应格式
+### 4.2. 全局统一响应格式
 
 所有API响应遵循以下JSON格式：
 
@@ -894,17 +1004,17 @@ helm install datafusion ./datafusion-chart \
 ```
 
 **字段说明:**
-*   `code`: 业务状态码（5位数字），见6.3节错误码表
+*   `code`: 业务状态码（5位数字），见4.3节错误码表
 *   `message`: 状态描述信息，支持国际化
 *   `data`: 业务数据，成功时包含实际返回数据，失败时可能包含错误详情
 *   `request_id`: 请求追踪ID，用于日志排查和问题定位
 *   `timestamp`: 响应时间戳，ISO 8601格式
 
-### 6.3. 全局错误码系统
+### 4.3. 全局错误码系统
 
 系统采用5位数字编码体系，按模块划分错误码段：
 
-#### 6.3.1. 通用错误码 (10000-10999)
+#### 4.3.1. 通用错误码 (10000-10999)
 
 | 错误码 | 含义 | HTTP状态码 | 说明 |
 |-------|------|-----------|------|
@@ -925,7 +1035,7 @@ helm install datafusion ./datafusion-chart \
 | 10014 | Request Timeout | 408 | 请求超时 |
 | 10015 | Rate Limit Exceeded | 429 | 请求频率超限 |
 
-#### 6.3.2. 认证授权错误码 (11000-11999)
+#### 4.3.2. 认证授权错误码 (11000-11999)
 
 | 错误码 | 含义 | HTTP状态码 | 说明 |
 |-------|------|-----------|------|
@@ -949,7 +1059,7 @@ helm install datafusion ./datafusion-chart \
 | 11017 | Password Reset Required | 403 | 需要重置密码 |
 | 11018 | MFA Required | 403 | 需要多因素认证 |
 
-#### 6.3.3. 任务管理错误码 (12000-12999)
+#### 4.3.3. 任务管理错误码 (12000-12999)
 
 | 错误码 | 含义 | HTTP状态码 | 说明 |
 |-------|------|-----------|------|
@@ -967,7 +1077,7 @@ helm install datafusion ./datafusion-chart \
 | 12011 | Task Dependency Cycle | 400 | 任务依赖循环 |
 | 12012 | Task Quota Exceeded | 429 | 任务数量超限 |
 
-#### 6.3.4. 数据源管理错误码 (13000-13999)
+#### 4.3.4. 数据源管理错误码 (13000-13999)
 
 | 错误码 | 含义 | HTTP状态码 | 说明 |
 |-------|------|-----------|------|
@@ -981,7 +1091,7 @@ helm install datafusion ./datafusion-chart \
 | 13007 | Database Connection String Invalid | 400 | 数据库连接串非法 |
 | 13008 | API Endpoint Unreachable | 503 | API端点不可达 |
 
-#### 6.3.5. 任务执行错误码 (14000-14999)
+#### 4.3.5. 任务执行错误码 (14000-14999)
 
 | 错误码 | 含义 | HTTP状态码 | 说明 |
 |-------|------|-----------|------|
@@ -998,7 +1108,7 @@ helm install datafusion ./datafusion-chart \
 | 14010 | Plugin Not Found | 404 | 插件不存在 |
 | 14011 | Plugin Execution Failed | 500 | 插件执行失败 |
 
-#### 6.3.6. 用户管理错误码 (15000-15999)
+#### 4.3.6. 用户管理错误码 (15000-15999)
 
 | 错误码 | 含义 | HTTP状态码 | 说明 |
 |-------|------|-----------|------|
@@ -1012,7 +1122,7 @@ helm install datafusion ./datafusion-chart \
 | 15007 | Role Invalid | 400 | 角色非法 |
 | 15008 | Cannot Modify Third Party User | 403 | 不可修改第三方用户 |
 
-#### 6.3.7. 监控告警错误码 (16000-16999)
+#### 4.3.7. 监控告警错误码 (16000-16999)
 
 | 错误码 | 含义 | HTTP状态码 | 说明 |
 |-------|------|-----------|------|
@@ -1021,9 +1131,9 @@ helm install datafusion ./datafusion-chart \
 | 16002 | Alert Notification Failed | 500 | 告警通知发送失败 |
 | 16003 | Metric Query Failed | 500 | 指标查询失败 |
 
-### 6.4. 认证与授权 API
+### 4.4. 认证与授权 API
 
-#### 6.4.1. 本地用户登录
+#### 4.4.1. 本地用户登录
 
 **接口:** `POST /api/v1/auth/login`
 
@@ -1061,7 +1171,7 @@ helm install datafusion ./datafusion-chart \
 
 **错误码:** 11005, 11006, 11007
 
-#### 6.4.2. OAuth 2.0 单点登录
+#### 4.4.2. OAuth 2.0 单点登录
 
 **接口1:** `GET /api/v1/auth/oauth/authorize`
 
@@ -1101,7 +1211,7 @@ helm install datafusion ./datafusion-chart \
 
 **错误码:** 11010, 11011, 11012, 11013
 
-#### 6.4.3. LDAP 认证登录
+#### 4.4.3. LDAP 认证登录
 
 **接口:** `POST /api/v1/auth/ldap/login`
 
@@ -1126,7 +1236,7 @@ helm install datafusion ./datafusion-chart \
 
 **错误码:** 11014, 11015, 11016
 
-#### 6.4.4. Token 刷新
+#### 4.4.4. Token 刷新
 
 **接口:** `POST /api/v1/auth/refresh`
 
@@ -1152,7 +1262,7 @@ helm install datafusion ./datafusion-chart \
 
 **错误码:** 11001, 11002
 
-#### 6.4.5. 退出登录
+#### 4.4.5. 退出登录
 
 **接口:** `POST /api/v1/auth/logout`
 
@@ -1170,7 +1280,7 @@ helm install datafusion ./datafusion-chart \
 *   仅清除DataFusion会话，不登出企业SSO
 *   Token加入黑名单直到过期
 
-#### 6.4.6. API Key 创建
+#### 4.4.6. API Key 创建
 
 **接口:** `POST /api/v1/auth/api-keys`
 
@@ -1207,7 +1317,7 @@ helm install datafusion ./datafusion-chart \
 
 **错误码:** 11009
 
-#### 6.4.7. API Key 认证
+#### 4.4.7. API Key 认证
 
 **使用方式:** 在HTTP Header中携带API Key
 
@@ -1217,9 +1327,9 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 11003, 11004
 
-### 6.5. 用户管理 API
+### 4.5. 用户管理 API
 
-#### 6.5.1. 获取用户列表
+#### 4.5.1. 获取用户列表
 
 **接口:** `GET /api/v1/users`
 
@@ -1260,7 +1370,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **权限控制:** 仅 `admin` 角色可访问
 
-#### 6.5.2. 获取用户详情
+#### 4.5.2. 获取用户详情
 
 **接口:** `GET /api/v1/users/{id}`
 
@@ -1288,7 +1398,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 15000
 
-#### 6.5.3. 创建用户（本地用户）
+#### 4.5.3. 创建用户（本地用户）
 
 **接口:** `POST /api/v1/users`
 
@@ -1324,7 +1434,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 15001, 15002, 15003, 15004, 15007
 
-#### 6.5.4. 更新用户信息
+#### 4.5.4. 更新用户信息
 
 **接口:** `PUT /api/v1/users/{id}`
 
@@ -1346,7 +1456,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 15000, 15003, 15007, 15008
 
-#### 6.5.5. 删除用户
+#### 4.5.5. 删除用户
 
 **接口:** `DELETE /api/v1/users/{id}`
 
@@ -1366,7 +1476,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 15000, 15006
 
-#### 6.5.6. 修改密码
+#### 4.5.6. 修改密码
 
 **接口:** `POST /api/v1/users/{id}/change-password`
 
@@ -1396,9 +1506,9 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 15000, 15005, 15004, 15008
 
-### 6.6. OAuth 提供商管理 API
+### 4.6. OAuth 提供商管理 API
 
-#### 6.6.1. 获取OAuth提供商列表
+#### 4.6.1. 获取OAuth提供商列表
 
 **接口:** `GET /api/v1/oauth/providers`
 
@@ -1431,7 +1541,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **权限控制:** `admin` 可查看完整配置，其他角色仅看到name和enabled
 
-#### 6.6.2. 创建OAuth提供商
+#### 4.6.2. 创建OAuth提供商
 
 **接口:** `POST /api/v1/oauth/providers`
 
@@ -1456,7 +1566,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 11011
 
-#### 6.6.3. 更新OAuth提供商
+#### 4.6.3. 更新OAuth提供商
 
 **接口:** `PUT /api/v1/oauth/providers/{id}`
 
@@ -1466,7 +1576,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 11011
 
-#### 6.6.4. 删除OAuth提供商
+#### 4.6.4. 删除OAuth提供商
 
 **接口:** `DELETE /api/v1/oauth/providers/{id}`
 
@@ -1476,9 +1586,9 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 11011
 
-### 6.7. 任务管理 API
+### 4.7. 任务管理 API
 
-#### 6.7.1. 创建任务
+#### 4.7.1. 创建任务
 
 **接口:** `POST /api/v1/tasks`
 
@@ -1534,7 +1644,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 12002, 12003, 12004, 12009, 12010, 12012
 
-#### 6.7.2. 获取任务列表
+#### 4.7.2. 获取任务列表
 
 **接口:** `GET /api/v1/tasks`
 
@@ -1583,7 +1693,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **权限控制:** 所有角色可访问
 
-#### 6.7.3. 获取任务详情
+#### 4.7.3. 获取任务详情
 
 **接口:** `GET /api/v1/tasks/{id}`
 
@@ -1636,7 +1746,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 12000
 
-#### 6.7.4. 更新任务
+#### 4.7.4. 更新任务
 
 **接口:** `PUT /api/v1/tasks/{id}`
 
@@ -1652,7 +1762,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 12000, 12003, 12006
 
-#### 6.7.5. 删除任务
+#### 4.7.5. 删除任务
 
 **接口:** `DELETE /api/v1/tasks/{id}`
 
@@ -1672,7 +1782,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 12000, 12007
 
-#### 6.7.6. 手动触发任务
+#### 4.7.6. 手动触发任务
 
 **接口:** `POST /api/v1/tasks/{id}/run`
 
@@ -1706,7 +1816,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 12000, 12008, 14006
 
-#### 6.7.7. 暂停/恢复任务
+#### 4.7.7. 暂停/恢复任务
 
 **接口:** `POST /api/v1/tasks/{id}/pause` / `POST /api/v1/tasks/{id}/resume`
 
@@ -1727,7 +1837,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 12000
 
-#### 6.7.8. 获取任务执行历史
+#### 4.7.8. 获取任务执行历史
 
 **接口:** `GET /api/v1/tasks/{id}/runs`
 
@@ -1777,7 +1887,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 12000
 
-#### 6.7.9. 获取任务执行详情
+#### 4.7.9. 获取任务执行详情
 
 **接口:** `GET /api/v1/task-runs/{run_id}`
 
@@ -1828,7 +1938,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 14000
 
-#### 6.7.10. 获取任务执行日志
+#### 4.7.10. 获取任务执行日志
 
 **接口:** `GET /api/v1/task-runs/{run_id}/logs`
 
@@ -1879,7 +1989,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 14000
 
-#### 6.7.11. 实时日志流（WebSocket）
+#### 4.7.11. 实时日志流（WebSocket）
 
 **接口:** `WebSocket /api/v1/task-runs/{run_id}/logs/stream`
 
@@ -1903,7 +2013,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 *   WebSocket连接持续到任务执行完成
 *   支持过滤level参数
 
-#### 6.7.12. 停止任务执行
+#### 4.7.12. 停止任务执行
 
 **接口:** `POST /api/v1/task-runs/{run_id}/stop`
 
@@ -1924,9 +2034,9 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 14000
 
-### 6.8. 数据源管理 API
+### 4.8. 数据源管理 API
 
-#### 6.8.1. 创建数据源
+#### 4.8.1. 创建数据源
 
 **接口:** `POST /api/v1/datasources`
 
@@ -1984,7 +2094,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 13001, 13002, 13003
 
-#### 6.8.2. 获取数据源列表
+#### 4.8.2. 获取数据源列表
 
 **接口:** `GET /api/v1/datasources`
 
@@ -2019,7 +2129,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **权限控制:** 所有角色可访问
 
-#### 6.8.3. 获取数据源详情
+#### 4.8.3. 获取数据源详情
 
 **接口:** `GET /api/v1/datasources/{id}`
 
@@ -2057,7 +2167,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 13000
 
-#### 6.8.4. 更新数据源
+#### 4.8.4. 更新数据源
 
 **接口:** `PUT /api/v1/datasources/{id}`
 
@@ -2069,7 +2179,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 13000, 13003
 
-#### 6.8.5. 删除数据源
+#### 4.8.5. 删除数据源
 
 **接口:** `DELETE /api/v1/datasources/{id}`
 
@@ -2087,7 +2197,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 13000, 13006
 
-#### 6.8.6. 测试数据源连接
+#### 4.8.6. 测试数据源连接
 
 **接口:** `POST /api/v1/datasources/{id}/test`
 
@@ -2122,9 +2232,9 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 13000, 13004, 13005
 
-### 6.9. 监控与统计 API
+### 4.9. 监控与统计 API
 
-#### 6.9.1. 系统概览
+#### 4.9.1. 系统概览
 
 **接口:** `GET /api/v1/monitoring/overview`
 
@@ -2176,7 +2286,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **权限控制:** 所有角色可访问
 
-#### 6.9.2. Worker节点列表
+#### 4.9.2. Worker节点列表
 
 **接口:** `GET /api/v1/monitoring/workers`
 
@@ -2207,7 +2317,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **权限控制:** 所有角色可访问
 
-#### 6.9.3. 任务统计数据
+#### 4.9.3. 任务统计数据
 
 **接口:** `GET /api/v1/monitoring/tasks/{id}/statistics`
 
@@ -2251,7 +2361,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 
 **错误码:** 12000
 
-#### 6.9.4. Prometheus指标导出
+#### 4.9.4. Prometheus指标导出
 
 **接口:** `GET /api/v1/metrics`
 
@@ -2282,9 +2392,9 @@ datafusion_workers_online 5
 
 **权限控制:** 公开访问（或通过API Key认证）
 
-### 6.10. 通用规范
+### 4.10. 通用规范
 
-#### 6.10.1. 分页规范
+#### 4.10.1. 分页规范
 
 所有列表接口统一使用以下分页参数：
 
@@ -2307,7 +2417,7 @@ datafusion_workers_online 5
 }
 ```
 
-#### 6.10.2. 过滤和排序
+#### 4.10.2. 过滤和排序
 
 *   **过滤:** 使用查询参数，支持精确匹配和模糊搜索
     - `status=active`: 精确匹配
@@ -2318,7 +2428,7 @@ datafusion_workers_online 5
     - `sort=created_at&order=desc`: 按创建时间降序
     - `sort=name&order=asc`: 按名称升序
 
-#### 6.10.3. 请求频率限制
+#### 4.10.3. 请求频率限制
 
 根据用户类型设置不同的请求频率限制：
 
@@ -2349,7 +2459,7 @@ X-RateLimit-Remaining: 245
 X-RateLimit-Reset: 1729767600
 ```
 
-#### 6.10.4. CORS跨域支持
+#### 4.10.4. CORS跨域支持
 
 API支持CORS跨域请求，允许的域名在系统配置中管理。
 
@@ -2361,7 +2471,7 @@ Access-Control-Allow-Headers: Authorization, Content-Type, X-API-Key
 Access-Control-Max-Age: 86400
 ```
 
-#### 6.10.5. API版本控制
+#### 4.10.5. API版本控制
 
 *   当前版本: `v1`
 *   路径格式: `/api/v1/`
@@ -2370,13 +2480,13 @@ Access-Control-Max-Age: 86400
     - 引入不兼容变更时发布v2版本
     - v1和v2同时提供服务至少6个月
 
-#### 6.10.6. 时区和时间格式
+#### 4.10.6. 时区和时间格式
 
 *   所有时间字段使用UTC时区
 *   时间格式: ISO 8601 (`2025-10-24T10:30:00Z`)
 *   前端根据用户所在时区显示本地时间
 
-#### 6.10.7. 幂等性设计
+#### 4.10.7. 幂等性设计
 
 *   **GET、PUT、DELETE:** 天然幂等
 *   **POST:** 支持幂等性Key机制
@@ -2393,7 +2503,7 @@ Idempotency-Key: client-generated-uuid-123
 
 相同Idempotency-Key的重复请求返回首次请求的结果，不会重复创建资源。
 
-#### 6.10.8. 批量操作
+#### 4.10.8. 批量操作
 
 部分接口支持批量操作，通过请求体数组实现：
 
@@ -2422,157 +2532,47 @@ POST /api/v1/tasks/batch-delete
 }
 ```
 
+## 5. 性能优化
 
-
-## 7. 核心场景时序图
-
-为了更清晰地展示系统在关键场景下的交互流程，我们提供了以下时序图。
-
-### 7.1. 任务创建场景
-
-用户通过 Web UI 创建一个新的数据采集任务的完整流程：
-
-![任务创建时序图](diagrams/seq_create_task.png)
-
-该时序图展示了从用户提交任务配置，到系统完成任务注册和调度配置的全过程，涉及认证、数据持久化、调度器注册等关键步骤。
-
-### 7.2. 任务执行场景
-
-调度器触发任务执行，Worker 节点完成数据采集、处理和存储的完整流程：
-
-![任务执行时序图](diagrams/seq_execute_task.png)
-
-该时序图详细描述了任务从调度、分发、执行、到结果上报的全过程，包括成功和失败两种情况的处理逻辑，以及重试和告警机制。
-
-## 8. 核心类设计
-
-系统的核心业务逻辑通过以下类和接口进行建模：
-
-![类图](diagrams/class_diagram.png)
-
-类图展示了系统的主要领域模型，包括任务管理域、数据源域、采集器域、处理器域、存储器域和调度域。各个类之间通过清晰的接口和依赖关系进行协作，体现了面向对象设计的封装、继承和多态原则。
-
-## 9. 安全设计
-
-### 9.1. 认证与授权
-
-![认证授权流程图](diagrams/auth_flow.png)
-
-*   **用户认证:** 支持多种认证方式：
-    - **本地用户认证:** 采用用户名密码+JWT机制。用户登录后获取有效期为24小时的Token，后续请求在HTTP Header的`Authorization`字段中携带。
-    - **OAuth 2.0 SSO:** 支持与企业统一认证平台、企业微信、钉钉等OAuth提供商集成，实现单点登录。
-    - **LDAP认证:** 支持企业LDAP目录服务集成，使用企业域账号登录。
-    - 认证方式通过`users.auth_source`字段标识，OAuth/LDAP用户默认分配`business_operator`角色。
-
-*   **API 认证:** 对于第三方系统的 API 调用，采用 API Key 认证。每个 API Key 关联到特定用户，并可配置权限范围和过期时间。
-
-*   **权限控制:** 基于 RBAC (Role-Based Access Control) 模型。系统预定义5种用户角色，不同角色拥有不同的操作权限：
-
-| 角色 | 角色标识 | 权限范围 | 典型场景 |
-|------|---------|---------|---------|
-| 系统管理员 | `admin` | 所有权限，包括用户管理、系统配置、OAuth提供商配置 | 系统运维人员 |
-| 数据分析师 | `data_analyst` | 任务查看、数据查看、报表导出 | 数据分析人员 |
-| 算法工程师 | `algorithm_engineer` | 任务管理、数据管理、数据源管理 | 算法建模人员 |
-| 业务运营 | `business_operator` | 任务查看、任务执行、数据查看（**OAuth/LDAP用户默认角色**） | 业务运营人员 |
-| 开发工程师 | `developer` | API调用、任务管理、插件开发 | 系统集成开发人员 |
-
-### 9.2. 数据安全
-
-*   **敏感信息加密:** 数据库连接密码、API Key 等敏感信息在存储时使用 AES-256 算法加密，密钥通过环境变量或密钥管理服务（如 K8s Secret）注入。
-*   **传输加密:** 所有外部通信（Web UI、API 调用）强制使用 HTTPS/TLS 1.3。
-*   **SQL 注入防护:** 所有数据库操作使用参数化查询，禁止拼接 SQL 语句。
-*   **XSS 防护:** 前端对所有用户输入进行转义和过滤。
-
-## 10. 监控与运维
-
-### 10.1. 监控指标
-
-系统需要监控的关键指标包括：
-
-| 类别 | 指标名称 | 说明 |
-| :--- | :--- | :--- |
-| **任务指标** | `task_total` | 任务总数 |
-| | `task_run_total` | 任务执行总次数 |
-| | `task_run_success_rate` | 任务执行成功率 |
-| | `task_run_duration_seconds` | 任务执行耗时（直方图） |
-| | `task_data_count` | 任务采集数据量 |
-| **系统指标** | `worker_count` | Worker 节点数量 |
-| | `worker_cpu_usage` | Worker CPU 使用率 |
-| | `worker_memory_usage` | Worker 内存使用率 |
-| | `queue_length` | 任务队列长度 |
-| | `api_request_total` | API 请求总数 |
-| | `api_request_duration_seconds` | API 请求耗时 |
-
-### 10.2. 日志规范
-
-*   **日志级别:** DEBUG, INFO, WARN, ERROR, FATAL
-*   **日志格式:** 统一采用 JSON 格式，包含时间戳、级别、模块、消息、上下文等字段
-*   **日志收集:** 所有服务的日志通过 Filebeat 收集并发送到 Elasticsearch
-*   **日志保留:** 生产环境日志保留 30 天，归档后保留 1 年
-
-### 10.3. 告警规则
-
-| 告警名称 | 触发条件 | 级别 | 通知方式 |
-| :--- | :--- | :--- | :--- |
-| Worker 节点下线 | Worker 心跳超时 > 1 分钟 | 严重 | 邮件 + 短信 |
-| 任务失败率过高 | 近 10 分钟任务失败率 > 20% | 警告 | 邮件 |
-| 任务队列积压 | 队列长度 > 1000 | 警告 | 邮件 |
-| 磁盘空间不足 | 磁盘使用率 > 85% | 严重 | 邮件 + 短信 |
-| 数据库连接失败 | 数据库连接失败 | 严重 | 邮件 + 短信 + 钉钉 |
-
-### 10.4. 运维工具
-
-系统需要提供以下运维工具和命令：
-
-*   `datafusion-cli task list`: 列出所有任务
-*   `datafusion-cli task run <task_id>`: 手动触发任务
-*   `datafusion-cli task logs <task_run_id>`: 查看任务日志
-*   `datafusion-cli worker list`: 列出所有 Worker 节点
-*   `datafusion-cli health check`: 系统健康检查
-*   `datafusion-cli diagnose connectivity`: 诊断目标网站可访问性
-*   `datafusion-cli diagnose database`: 诊断数据库连接状态
-
-## 11. 性能优化
-
-### 11.1. 采集性能优化
+### 5.1. 采集性能优化
 
 *   **连接池复用:** 对于数据库采集，使用连接池避免频繁创建连接。
 *   **并发控制:** 根据目标网站的承载能力，合理设置并发数，避免被封禁。
 *   **增量采集:** 对于支持增量的数据源，记录上次采集的时间戳或游标，只获取新增数据。
 *   **缓存机制:** 对于不常变化的数据（如配置、规则），使用 Redis 缓存，减少数据库访问。
 
-### 11.2. 存储性能优化
+### 5.2. 存储性能优化
 
 *   **批量写入:** 采集到的数据先缓存在内存中，达到一定数量（如 1000 条）或时间间隔（如 10 秒）后批量写入数据库。
 *   **异步写入:** 数据存储操作异步执行，不阻塞采集流程。
 *   **分库分表:** 对于数据量特别大的场景，可以对目标数据库进行分库分表设计。
 
-### 11.3. 系统性能优化
+### 5.3. 系统性能优化
 
 *   **负载均衡:** 通过 Nginx 或 K8s Service 实现 API 和 Master 节点的负载均衡。
 *   **资源限制:** 为每个 Pod 设置合理的 CPU 和内存限制，防止资源耗尽。
 *   **弹性伸缩:** 根据任务队列长度或 CPU 使用率自动调整 Worker 节点数量。
 
-## 12. 开发规范
+## 6. 开发规范
 
-### 12.1. 代码规范
+### 6.1. 代码规范
 
 *   **Go 代码:** 遵循 [Effective Go](https://go.dev/doc/effective_go) 和 [Uber Go Style Guide](https://github.com/uber-go/guide/blob/master/style.md)
 *   **Python 代码:** 遵循 [PEP 8](https://peps.python.org/pep-0008/)
 *   **代码审查:** 所有代码必须经过至少一名其他开发者的 Code Review 后才能合并
 
-### 12.2. 测试规范
+### 6.2. 测试规范
 
 *   **单元测试:** 核心业务逻辑的单元测试覆盖率 > 80%
 *   **集成测试:** 对关键流程（任务创建、执行、存储）编写集成测试
 *   **性能测试:** 在正式发布前进行压力测试，确保满足性能指标
 
-### 12.3. 版本管理
+### 6.3. 版本管理
 
 *   **分支策略:** 采用 Git Flow 模型，主要分支包括 `main`（生产）、`develop`（开发）、`feature/*`（特性）、`hotfix/*`（热修复）
 *   **版本号:** 遵循语义化版本 (Semantic Versioning)，格式为 `MAJOR.MINOR.PATCH`
 
-## 13. 总结
+## 7. 总结
 
 本文档详细描述了 **DataFusion** 系统的技术设计方案，涵盖了系统架构、模块设计、数据库设计、部署架构、安全设计、监控运维等各个方面。该设计方案基于成熟的技术栈和最佳实践，能够满足生产环境对高可用、高性能、高可靠的要求。
 
