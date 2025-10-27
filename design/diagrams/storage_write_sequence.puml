@@ -1,0 +1,326 @@
+@startuml
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+title 数据存储写入时序图
+
+participant "Processor\n数据处理器" as Processor
+participant "Storage Manager\n存储管理器" as SM
+participant "Batch Writer\n批量写入器" as BW
+participant "Storage Router\n存储路由器" as SR
+participant "PostgreSQL\nStorage" as PGSQL
+participant "MongoDB\nStorage" as Mongo
+participant "File\nStorage" as File
+participant "Connection Pool\n连接池" as Pool
+participant "Retry Manager\n重试管理器" as Retry
+participant "Metrics Collector\n指标收集器" as Metrics
+participant "Redis\n去重缓存" as Redis
+
+autonumber
+
+== 数据提交阶段 ==
+
+Processor -> SM: Write(processedData)
+activate SM
+
+SM -> SM: 验证数据格式
+note right
+  验证内容:
+  - 必填字段检查
+  - 数据类型验证
+  - Schema匹配检查
+end note
+
+SM -> Redis: 检查数据是否重复
+Redis --> SM: 返回检查结果
+
+alt 数据已存在（重复）
+    SM -> Metrics: 记录重复数据指标
+    SM --> Processor: 返回{status: "duplicate", skipped: true}
+    deactivate SM
+    note right
+      重复数据直接跳过
+      不进入存储流程
+    end note
+else 新数据
+    SM -> BW: AddToBatch(data)
+    activate BW
+
+    BW -> BW: 添加到缓冲区
+    note right
+      缓冲区配置:
+      - 缓冲区大小: 1000条
+      - 刷新间隔: 10秒
+      - Worker数量: 5个
+    end note
+
+    SM --> Processor: 返回{status: "queued"}
+    deactivate SM
+end
+
+== 批量刷新触发阶段 ==
+
+alt 缓冲区已满（达到1000条）
+    BW -> BW: 触发批量刷新
+    note right: 触发条件1: bufferSize >= 1000
+else 定时刷新（10秒到期）
+    BW -> BW: 触发批量刷新
+    note right: 触发条件2: 距上次刷新 >= 10秒
+else 强制刷新信号
+    BW -> BW: 触发批量刷新
+    note right: 触发条件3: 收到Flush()命令
+end
+
+== 存储路由阶段 ==
+
+BW -> SR: RouteBatch(batchData)
+activate SR
+
+loop 遍历每条数据
+    SR -> SR: 应用路由规则
+    note right
+      路由规则示例:
+      1. data_size < 1MB → PostgreSQL
+      2. data_size >= 1MB → MongoDB
+      3. data_type = "binary" → FileStorage
+      4. task_type = "log" → Elasticsearch
+      5. 自定义规则表达式
+    end note
+
+    alt 路由到PostgreSQL
+        SR -> SR: 添加到PostgreSQL批次
+    else 路由到MongoDB
+        SR -> SR: 添加到MongoDB批次
+    else 路由到FileStorage
+        SR -> SR: 添加到FileStorage批次
+    end
+end
+
+SR --> BW: 返回路由后的批次
+deactivate SR
+
+== PostgreSQL存储阶段 ==
+
+BW -> PGSQL: WriteBatch(pgBatch)
+activate PGSQL
+
+PGSQL -> Pool: 获取数据库连接
+activate Pool
+Pool --> PGSQL: 返回连接
+deactivate Pool
+
+PGSQL -> PGSQL: 开启事务\nBEGIN TRANSACTION
+
+PGSQL -> PGSQL: 构建COPY命令
+note right
+  使用PostgreSQL COPY协议:
+  COPY table_name (col1, col2, ...)
+  FROM STDIN
+  WITH (FORMAT csv)
+
+  优势:
+  - 比INSERT快10-50倍
+  - 批量导入优化
+  - 减少网络往返
+end note
+
+PGSQL -> PGSQL: 执行COPY批量写入
+
+alt 写入成功
+    PGSQL -> PGSQL: 提交事务\nCOMMIT
+    PGSQL -> Pool: 归还连接
+    PGSQL -> Metrics: 记录成功指标\n(写入条数、耗时)
+    PGSQL --> BW: 返回{success: true, count: N}
+    deactivate PGSQL
+
+else 写入失败
+    PGSQL -> PGSQL: 回滚事务\nROLLBACK
+    PGSQL -> Pool: 归还连接
+
+    PGSQL -> Retry: 提交重试请求
+    activate Retry
+
+    Retry -> Retry: 判断是否可重试
+    note right
+      可重试错误:
+      - 网络超时
+      - 连接断开
+      - 死锁检测
+      - 资源临时不可用
+
+      不可重试错误:
+      - 数据格式错误
+      - 主键冲突
+      - 权限不足
+      - Schema不匹配
+    end note
+
+    alt 可重试且未超过最大次数
+        Retry -> Retry: 计算退避延迟
+        note right
+          指数退避算法:
+          delay = min(
+            initialDelay * (2 ^ retryCount),
+            maxDelay
+          )
+
+          示例:
+          第1次: 1秒
+          第2次: 2秒
+          第3次: 4秒
+          最大: 30秒
+        end note
+
+        Retry -> Retry: 等待延迟时间
+        Retry -> PGSQL: 重新执行写入
+        note left: 重试流程与首次写入相同
+
+    else 不可重试或超过最大次数
+        Retry -> Retry: 记录到死信队列
+        Retry -> Metrics: 记录失败指标
+        Retry --> BW: 返回{success: false, error: "..."}
+        deactivate Retry
+    end
+end
+
+== MongoDB存储阶段 ==
+
+BW -> Mongo: WriteBatch(mongoBatch)
+activate Mongo
+
+Mongo -> Mongo: 构建BulkWrite操作
+note right
+  MongoDB BulkWrite:
+  - insertOne: 插入新文档
+  - updateOne: 更新文档
+  - replaceOne: 替换文档
+  - deleteOne: 删除文档
+
+  配置选项:
+  - ordered: false (无序写入，更快)
+  - writeConcern: {w: 1, j: true}
+end note
+
+Mongo -> Mongo: 执行BulkWrite
+
+alt 写入成功
+    Mongo -> Metrics: 记录成功指标
+    Mongo --> BW: 返回{success: true, count: N}
+    deactivate Mongo
+
+else 写入失败
+    Mongo -> Retry: 提交重试请求
+    note left: 重试流程同PostgreSQL
+end
+
+== FileStorage存储阶段 ==
+
+BW -> File: WriteBatch(fileBatch)
+activate File
+
+File -> File: 按任务ID分组数据
+note right
+  文件组织结构:
+  /data/{task_id}/
+    - 2025-10-26-0001.json
+    - 2025-10-26-0002.json.gz
+    - 2025-10-26.parquet
+end note
+
+loop 每个任务的数据批次
+    File -> File: 生成文件名\n(包含时间戳和序号)
+
+    File -> File: 选择文件格式
+    note right
+      支持格式:
+      - JSON: 单行JSONL或格式化
+      - CSV: 带header，逗号分隔
+      - Parquet: 列式存储，压缩
+    end note
+
+    alt 启用压缩
+        File -> File: 压缩数据\n(gzip/zstd)
+    end
+
+    File -> File: 写入文件系统
+    File -> File: 刷新到磁盘\nfsync()
+end
+
+File -> Metrics: 记录成功指标
+File --> BW: 返回{success: true, count: N}
+deactivate File
+
+== 最终确认阶段 ==
+
+BW -> Redis: 批量记录已写入数据键\n(用于后续去重)
+note right
+  Redis去重键格式:
+  dedup:{strategy}:{key_hash}
+
+  TTL: 7天（604800秒）
+
+  布隆过滤器辅助:
+  - 快速判断数据是否存在
+  - 降低Redis查询压力
+end note
+
+BW -> Metrics: 汇总所有存储的指标
+activate Metrics
+Metrics -> Metrics: 计算总耗时、成功率
+Metrics --> BW: 返回汇总指标
+deactivate Metrics
+
+BW --> BW: 清空缓冲区
+deactivate BW
+
+note over BW
+  批量写入完成统计:
+  - 总条数: N条
+  - 成功条数: M条
+  - 失败条数: N-M条
+  - 总耗时: X秒
+  - 平均QPS: M/X
+  - PostgreSQL: X1条
+  - MongoDB: X2条
+  - FileStorage: X3条
+end note
+
+== 异常处理说明 ==
+
+note over SM, Retry
+  **异常处理策略总结**:
+
+  1. **数据验证失败**:
+     - 记录错误日志
+     - 返回错误给Processor
+     - 不进入批量队列
+
+  2. **数据重复**:
+     - 跳过写入
+     - 记录重复指标
+     - 快速返回
+
+  3. **缓冲区满**:
+     - 立即触发刷新
+     - 阻塞新数据写入
+     - 等待缓冲区空闲
+
+  4. **存储失败**:
+     - 根据错误类型判断是否重试
+     - 使用指数退避算法
+     - 最多重试3次
+     - 失败记录到死信队列
+
+  5. **连接池耗尽**:
+     - 等待连接释放（超时时间30秒）
+     - 超时后返回错误
+     - 触发告警通知
+
+  6. **磁盘空间不足**:
+     - 停止写入
+     - 触发严重告警
+     - 通知运维团队
+end note
+
+@enduml

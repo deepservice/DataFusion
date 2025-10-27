@@ -1,0 +1,448 @@
+@startuml
+skinparam backgroundColor white
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+title 数据存储插件类图
+
+' 核心接口
+interface Storage {
+  + Name() string
+  + Connect(config StorageConfig) error
+  + Write(data *Data) error
+  + WriteBatch(batch []*Data) error
+  + Close() error
+  + HealthCheck() error
+  + GetMetrics() *StorageMetrics
+}
+
+note right of Storage
+  **Storage接口说明**:
+
+  所有存储插件必须实现该接口
+
+  方法说明:
+  - Name(): 返回存储类型名称
+  - Connect(): 建立与存储的连接
+  - Write(): 单条数据写入
+  - WriteBatch(): 批量数据写入
+  - Close(): 关闭连接，释放资源
+  - HealthCheck(): 健康检查
+  - GetMetrics(): 获取存储指标
+end note
+
+' 存储配置基类
+class StorageConfig {
+  + Type: string
+  + Name: string
+  + ConnectionString: string
+  + MaxConnections: int
+  + MinConnections: int
+  + ConnectionTimeout: time.Duration
+  + WriteTimeout: time.Duration
+  + BatchSize: int
+  + EnableRetry: bool
+  + RetryConfig: *RetryConfig
+  --
+  + Validate() error
+  + ToJSON() string
+}
+
+' PostgreSQL配置
+class PostgreSQLConfig {
+  + Database: string
+  + Host: string
+  + Port: int
+  + User: string
+  + Password: string
+  + SSLMode: string
+  + Schema: string
+  + TableName: string
+  + UseCopyProtocol: bool
+  + PreparedStatementCache: bool
+  --
+  + BuildDSN() string
+}
+
+' MongoDB配置
+class MongoDBConfig {
+  + Database: string
+  + Collection: string
+  + ReplicaSet: string
+  + WriteConcern: string
+  + ReadPreference: string
+  + AuthSource: string
+  + OrderedWrites: bool
+  --
+  + BuildConnectionString() string
+}
+
+' File存储配置
+class FileStorageConfig {
+  + BasePath: string
+  + FileFormat: string
+  + Compression: string
+  + RotationSize: int64
+  + RotationInterval: time.Duration
+  + PartitionBy: string
+  --
+  + GetFilePath(taskID string, timestamp time.Time) string
+}
+
+' PostgreSQL存储实现
+class PostgreSQLStorage {
+  - config: *PostgreSQLConfig
+  - pool: *ConnectionPool
+  - metrics: *StorageMetrics
+  - prepared: map[string]*sql.Stmt
+  --
+  + Name() string
+  + Connect(config) error
+  + Write(data) error
+  + WriteBatch(batch) error
+  + Close() error
+  + HealthCheck() error
+  --
+  - buildCopyCommand() string
+  - executeCopy(batch) error
+  - executePreparedStatement(data) error
+}
+
+note bottom of PostgreSQLStorage
+  **PostgreSQL优化策略**:
+
+  1. COPY协议批量导入:
+     - 比INSERT快10-50倍
+     - 直接写入数据文件
+
+  2. Prepared Statement缓存:
+     - 减少SQL解析开销
+     - 提升单条写入性能
+
+  3. 事务批量提交:
+     - BEGIN → COPY → COMMIT
+     - 原子性保证
+
+  4. 连接池复用:
+     - 避免频繁建立连接
+     - 支持并发写入
+end note
+
+' MongoDB存储实现
+class MongoDBStorage {
+  - config: *MongoDBConfig
+  - client: *mongo.Client
+  - collection: *mongo.Collection
+  - metrics: *StorageMetrics
+  --
+  + Name() string
+  + Connect(config) error
+  + Write(data) error
+  + WriteBatch(batch) error
+  + Close() error
+  + HealthCheck() error
+  --
+  - buildBulkWriteModels(batch) []mongo.WriteModel
+  - executeBulkWrite(models) error
+}
+
+note bottom of MongoDBStorage
+  **MongoDB优化策略**:
+
+  1. BulkWrite批量操作:
+     - 减少网络往返
+     - 提升写入吞吐量
+
+  2. 无序写入:
+     - ordered=false
+     - 并发写入不同文档
+
+  3. WriteConcern调节:
+     - w=1: 主节点确认
+     - j=true: 写入journal日志
+
+  4. 索引优化:
+     - 后台创建索引
+     - 避免写入阻塞
+end note
+
+' File存储实现
+class FileStorage {
+  - config: *FileStorageConfig
+  - writers: map[string]*FileWriter
+  - metrics: *StorageMetrics
+  - mu: sync.RWMutex
+  --
+  + Name() string
+  + Connect(config) error
+  + Write(data) error
+  + WriteBatch(batch) error
+  + Close() error
+  + HealthCheck() error
+  --
+  - getOrCreateWriter(path) *FileWriter
+  - rotateFileIfNeeded(writer) error
+  - writeJSON(writer, data) error
+  - writeCSV(writer, data) error
+  - writeParquet(writer, data) error
+}
+
+note bottom of FileStorage
+  **File存储特性**:
+
+  1. 多格式支持:
+     - JSON: 单行JSONL或格式化
+     - CSV: 带header，逗号分隔
+     - Parquet: 列式存储，高压缩比
+
+  2. 压缩选项:
+     - gzip: 通用压缩，兼容性好
+     - zstd: 高压缩比，速度快
+
+  3. 文件轮转:
+     - 按大小: 每100MB轮转
+     - 按时间: 每小时轮转
+     - 按分区: 按任务ID/日期分区
+
+  4. 缓冲写入:
+     - bufio.Writer缓冲
+     - 定时flush到磁盘
+end note
+
+' 连接池
+class ConnectionPool {
+  - maxConns: int
+  - minConns: int
+  - idleTimeout: time.Duration
+  - conns: chan *sql.DB
+  - activeConns: int
+  - mu: sync.RWMutex
+  --
+  + Acquire() (*sql.DB, error)
+  + Release(conn *sql.DB) error
+  + Close() error
+  + Stats() *PoolStats
+  --
+  - createConnection() (*sql.DB, error)
+  - validateConnection(conn *sql.DB) bool
+  - closeIdleConnections()
+}
+
+note right of ConnectionPool
+  **连接池配置**:
+
+  - 最大连接数: 20
+  - 最小连接数: 5
+  - 空闲超时: 30分钟
+  - 连接超时: 10秒
+
+  **连接池优势**:
+  - 避免频繁建立/关闭连接
+  - 控制并发数
+  - 自动回收空闲连接
+  - 健康检查机制
+end note
+
+' 重试管理器
+class RetryManager {
+  - maxRetries: int
+  - initialDelay: time.Duration
+  - maxDelay: time.Duration
+  - backoffMultiplier: float64
+  --
+  + ShouldRetry(err error) bool
+  + GetDelay(retryCount int) time.Duration
+  + Execute(fn func() error) error
+  --
+  - isRetriableError(err error) bool
+  - calculateBackoff(retryCount int) time.Duration
+}
+
+note right of RetryManager
+  **重试策略**:
+
+  指数退避算法:
+  delay = min(
+    initialDelay * (backoffMultiplier ^ retryCount),
+    maxDelay
+  )
+
+  示例:
+  - 第1次: 1秒
+  - 第2次: 2秒
+  - 第3次: 4秒
+  - 第4次: 8秒
+  - 最大: 30秒
+
+  **可重试错误**:
+  - 网络超时
+  - 连接断开
+  - 死锁检测
+  - 临时资源不可用
+
+  **不可重试错误**:
+  - 数据格式错误
+  - 主键冲突
+  - 权限不足
+  - Schema不匹配
+end note
+
+' 存储路由器
+class StorageRouter {
+  - rules: []*RoutingRule
+  - defaultStorage: string
+  --
+  + Route(data *Data) string
+  + AddRule(rule *RoutingRule)
+  + RemoveRule(ruleID string)
+  --
+  - evaluateRule(rule *RoutingRule, data *Data) bool
+}
+
+class RoutingRule {
+  + ID: string
+  + Priority: int
+  + Condition: string
+  + TargetStorage: string
+  + Enabled: bool
+  --
+  + Evaluate(data *Data) bool
+}
+
+note right of StorageRouter
+  **路由规则示例**:
+
+  ```yaml
+  rules:
+    - id: "large_data"
+      priority: 1
+      condition: "data_size >= 1048576"
+      target: "mongodb"
+
+    - id: "binary_data"
+      priority: 2
+      condition: "data_type == 'binary'"
+      target: "file_storage"
+
+    - id: "log_data"
+      priority: 3
+      condition: "task_type == 'log'"
+      target: "elasticsearch"
+
+    - id: "default"
+      priority: 99
+      condition: "true"
+      target: "postgresql"
+  ```
+
+  **规则匹配逻辑**:
+  - 按priority升序排序
+  - 依次评估condition表达式
+  - 返回第一个匹配的target
+  - 无匹配使用defaultStorage
+end note
+
+' 批量写入器
+class BatchWriter {
+  - buffer: []*Data
+  - bufferSize: int
+  - flushInterval: time.Duration
+  - router: *StorageRouter
+  - storages: map[string]Storage
+  - mu: sync.Mutex
+  - flushChan: chan struct{}
+  --
+  + AddToBatch(data *Data) error
+  + Flush() error
+  + Start()
+  + Stop()
+  --
+  - shouldFlush() bool
+  - flushBatch() error
+  - routeAndGroupData() map[string][]*Data
+}
+
+note right of BatchWriter
+  **批量写入优化**:
+
+  触发刷新条件（满足任一）:
+  1. 缓冲区大小 >= bufferSize
+  2. 距上次刷新 >= flushInterval
+  3. 收到强制flush信号
+
+  配置示例:
+  - bufferSize: 1000条
+  - flushInterval: 10秒
+  - worker数量: 5个
+
+  **工作流程**:
+  1. 数据写入缓冲区
+  2. 达到阈值触发刷新
+  3. 按路由规则分组
+  4. 并发批量写入各存储
+  5. 清空缓冲区
+end note
+
+' 指标收集器
+class StorageMetrics {
+  + WriteCount: int64
+  + WriteBytes: int64
+  + ErrorCount: int64
+  + RetryCount: int64
+  + AvgLatency: time.Duration
+  + LastWriteTime: time.Time
+  --
+  + RecordWrite(bytes int64, latency time.Duration)
+  + RecordError()
+  + RecordRetry()
+  + Reset()
+  + ToPrometheusMetrics() map[string]interface{}
+}
+
+' 数据模型
+class Data {
+  + ID: string
+  + TaskID: string
+  + SourceID: string
+  + DataType: string
+  + Size: int64
+  + Fields: map[string]interface{}
+  + Metadata: map[string]interface{}
+  + CreatedAt: time.Time
+  --
+  + Validate() error
+  + ToJSON() ([]byte, error)
+  + ToCSV() ([]byte, error)
+}
+
+' 关系定义
+Storage <|.. PostgreSQLStorage : implements
+Storage <|.. MongoDBStorage : implements
+Storage <|.. FileStorage : implements
+
+StorageConfig <|-- PostgreSQLConfig : extends
+StorageConfig <|-- MongoDBConfig : extends
+StorageConfig <|-- FileStorageConfig : extends
+
+PostgreSQLStorage *-- ConnectionPool : uses
+PostgreSQLStorage *-- StorageMetrics : has
+MongoDBStorage *-- StorageMetrics : has
+FileStorage *-- StorageMetrics : has
+
+PostgreSQLStorage ..> RetryManager : uses
+MongoDBStorage ..> RetryManager : uses
+FileStorage ..> RetryManager : uses
+
+BatchWriter *-- StorageRouter : has
+BatchWriter o-- Storage : manages multiple
+StorageRouter *-- RoutingRule : has many
+
+' 组合关系
+PostgreSQLStorage --> PostgreSQLConfig : uses
+MongoDBStorage --> MongoDBConfig : uses
+FileStorage --> FileStorageConfig : uses
+
+BatchWriter --> Data : processes
+
+@enduml

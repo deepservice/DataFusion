@@ -1,0 +1,184 @@
+@startuml
+skinparam backgroundColor white
+skinparam shadowing false
+
+skinparam activity {
+    BackgroundColor<<Success>> LightGreen
+    BackgroundColor<<Failed>> LightCoral
+    BackgroundColor<<Compensate>> LightYellow
+    BorderColor<<Success>> Green
+    BorderColor<<Failed>> Red
+    BorderColor<<Compensate>> Orange
+}
+
+title 分布式事务处理流程图（Saga模式）
+
+|写入协调器|
+start
+
+:接收批量写入请求\n(包含多存储目标);
+
+note right
+  **批量写入请求示例**:
+  {
+    "batch_id": "batch_12345",
+    "timestamp": "2025-10-26T10:30:00Z",
+    "data_count": 500,
+    "targets": [
+      {"storage": "postgresql", "data": [...]},
+      {"storage": "mongodb", "data": [...]},
+      {"storage": "elasticsearch", "data": [...]}
+    ]
+  }
+end note
+
+:创建Saga事务\n生成transaction_id;
+
+:初始化补偿日志\n(Compensation Log);
+
+note right
+  **补偿日志内容**:
+  - transaction_id
+  - batch_id
+  - 各存储的写入状态
+  - 补偿操作列表
+  - 创建时间
+end note
+
+|PostgreSQL存储|
+
+:执行PostgreSQL写入;
+
+partition "PostgreSQL写入" <<Success>> {
+    :开启事务\nBEGIN;
+
+    :执行COPY批量导入;
+
+    if (写入成功?) then (是)
+        :提交事务\nCOMMIT;
+        :记录写入日志\n(包含行ID列表);
+        #LightGreen:PostgreSQL写入成功;
+    else (否)
+        :回滚事务\nROLLBACK;
+        #LightCoral:PostgreSQL写入失败;
+        |写入协调器|
+        :标记Saga事务失败;
+        :触发补偿流程;
+        stop
+    endif
+}
+
+|MongoDB存储|
+
+:执行MongoDB写入;
+
+partition "MongoDB写入" <<Success>> {
+    :构建BulkWrite操作;
+
+    :执行批量写入\ninsertMany();
+
+    if (写入成功?) then (是)
+        :记录文档ID列表;
+        #LightGreen:MongoDB写入成功;
+    else (否)
+        #LightCoral:MongoDB写入失败;
+        |写入协调器|
+        :标记Saga事务失败;
+        :触发补偿流程;
+        note right
+          **补偿操作**:
+          1. 删除已写入PostgreSQL的数据
+          2. 记录失败原因
+          3. 更新补偿日志
+        end note
+        |补偿处理|
+        :开始补偿PostgreSQL;
+        partition "补偿PostgreSQL" <<Compensate>> {
+            :连接PostgreSQL;
+            :根据记录的行ID列表;
+            :执行DELETE语句;
+            if (删除成功?) then (是)
+                #LightYellow:补偿成功\nPostgreSQL数据已删除;
+            else (否)
+                #LightCoral:补偿失败\n记录到补偿失败日志;
+            endif
+        }
+        |写入协调器|
+        stop
+    endif
+}
+
+|Elasticsearch存储|
+
+:执行Elasticsearch写入;
+
+partition "Elasticsearch写入" <<Success>> {
+    :构建Bulk请求;
+
+    :执行批量索引\nbulk();
+
+    if (写入成功?) then (是)
+        :记录文档ID列表;
+        #LightGreen:Elasticsearch写入成功;
+    else (否)
+        #LightCoral:Elasticsearch写入失败;
+        |写入协调器|
+        :标记Saga事务失败;
+        :触发补偿流程;
+        |补偿处理|
+        :并行补偿已成功的存储;
+        fork
+            :补偿PostgreSQL;
+            partition "补偿PostgreSQL" <<Compensate>> {
+                :DELETE FROM table\nWHERE id IN (...);
+                #LightYellow:PostgreSQL补偿完成;
+            }
+        fork again
+            :补偿MongoDB;
+            partition "补偿MongoDB" <<Compensate>> {
+                :deleteMany({\n  _id: {$in: [...]}\n});
+                #LightYellow:MongoDB补偿完成;
+            }
+        end fork
+        |写入协调器|
+        stop
+    endif
+}
+
+|写入协调器|
+
+:所有存储写入成功;
+
+:更新补偿日志状态\n(status = "committed");
+
+:清理临时补偿数据\n(TTL = 7天);
+
+note right
+  **最终一致性保证**:
+
+  1. 所有存储都成功 → 提交事务
+  2. 任意存储失败 → 补偿已成功的存储
+  3. 补偿失败 → 记录到补偿失败日志
+  4. 定时任务扫描补偿失败日志并重试
+
+  **补偿失败处理**:
+  - 记录详细错误信息
+  - 触发告警通知
+  - 人工介入处理
+  - 定时重试机制
+end note
+
+note right
+  **补偿失败重试机制**:
+  - 定时任务每5分钟扫描补偿失败日志
+  - 按指数退避算法重试，最多10次
+  - 仍失败则触发严重告警
+  - 邮件通知DBA和运维团队
+  - 提供补偿脚本模板供人工介入
+end note
+
+#LightGreen:返回成功结果;
+
+stop
+
+@enduml
