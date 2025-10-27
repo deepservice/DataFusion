@@ -1,0 +1,149 @@
+@startuml
+skinparam backgroundColor white
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+title 数据处理模块组件架构图
+
+package "数据处理模块 (Processor Module)" {
+
+    ' 接口层
+    package "接口层 (Interface Layer)" {
+        [Processor接口] <<interface>> as ProcessorIface
+        note right of ProcessorIface
+          核心处理接口
+          Process(rawData) -> ProcessedData
+        end note
+    }
+
+    ' 管道编排层
+    package "管道编排层 (Pipeline Orchestration)" {
+        [Pipeline Manager] as PipelineMgr
+        [Stage Executor] as StageExec
+        [Error Handler] as ErrorHandler
+        [Middleware Chain] as Middleware
+
+        note right of PipelineMgr
+          负责:
+          - 管道构建
+          - 阶段调度
+          - 上下文传递
+        end note
+    }
+
+    ' 处理器层
+    package "处理器层 (Processor Layer)" {
+        [Parser\n数据解析器] as Parser
+        [Cleaner\n数据清洗器] as Cleaner
+        [Transformer\n数据转换器] as Transformer
+        [Deduplicator\n数据去重器] as Deduplicator
+
+        ' Parser子组件
+        package "Parser子组件" {
+            [HTML Parser\n(goquery)] as HTMLParser
+            [JSON Parser\n(gjson)] as JSONParser
+            [XML Parser\n(xmlpath)] as XMLParser
+            [CSV Parser] as CSVParser
+        }
+
+        ' Cleaner子组件
+        package "Cleaner子组件" {
+            [Rule Engine\n规则引擎] as RuleEngine
+            [Built-in Functions\n内置函数库] as BuiltinFuncs
+            [Script Engine\n(expr)] as ScriptEngine
+        }
+
+        ' Transformer子组件
+        package "Transformer子组件" {
+            [Field Mapper\n字段映射器] as FieldMapper
+            [Type Converter\n类型转换器] as TypeConverter
+        }
+
+        ' Deduplicator子组件
+        package "Deduplicator子组件" {
+            [Hash Calculator\n哈希计算器] as HashCalc
+            [Bloom Filter\n布隆过滤器] as BloomFilter
+            [Diff Engine\n差异引擎] as DiffEngine
+        }
+    }
+
+    ' 工具层
+    package "工具层 (Utility Layer)" {
+        [Config Loader\n配置加载器] as ConfigLoader
+        [Cache Manager\n缓存管理器] as CacheManager
+        [Metrics Collector\n指标收集器] as MetricsCollector
+        [Logger] as Logger
+    }
+
+    ' 数据存储
+    database "配置存储" {
+        [PostgreSQL\n规则配置] as PG
+        [Redis\n热配置缓存] as RedisConfig
+    }
+
+    database "去重存储" {
+        [Redis\n去重缓存] as RedisDedup
+    }
+}
+
+' 外部系统
+component "Worker节点" as Worker
+component "存储模块" as Storage
+component "监控系统" as Monitor
+
+' 关系连接 - 接口层
+Worker --> ProcessorIface : 调用处理接口
+ProcessorIface --> PipelineMgr : 委托给管道管理器
+
+' 关系连接 - 管道编排层
+PipelineMgr --> StageExec : 执行各个处理阶段
+PipelineMgr --> Middleware : 应用中间件
+PipelineMgr --> ErrorHandler : 错误处理
+StageExec --> Parser : Stage 1: 解析
+StageExec --> Cleaner : Stage 2: 清洗
+StageExec --> Transformer : Stage 3: 转换
+StageExec --> Deduplicator : Stage 4: 去重
+
+' 关系连接 - Parser
+Parser --> HTMLParser : HTML数据
+Parser --> JSONParser : JSON数据
+Parser --> XMLParser : XML数据
+Parser --> CSVParser : CSV数据
+
+' 关系连接 - Cleaner
+Cleaner --> RuleEngine : 加载规则
+RuleEngine --> BuiltinFuncs : 调用内置函数
+RuleEngine --> ScriptEngine : 执行自定义脚本
+
+' 关系连接 - Transformer
+Transformer --> FieldMapper : 字段映射
+Transformer --> TypeConverter : 类型转换
+
+' 关系连接 - Deduplicator
+Deduplicator --> HashCalc : 计算哈希
+Deduplicator --> BloomFilter : 快速判重
+Deduplicator --> DiffEngine : 增量对比
+Deduplicator --> RedisDedup : 查询/存储去重键
+
+' 关系连接 - 工具层
+PipelineMgr ..> ConfigLoader : 使用
+ConfigLoader --> PG : 加载规则
+ConfigLoader --> RedisConfig : 读取缓存
+PipelineMgr ..> CacheManager : 使用
+PipelineMgr ..> Logger : 日志记录
+PipelineMgr ..> MetricsCollector : 收集指标
+
+' 输出
+PipelineMgr --> Storage : 处理结果
+MetricsCollector --> Monitor : 推送指标
+
+' 图例
+legend right
+  |= 符号 |= 说明 |
+  | --> | 直接调用/依赖 |
+  | ..> | 间接使用 |
+  | <<interface>> | 接口定义 |
+endlegend
+
+@enduml

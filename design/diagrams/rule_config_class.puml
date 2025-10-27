@@ -1,0 +1,286 @@
+@startuml
+skinparam backgroundColor white
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+title 数据处理规则配置类图
+
+' 主配置类
+class ProcessorConfig {
+  + task_id: string
+  + data_source_id: string
+  + parse_rules: ParseRules
+  + clean_rules: CleanRules
+  + transform_rules: TransformRules
+  + deduplicate_config: DeduplicateConfig
+  + version: int
+  + created_at: time.Time
+  + updated_at: time.Time
+  --
+  + Validate() error
+  + ToJSON() string
+  + FromJSON(json) error
+}
+
+' 解析规则
+class ParseRules {
+  + data_format: string
+  + field_rules: []FieldParseRule
+  + encoding: string
+  --
+  + GetParser() Parser
+}
+
+class FieldParseRule {
+  + field_name: string
+  + selector_type: string
+  + selector: string
+  + is_array: bool
+  + default_value: interface{}
+  --
+  + Execute(doc) interface{}
+}
+
+note right of FieldParseRule
+  selector_type可选值:
+  - "css": CSS Selector
+  - "xpath": XPath表达式
+  - "jsonpath": JSONPath表达式
+  - "regex": 正则表达式
+  - "column_index": CSV列索引
+  - "column_name": CSV列名
+
+  示例:
+  {
+    "field_name": "title",
+    "selector_type": "css",
+    "selector": "h1.title",
+    "is_array": false
+  }
+end note
+
+' 清洗规则
+class CleanRules {
+  + field_rules: map[string]FieldCleanRule
+  + global_rules: []CleanFunction
+  --
+  + Apply(data) map[string]interface{}
+}
+
+class FieldCleanRule {
+  + field_name: string
+  + functions: []CleanFunction
+  + required: bool
+  + validation: ValidationRule
+  --
+  + Clean(value) interface{}
+}
+
+class CleanFunction {
+  + function_name: string
+  + parameters: map[string]interface{}
+  --
+  + Execute(value) interface{}
+}
+
+note right of CleanFunction
+  内置清洗函数:
+  1. trim() - 去除首尾空格
+  2. stripHTML() - 去除HTML标签
+  3. removeNoiseText(patterns) - 去除干扰文本
+  4. dateNormalize(format) - 日期标准化
+  5. standardizeEnum(mapping) - 枚举标准化
+  6. regexReplace(pattern, replacement) - 正则替换
+  7. upper() / lower() - 大小写转换
+  8. truncate(maxLength) - 截断字符串
+  9. removeEmoji() - 去除emoji
+  10. normalizeWhitespace() - 标准化空白字符
+  11. extractNumbers() - 提取数字
+  12. extractURL() - 提取URL
+  13. removeSpecialChars() - 去除特殊字符
+  14. custom(script) - 自定义expr脚本
+
+  示例:
+  {
+    "function_name": "regexReplace",
+    "parameters": {
+      "pattern": "\\s+",
+      "replacement": " "
+    }
+  }
+end note
+
+class ValidationRule {
+  + type: string
+  + min_length: int
+  + max_length: int
+  + pattern: string
+  + enum_values: []string
+  --
+  + Validate(value) error
+}
+
+' 转换规则
+class TransformRules {
+  + field_mappings: []FieldMapping
+  + output_schema: map[string]FieldSchema
+  --
+  + Transform(data) map[string]interface{}
+}
+
+class FieldMapping {
+  + source_field: string
+  + target_field: string
+  + type_convert: TypeConversion
+  + transform_script: string
+  --
+  + Apply(sourceData) interface{}
+}
+
+class TypeConversion {
+  + source_type: string
+  + target_type: string
+  + format: string
+  --
+  + Convert(value) interface{}
+}
+
+note right of TypeConversion
+  支持的类型转换:
+  - string -> int/int64
+  - string -> float/float64
+  - string -> bool
+  - string -> time.Time (指定format)
+  - string -> []string (JSON数组)
+  - string -> map[string]interface{} (JSON对象)
+  - int -> string
+  - float -> string
+  - time.Time -> string (指定format)
+
+  示例:
+  {
+    "source_type": "string",
+    "target_type": "time.Time",
+    "format": "2006-01-02 15:04:05"
+  }
+end note
+
+class FieldSchema {
+  + field_name: string
+  + data_type: string
+  + nullable: bool
+  + default_value: interface{}
+  + description: string
+}
+
+' 去重配置
+class DeduplicateConfig {
+  + enabled: bool
+  + strategy: string
+  + key_fields: []string
+  + ttl_seconds: int
+  + update_strategy: string
+  --
+  + GenerateKey(data) string
+}
+
+note right of DeduplicateConfig
+  去重策略(strategy):
+  - "primary_key": 基于主键字段组合
+  - "content_hash": 基于内容哈希
+  - "url_time": 基于URL+采集时间
+
+  更新策略(update_strategy):
+  - "skip": 跳过重复数据
+  - "replace": 使用新数据替换
+  - "merge": 合并新旧数据
+
+  示例:
+  {
+    "enabled": true,
+    "strategy": "primary_key",
+    "key_fields": ["url", "title"],
+    "ttl_seconds": 604800,
+    "update_strategy": "skip"
+  }
+end note
+
+' 增量更新配置
+class IncrementalConfig {
+  + enabled: bool
+  + snapshot_storage: string
+  + diff_fields: []string
+  + change_detection: string
+  --
+  + DetectChanges(old, new) ChangeSet
+}
+
+class ChangeSet {
+  + added: []map[string]interface{}
+  + updated: []map[string]interface{}
+  + deleted: []map[string]interface{}
+  + unchanged_count: int
+  --
+  + HasChanges() bool
+}
+
+' 关系定义
+ProcessorConfig "1" *-- "1" ParseRules
+ProcessorConfig "1" *-- "1" CleanRules
+ProcessorConfig "1" *-- "1" TransformRules
+ProcessorConfig "1" *-- "1" DeduplicateConfig
+ProcessorConfig "1" *-- "0..1" IncrementalConfig
+
+ParseRules "1" *-- "many" FieldParseRule
+
+CleanRules "1" *-- "many" FieldCleanRule
+FieldCleanRule "1" *-- "many" CleanFunction
+FieldCleanRule "1" *-- "0..1" ValidationRule
+
+TransformRules "1" *-- "many" FieldMapping
+TransformRules "1" *-- "many" FieldSchema
+FieldMapping "1" *-- "0..1" TypeConversion
+
+IncrementalConfig "1" ..> "1" ChangeSet : creates
+
+' 配置管理器
+class ConfigManager {
+  + db: *PostgreSQL
+  + cache: *Redis
+  + pubsub: *RedisPubSub
+  --
+  + LoadConfig(taskID) ProcessorConfig
+  + SaveConfig(config) error
+  + UpdateConfig(config) error
+  + DeleteConfig(taskID) error
+  + WatchConfigChanges(callback)
+  + InvalidateCache(taskID)
+}
+
+note right of ConfigManager
+  配置管理功能:
+
+  1. **持久化存储**: PostgreSQL
+     - 表: processor_configs
+     - 版本控制: version字段自增
+
+  2. **缓存策略**: Redis
+     - Key: processor:config:{task_id}
+     - TTL: 1小时
+     - 更新时主动失效
+
+  3. **热更新机制**: Redis Pub/Sub
+     - Channel: processor:config:update
+     - 消息格式: {"task_id": "xxx", "action": "update"}
+     - Worker订阅该Channel，收到消息后重新加载配置
+
+  4. **配置验证**:
+     - JSON Schema验证
+     - 字段类型检查
+     - 规则语法检查（CSS/XPath/JSONPath/Regex）
+end note
+
+ConfigManager ..> ProcessorConfig : manages
+
+@enduml

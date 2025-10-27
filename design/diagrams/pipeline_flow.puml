@@ -1,0 +1,250 @@
+@startuml
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam defaultFontName Arial
+
+title 数据处理Pipeline流程图（责任链模式）
+
+participant "Worker" as Worker
+participant "Pipeline\nManager" as Pipeline
+participant "Parser\nStage" as Parser
+participant "Cleaner\nStage" as Cleaner
+participant "Transformer\nStage" as Transformer
+participant "Deduplicator\nStage" as Deduplicator
+participant "Storage\nModule" as Storage
+participant "Redis\n缓存" as Redis
+participant "Metrics\nCollector" as Metrics
+
+autonumber
+
+== Pipeline初始化阶段 ==
+
+Worker -> Pipeline: Process(rawData, config)
+activate Pipeline
+
+Pipeline -> Pipeline: 构建处理链
+note right
+  根据配置动态构建Stage链:
+  Parser -> Cleaner -> Transformer -> Deduplicator
+
+  每个Stage实现相同接口:
+  - Execute(ctx, data) (data, error)
+  - SetNext(stage)
+end note
+
+Pipeline -> Redis: 加载配置缓存
+Redis --> Pipeline: 返回规则配置
+
+Pipeline -> Pipeline: 创建上下文Context
+note right
+  Context包含:
+  - TaskID
+  - TaskConfig
+  - StartTime
+  - Logger
+  - Metrics
+  - 共享数据存储
+end note
+
+== Stage 1: 数据解析阶段 ==
+
+Pipeline -> Parser: Execute(ctx, rawData)
+activate Parser
+
+Parser -> Parser: 识别数据格式\n(HTML/JSON/XML/CSV)
+
+alt 格式为HTML
+    Parser -> Parser: goquery解析HTML
+    Parser -> Parser: 应用CSS Selector规则
+    Parser -> Parser: 提取字段
+else 格式为JSON
+    Parser -> Parser: gjson解析JSON
+    Parser -> Parser: 应用JSONPath表达式
+    Parser -> Parser: 提取字段
+else 格式为XML
+    Parser -> Parser: xmlpath解析XML
+    Parser -> Parser: 应用XPath表达式
+    Parser -> Parser: 提取字段
+else 格式为CSV
+    Parser -> Parser: encoding/csv解析
+    Parser -> Parser: 按列索引提取字段
+end
+
+Parser -> Metrics: 记录解析耗时
+Parser --> Pipeline: 返回StructuredData
+deactivate Parser
+
+note right of Parser
+  解析结果:
+  map[string]interface{}{
+    "title": "...",
+    "content": "...",
+    "author": "...",
+  }
+end note
+
+== Stage 2: 数据清洗阶段 ==
+
+Pipeline -> Cleaner: Execute(ctx, structuredData)
+activate Cleaner
+
+Cleaner -> Redis: 获取清洗规则
+Redis --> Cleaner: 返回规则列表
+
+loop 遍历每个字段
+    Cleaner -> Cleaner: 加载字段清洗规则
+
+    alt 有清洗规则
+        Cleaner -> Cleaner: trim() - 去除空格
+        Cleaner -> Cleaner: stripHTML() - 去除HTML标签
+        Cleaner -> Cleaner: dateNormalize() - 日期标准化
+        Cleaner -> Cleaner: removeNoiseText() - 去除干扰文本
+        Cleaner -> Cleaner: regexReplace() - 正则替换
+
+        opt 有自定义脚本
+            Cleaner -> Cleaner: expr引擎执行脚本
+        end
+
+        Cleaner -> Cleaner: 更新字段值
+    else 无规则
+        Cleaner -> Cleaner: 保持原值
+    end
+end
+
+Cleaner -> Metrics: 记录清洗统计
+Cleaner --> Pipeline: 返回CleanedData
+deactivate Cleaner
+
+== Stage 3: 数据转换阶段 ==
+
+Pipeline -> Transformer: Execute(ctx, cleanedData)
+activate Transformer
+
+Transformer -> Transformer: 加载字段映射规则
+note right
+  映射规则示例:
+  source_field -> target_field
+  "pub_time" -> "publish_date"
+  "author_name" -> "author"
+
+  类型转换:
+  "123" (string) -> 123 (int)
+  "2025-10-26" (string) -> time.Time
+end note
+
+loop 遍历映射规则
+    Transformer -> Transformer: 读取源字段值
+
+    alt 需要类型转换
+        Transformer -> Transformer: string -> int/float/date/json
+    end
+
+    Transformer -> Transformer: 设置目标字段值
+end
+
+Transformer -> Transformer: 构造目标数据结构
+
+Transformer -> Metrics: 记录转换统计
+Transformer --> Pipeline: 返回TransformedData
+deactivate Transformer
+
+== Stage 4: 数据去重阶段 ==
+
+Pipeline -> Deduplicator: Execute(ctx, transformedData)
+activate Deduplicator
+
+Deduplicator -> Deduplicator: 读取去重配置
+note right
+  去重策略:
+  1. 主键去重: md5(field1+field2+...)
+  2. 内容哈希: sha256(json.dumps(data))
+  3. URL+时间: url + "_" + timestamp
+end note
+
+alt 策略1: 主键去重
+    Deduplicator -> Deduplicator: 计算主键组合\nkey = md5(field1+field2+...)
+else 策略2: 内容哈希
+    Deduplicator -> Deduplicator: 计算内容哈希\nkey = sha256(json)
+else 策略3: URL+时间
+    Deduplicator -> Deduplicator: 组合URL和时间\nkey = url + "_" + ts
+end
+
+Deduplicator -> Redis: EXISTS(key)
+Redis --> Deduplicator: 1=存在 / 0=不存在
+
+alt key已存在（重复数据）
+    Deduplicator -> Deduplicator: 标记为重复
+    Deduplicator -> Metrics: duplicated_count++
+
+    alt 更新策略=替换
+        Deduplicator -> Deduplicator: 使用新数据
+        Deduplicator -> Redis: SET(key, data, TTL=7天)
+    else 更新策略=跳过
+        Deduplicator -> Deduplicator: 丢弃数据
+        Deduplicator --> Pipeline: 返回nil（跳过存储）
+        deactivate Deduplicator
+        Pipeline --> Worker: 处理完成（已跳过）
+        deactivate Pipeline
+        note right
+          重复数据被跳过
+          不进入存储模块
+        end note
+    end
+
+else key不存在（新数据）
+    Deduplicator -> Deduplicator: 标记为新数据
+    Deduplicator -> Redis: SET(key, 1, TTL=7天)
+    Deduplicator -> Metrics: new_count++
+end
+
+Deduplicator --> Pipeline: 返回FinalData
+deactivate Deduplicator
+
+== 数据存储阶段 ==
+
+Pipeline -> Metrics: 收集整体统计
+note right
+  统计信息:
+  - total_count: 总数
+  - parsed_count: 解析成功数
+  - cleaned_count: 清洗成功数
+  - duplicated_count: 去重数
+  - final_count: 最终数
+  - total_duration: 总耗时
+  - parse_duration: 解析耗时
+  - clean_duration: 清洗耗时
+  - transform_duration: 转换耗时
+  - deduplicate_duration: 去重耗时
+end note
+
+Pipeline -> Storage: Save(finalData, metadata)
+activate Storage
+Storage --> Pipeline: 存储成功
+deactivate Storage
+
+Pipeline --> Worker: 返回处理结果
+deactivate Pipeline
+
+== 异常处理流程 ==
+
+note over Pipeline
+  每个Stage的错误处理:
+
+  1. **可恢复错误**:
+     - 记录日志，继续处理
+     - 例如: 某个字段解析失败，其他字段继续
+
+  2. **不可恢复错误**:
+     - 中断Pipeline，返回错误
+     - 例如: 数据格式完全无法识别
+
+  3. **重试机制**:
+     - 网络错误: 指数退避重试3次
+     - Redis连接失败: 降级处理（跳过缓存）
+
+  4. **降级策略**:
+     - Redis不可用: 跳过去重检查
+     - 规则加载失败: 使用默认规则
+end note
+
+@enduml

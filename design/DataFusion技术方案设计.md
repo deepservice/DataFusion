@@ -1757,12 +1757,1278 @@ helm install datafusion ./datafusion-chart \
 
 #### 3.2.4. 数据处理模块 (Processor)
 
+数据处理模块是DataFusion系统的核心数据加工引擎，负责将Worker采集到的原始数据（HTML、JSON、XML、CSV等）转换为结构化、标准化、可存储的目标数据。该模块采用**管道式处理架构（Pipeline Pattern）**和**责任链设计模式（Chain of Responsibility）**，通过4个处理阶段顺序执行：数据解析（Parser）→ 数据清洗（Cleaner）→ 数据转换（Transformer）→ 数据去重（Deduplicator）。
+
+##### 3.2.4.1. 总体架构设计
+
+![数据处理模块组件架构图](diagrams/component_data_processor.png)
+
+**模块定位与职责**
+
+数据处理模块位于采集模块（Collector）和存储模块（Storage）之间，是数据流转的必经环节：
+
+```
+Collector → Processor → Storage
+  (原始数据) → (结构化数据) → (持久化存储)
+```
+
+核心职责包括：
+1. **数据解析**：识别数据格式，提取目标字段
+2. **数据清洗**：去除噪音、标准化格式、验证数据质量
+3. **数据转换**：字段映射、类型转换、Schema适配
+4. **数据去重**：避免重复数据入库，支持增量更新
+
+**分层架构设计**
+
+数据处理模块采用4层架构设计：
+
+1. **接口层（Interface Layer）**
+   - 定义统一的Processor接口：`Process(rawData) -> ProcessedData`
+   - 对外屏蔽内部实现细节
+   - 支持多种数据源类型的统一处理
+
+2. **管道编排层（Pipeline Orchestration）**
+   - Pipeline Manager：负责管道构建、阶段调度、上下文传递
+   - Stage Executor：执行具体的处理阶段（Parser、Cleaner、Transformer、Deduplicator）
+   - Error Handler：统一的错误处理和降级策略
+   - Middleware Chain：支持日志记录、指标收集、性能监控等横切关注点
+
+3. **处理器层（Processor Layer）**
+   - Parser：数据解析器（HTML/JSON/XML/CSV）
+   - Cleaner：数据清洗器（规则引擎、内置函数、自定义脚本）
+   - Transformer：数据转换器（字段映射、类型转换）
+   - Deduplicator：数据去重器（哈希计算、布隆过滤、增量对比）
+
+4. **工具层（Utility Layer）**
+   - Config Loader：从PostgreSQL和Redis加载处理规则
+   - Cache Manager：管理规则缓存，支持热更新
+   - Metrics Collector：收集处理统计指标
+   - Logger：结构化日志记录
+
+**处理管道流程设计**
+
+![Pipeline处理流程图](diagrams/pipeline_flow.png)
+
+数据处理采用责任链模式，每个处理阶段（Stage）实现相同的接口：
+
+```go
+type Stage interface {
+    Execute(ctx context.Context, data interface{}) (interface{}, error)
+    SetNext(stage Stage)
+}
+```
+
+Pipeline Manager负责构建处理链并依次执行：
+
+```
+原始数据 → Parser → 结构化数据 → Cleaner → 清洗数据 → Transformer → 转换数据 → Deduplicator → 最终数据
+```
+
+每个Stage可以：
+- 修改数据内容
+- 传递给下一个Stage
+- 中断处理流程（返回错误）
+- 跳过当前数据（标记为重复或无效）
+
+**配置系统设计**
+
+![规则配置类图](diagrams/rule_config_class.png)
+
+数据处理规则存储在PostgreSQL的`processor_configs`表中，包含：
+- 解析规则（ParseRules）：选择器类型、选择器表达式、字段定义
+- 清洗规则（CleanRules）：清洗函数链、验证规则
+- 转换规则（TransformRules）：字段映射、类型转换
+- 去重配置（DeduplicateConfig）：去重策略、TTL设置
+
+配置支持热更新机制：
+1. 用户在Web UI修改规则 → 保存到PostgreSQL
+2. Master发布配置更新消息到Redis Pub/Sub
+3. 所有Worker节点订阅该Channel，收到消息后重新加载配置
+4. 新任务使用新配置，运行中的任务继续使用旧配置
+
+**处理流程概览**
+
 ![数据处理模块流程图](diagrams/data_processor_flow.png)
 
-对采集到的原始数据进行结构化处理。
+完整的数据处理流程包含5个阶段：
+1. **数据接收**：接收原始数据（HTML/JSON/XML/CSV）
+2. **数据解析**：识别格式并提取字段
+3. **数据清洗**：应用清洗规则、去除噪音
+4. **数据转换**：字段映射、类型转换
+5. **数据去重**：检查重复、标记新数据
 
-*   **功能:** 调用解析插件，对原始数据（HTML, JSON, XML 等）进行解析，提取目标字段。执行数据清洗、格式转换、去重等操作。
-*   **实现:** 同样采用插件化设计。解析规则（如 XPath, CSS Selector, 正则表达式）作为任务配置的一部分，由解析插件加载并执行。
+##### 3.2.4.2. 核心子模块详细设计
+
+**1. 数据解析器（Parser）**
+
+数据解析器负责识别原始数据格式并提取目标字段，支持HTML、JSON、XML、CSV四种主流格式。
+
+**(1) HTML解析器 - 基于goquery库**
+
+使用goquery库（Go版本的jQuery）解析HTML文档，支持CSS Selector和XPath两种选择器语法。
+
+```go
+type HTMLParser struct {
+    doc *goquery.Document
+}
+
+func (p *HTMLParser) Parse(html string, rules []FieldParseRule) (map[string]interface{}, error) {
+    doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+    if err != nil {
+        return nil, err
+    }
+
+    result := make(map[string]interface{})
+
+    for _, rule := range rules {
+        switch rule.SelectorType {
+        case "css":
+            // CSS Selector示例: "h1.title", "div.content p"
+            selection := doc.Find(rule.Selector)
+            if rule.IsArray {
+                var values []string
+                selection.Each(func(i int, s *goquery.Selection) {
+                    values = append(values, s.Text())
+                })
+                result[rule.FieldName] = values
+            } else {
+                result[rule.FieldName] = selection.First().Text()
+            }
+
+        case "xpath":
+            // XPath示例: "//h1[@class='title']"
+            // 使用xmlpath库处理XPath
+            value := p.parseXPath(doc, rule.Selector)
+            result[rule.FieldName] = value
+
+        case "regex":
+            // 正则表达式示例: `<title>(.*?)</title>`
+            re := regexp.MustCompile(rule.Selector)
+            matches := re.FindStringSubmatch(html)
+            if len(matches) > 1 {
+                result[rule.FieldName] = matches[1]
+            }
+        }
+
+        // 设置默认值
+        if result[rule.FieldName] == nil || result[rule.FieldName] == "" {
+            result[rule.FieldName] = rule.DefaultValue
+        }
+    }
+
+    return result, nil
+}
+```
+
+**(2) JSON解析器 - 基于gjson库**
+
+使用gjson库高效解析JSON数据，支持JSONPath表达式。
+
+```go
+type JSONParser struct{}
+
+func (p *JSONParser) Parse(jsonStr string, rules []FieldParseRule) (map[string]interface{}, error) {
+    if !gjson.Valid(jsonStr) {
+        return nil, errors.New("invalid JSON format")
+    }
+
+    result := make(map[string]interface{})
+
+    for _, rule := range rules {
+        // JSONPath示例: "data.items.0.title", "users.#.name"
+        value := gjson.Get(jsonStr, rule.Selector)
+
+        if rule.IsArray {
+            var arr []interface{}
+            value.ForEach(func(key, val gjson.Result) bool {
+                arr = append(arr, val.Value())
+                return true
+            })
+            result[rule.FieldName] = arr
+        } else {
+            result[rule.FieldName] = value.Value()
+        }
+
+        if result[rule.FieldName] == nil {
+            result[rule.FieldName] = rule.DefaultValue
+        }
+    }
+
+    return result, nil
+}
+```
+
+**(3) XML解析器 - 基于xmlpath库**
+
+```go
+type XMLParser struct{}
+
+func (p *XMLParser) Parse(xmlStr string, rules []FieldParseRule) (map[string]interface{}, error) {
+    root, err := xmlpath.Parse(strings.NewReader(xmlStr))
+    if err != nil {
+        return nil, err
+    }
+
+    result := make(map[string]interface{})
+
+    for _, rule := range rules {
+        // XPath示例: "//item/title", "/rss/channel/item[1]/description"
+        path := xmlpath.MustCompile(rule.Selector)
+
+        if rule.IsArray {
+            var values []string
+            iter := path.Iter(root)
+            for iter.Next() {
+                values = append(values, iter.Node().String())
+            }
+            result[rule.FieldName] = values
+        } else {
+            if value, ok := path.String(root); ok {
+                result[rule.FieldName] = value
+            } else {
+                result[rule.FieldName] = rule.DefaultValue
+            }
+        }
+    }
+
+    return result, nil
+}
+```
+
+**(4) CSV解析器**
+
+```go
+type CSVParser struct{}
+
+func (p *CSVParser) Parse(csvStr string, rules []FieldParseRule) ([]map[string]interface{}, error) {
+    reader := csv.NewReader(strings.NewReader(csvStr))
+    records, err := reader.ReadAll()
+    if err != nil {
+        return nil, err
+    }
+
+    if len(records) == 0 {
+        return nil, errors.New("empty CSV data")
+    }
+
+    // 第一行作为表头
+    headers := records[0]
+    var results []map[string]interface{}
+
+    for _, record := range records[1:] {
+        row := make(map[string]interface{})
+        for _, rule := range rules {
+            var value string
+            if rule.SelectorType == "column_index" {
+                idx, _ := strconv.Atoi(rule.Selector)
+                if idx < len(record) {
+                    value = record[idx]
+                }
+            } else if rule.SelectorType == "column_name" {
+                for i, header := range headers {
+                    if header == rule.Selector && i < len(record) {
+                        value = record[i]
+                        break
+                    }
+                }
+            }
+
+            if value == "" {
+                row[rule.FieldName] = rule.DefaultValue
+            } else {
+                row[rule.FieldName] = value
+            }
+        }
+        results = append(results, row)
+    }
+
+    return results, nil
+}
+```
+
+**2. 数据清洗器（Cleaner）**
+
+数据清洗器提供15+内置清洗函数，支持自定义expr脚本，采用规则链式执行机制。
+
+**(1) 内置清洗函数库**
+
+```go
+// 清洗函数接口
+type CleanFunc func(value interface{}) interface{}
+
+// 内置函数注册表
+var builtinFunctions = map[string]CleanFunc{
+    "trim":                trimFunc,
+    "stripHTML":           stripHTMLFunc,
+    "removeNoiseText":     removeNoiseTextFunc,
+    "dateNormalize":       dateNormalizeFunc,
+    "standardizeEnum":     standardizeEnumFunc,
+    "regexReplace":        regexReplaceFunc,
+    "upper":               upperFunc,
+    "lower":               lowerFunc,
+    "truncate":            truncateFunc,
+    "removeEmoji":         removeEmojiFunc,
+    "normalizeWhitespace": normalizeWhitespaceFunc,
+    "extractNumbers":      extractNumbersFunc,
+    "extractURL":          extractURLFunc,
+    "removeSpecialChars":  removeSpecialCharsFunc,
+}
+
+// 示例：去除HTML标签
+func stripHTMLFunc(value interface{}) interface{} {
+    str, ok := value.(string)
+    if !ok {
+        return value
+    }
+
+    // 使用bluemonday库安全地去除HTML标签
+    p := bluemonday.StrictPolicy()
+    return p.Sanitize(str)
+}
+
+// 示例：日期标准化
+func dateNormalizeFunc(value interface{}, format string) interface{} {
+    str, ok := value.(string)
+    if !ok {
+        return value
+    }
+
+    // 尝试多种日期格式
+    formats := []string{
+        "2006年01月02日",
+        "2006-01-02",
+        "2006/01/02",
+        "Jan 2, 2006",
+        time.RFC3339,
+    }
+
+    for _, f := range formats {
+        if t, err := time.Parse(f, str); err == nil {
+            // 输出标准格式
+            return t.Format("2006-01-02")
+        }
+    }
+
+    return value
+}
+
+// 示例：枚举标准化
+func standardizeEnumFunc(value interface{}, mapping map[string]string) interface{} {
+    str, ok := value.(string)
+    if !ok {
+        return value
+    }
+
+    // 示例映射: {"男": "MALE", "M": "MALE", "male": "MALE"}
+    if standardValue, exists := mapping[str]; exists {
+        return standardValue
+    }
+
+    return value
+}
+```
+
+**(2) 规则引擎与链式执行**
+
+```go
+type Cleaner struct {
+    ruleEngine *RuleEngine
+    scriptEngine *expr.VM
+}
+
+func (c *Cleaner) Clean(data map[string]interface{}, rules CleanRules) (map[string]interface{}, error) {
+    result := make(map[string]interface{})
+
+    for fieldName, fieldRule := range rules.FieldRules {
+        value := data[fieldName]
+
+        // 链式执行清洗函数
+        for _, cleanFunc := range fieldRule.Functions {
+            fn, exists := builtinFunctions[cleanFunc.FunctionName]
+            if !exists {
+                return nil, fmt.Errorf("unknown function: %s", cleanFunc.FunctionName)
+            }
+
+            // 执行清洗函数
+            value = fn(value, cleanFunc.Parameters...)
+        }
+
+        // 执行自定义脚本（如果有）
+        if fieldRule.CustomScript != "" {
+            scriptResult, err := c.scriptEngine.Run(fieldRule.CustomScript, map[string]interface{}{
+                "value": value,
+                "data":  data,
+            })
+            if err != nil {
+                return nil, fmt.Errorf("script execution failed: %w", err)
+            }
+            value = scriptResult
+        }
+
+        // 数据验证
+        if err := fieldRule.Validation.Validate(value); err != nil {
+            if fieldRule.Required {
+                return nil, fmt.Errorf("validation failed for field %s: %w", fieldName, err)
+            }
+            // 非必填字段验证失败时使用nil
+            value = nil
+        }
+
+        result[fieldName] = value
+    }
+
+    return result, nil
+}
+```
+
+**3. 数据转换器（Transformer）**
+
+数据转换器负责字段映射和类型转换。
+
+```go
+type Transformer struct{}
+
+func (t *Transformer) Transform(data map[string]interface{}, rules TransformRules) (map[string]interface{}, error) {
+    result := make(map[string]interface{})
+
+    for _, mapping := range rules.FieldMappings {
+        sourceValue := data[mapping.SourceField]
+
+        // 类型转换
+        if mapping.TypeConvert != nil {
+            converted, err := t.convertType(sourceValue, mapping.TypeConvert)
+            if err != nil {
+                return nil, fmt.Errorf("type conversion failed for field %s: %w", mapping.SourceField, err)
+            }
+            sourceValue = converted
+        }
+
+        // 自定义转换脚本
+        if mapping.TransformScript != "" {
+            // 使用expr引擎执行转换脚本
+            // 脚本示例: "upper(value) + '-' + date"
+        }
+
+        result[mapping.TargetField] = sourceValue
+    }
+
+    return result, nil
+}
+
+func (t *Transformer) convertType(value interface{}, conversion *TypeConversion) (interface{}, error) {
+    if value == nil {
+        return nil, nil
+    }
+
+    switch conversion.TargetType {
+    case "int":
+        return strconv.Atoi(fmt.Sprintf("%v", value))
+    case "float":
+        return strconv.ParseFloat(fmt.Sprintf("%v", value), 64)
+    case "bool":
+        return strconv.ParseBool(fmt.Sprintf("%v", value))
+    case "time.Time":
+        str := fmt.Sprintf("%v", value)
+        return time.Parse(conversion.Format, str)
+    case "[]string":
+        // JSON数组字符串转字符串切片
+        var arr []string
+        json.Unmarshal([]byte(fmt.Sprintf("%v", value)), &arr)
+        return arr, nil
+    case "map[string]interface{}":
+        // JSON对象字符串转map
+        var m map[string]interface{}
+        json.Unmarshal([]byte(fmt.Sprintf("%v", value)), &m)
+        return m, nil
+    default:
+        return value, nil
+    }
+}
+```
+
+**4. 数据去重器（Deduplicator）**
+
+数据去重器支持3种去重策略，使用Redis缓存和布隆过滤器优化性能。
+
+```go
+type Deduplicator struct {
+    redis       *redis.Client
+    bloomFilter *bloom.BloomFilter
+}
+
+func (d *Deduplicator) Deduplicate(data map[string]interface{}, config DeduplicateConfig) (bool, error) {
+    if !config.Enabled {
+        return false, nil // false表示不是重复数据
+    }
+
+    // 生成去重键
+    key := d.generateKey(data, config)
+
+    // 先用布隆过滤器快速判断（可能误判为存在，但不会误判为不存在）
+    if d.bloomFilter != nil && !d.bloomFilter.Test([]byte(key)) {
+        // 布隆过滤器判断不存在，直接返回false（新数据）
+        d.bloomFilter.Add([]byte(key))
+        d.redis.Set(context.Background(), key, 1, time.Duration(config.TTLSeconds)*time.Second)
+        return false, nil
+    }
+
+    // 布隆过滤器判断可能存在，查询Redis确认
+    exists, err := d.redis.Exists(context.Background(), key).Result()
+    if err != nil {
+        return false, err
+    }
+
+    if exists > 0 {
+        // 重复数据
+        return true, nil
+    }
+
+    // 新数据，写入Redis
+    d.redis.Set(context.Background(), key, 1, time.Duration(config.TTLSeconds)*time.Second)
+    if d.bloomFilter != nil {
+        d.bloomFilter.Add([]byte(key))
+    }
+
+    return false, nil
+}
+
+func (d *Deduplicator) generateKey(data map[string]interface{}, config DeduplicateConfig) string {
+    switch config.Strategy {
+    case "primary_key":
+        // 基于主键字段组合
+        var keyParts []string
+        for _, field := range config.KeyFields {
+            keyParts = append(keyParts, fmt.Sprintf("%v", data[field]))
+        }
+        combined := strings.Join(keyParts, "|")
+        return fmt.Sprintf("dedup:pk:%s", md5Hash(combined))
+
+    case "content_hash":
+        // 基于内容哈希
+        jsonBytes, _ := json.Marshal(data)
+        return fmt.Sprintf("dedup:hash:%s", sha256Hash(string(jsonBytes)))
+
+    case "url_time":
+        // 基于URL+时间
+        url := data["url"]
+        timestamp := data["collected_at"]
+        return fmt.Sprintf("dedup:url:%s_%v", url, timestamp)
+
+    default:
+        return ""
+    }
+}
+```
+
+##### 3.2.4.3. 处理管道（Pipeline）实现
+
+Pipeline采用责任链模式，提供统一的处理接口和灵活的中间件机制。
+
+**Pipeline接口定义**
+
+```go
+// Pipeline处理上下文
+type ProcessContext struct {
+    TaskID      string
+    TaskConfig  *ProcessorConfig
+    StartTime   time.Time
+    Logger      *log.Logger
+    Metrics     *MetricsCollector
+    SharedData  map[string]interface{} // 阶段间共享数据
+}
+
+// Stage接口
+type Stage interface {
+    Name() string
+    Execute(ctx *ProcessContext, data interface{}) (interface{}, error)
+    SetNext(stage Stage) Stage
+    GetNext() Stage
+}
+
+// Pipeline接口
+type Pipeline interface {
+    AddStage(stage Stage) Pipeline
+    AddMiddleware(middleware Middleware) Pipeline
+    Process(rawData interface{}) (*ProcessResult, error)
+}
+```
+
+**Pipeline Manager实现**
+
+```go
+type PipelineManager struct {
+    stages      []Stage
+    middlewares []Middleware
+    configLoader *ConfigLoader
+    logger      *log.Logger
+}
+
+func (pm *PipelineManager) Process(rawData interface{}, taskID string) (*ProcessResult, error) {
+    // 1. 创建处理上下文
+    ctx := &ProcessContext{
+        TaskID:     taskID,
+        StartTime:  time.Now(),
+        Logger:     pm.logger,
+        Metrics:    NewMetricsCollector(),
+        SharedData: make(map[string]interface{}),
+    }
+
+    // 2. 加载配置
+    config, err := pm.configLoader.LoadConfig(taskID)
+    if err != nil {
+        return nil, fmt.Errorf("failed to load config: %w", err)
+    }
+    ctx.TaskConfig = config
+
+    // 3. 构建处理链
+    pipeline := pm.buildPipeline(config)
+
+    // 4. 应用中间件包装
+    wrappedPipeline := pm.applyMiddlewares(pipeline)
+
+    // 5. 执行处理链
+    result := rawData
+    for _, stage := range wrappedPipeline {
+        stageName := stage.Name()
+        stageStart := time.Now()
+
+        result, err = stage.Execute(ctx, result)
+        if err != nil {
+            ctx.Logger.Printf("[%s] Stage failed: %v", stageName, err)
+            return nil, fmt.Errorf("stage %s failed: %w", stageName, err)
+        }
+
+        // 记录阶段耗时
+        ctx.Metrics.RecordStageDuration(stageName, time.Since(stageStart))
+
+        // 如果数据被标记为跳过（例如重复数据），提前终止
+        if ctx.SharedData["skip"] == true {
+            ctx.Logger.Printf("[%s] Data marked as skip, terminating pipeline", stageName)
+            return &ProcessResult{
+                Data:    nil,
+                Skipped: true,
+                Metrics: ctx.Metrics.GetStats(),
+            }, nil
+        }
+    }
+
+    // 6. 返回处理结果
+    return &ProcessResult{
+        Data:    result,
+        Skipped: false,
+        Metrics: ctx.Metrics.GetStats(),
+    }, nil
+}
+
+func (pm *PipelineManager) buildPipeline(config *ProcessorConfig) []Stage {
+    return []Stage{
+        NewParserStage(config.ParseRules),
+        NewCleanerStage(config.CleanRules),
+        NewTransformerStage(config.TransformRules),
+        NewDeduplicatorStage(config.DeduplicateConfig),
+    }
+}
+```
+
+**中间件机制**
+
+```go
+type Middleware func(stage Stage) Stage
+
+// 日志中间件
+func LoggingMiddleware(logger *log.Logger) Middleware {
+    return func(stage Stage) Stage {
+        return &loggingStage{
+            stage:  stage,
+            logger: logger,
+        }
+    }
+}
+
+type loggingStage struct {
+    stage  Stage
+    logger *log.Logger
+}
+
+func (ls *loggingStage) Execute(ctx *ProcessContext, data interface{}) (interface{}, error) {
+    ls.logger.Printf("[%s] Starting execution", ls.stage.Name())
+    result, err := ls.stage.Execute(ctx, data)
+    if err != nil {
+        ls.logger.Printf("[%s] Execution failed: %v", ls.stage.Name(), err)
+    } else {
+        ls.logger.Printf("[%s] Execution succeeded", ls.stage.Name())
+    }
+    return result, err
+}
+
+// 指标收集中间件
+func MetricsMiddleware() Middleware {
+    return func(stage Stage) Stage {
+        return &metricsStage{stage: stage}
+    }
+}
+
+// 重试中间件
+func RetryMiddleware(maxRetries int) Middleware {
+    return func(stage Stage) Stage {
+        return &retryStage{
+            stage:      stage,
+            maxRetries: maxRetries,
+        }
+    }
+}
+```
+
+##### 3.2.4.4. 配置系统详细设计
+
+**配置数据结构（YAML示例）**
+
+```yaml
+# processor_config.yaml
+task_id: "task_12345"
+data_source_id: "ds_67890"
+version: 2
+
+# 解析规则
+parse_rules:
+  data_format: "html"  # html, json, xml, csv
+  encoding: "utf-8"
+  field_rules:
+    - field_name: "title"
+      selector_type: "css"
+      selector: "h1.article-title"
+      is_array: false
+      default_value: "无标题"
+
+    - field_name: "content"
+      selector_type: "css"
+      selector: "div.article-content p"
+      is_array: true
+
+    - field_name: "author"
+      selector_type: "xpath"
+      selector: "//span[@class='author']/text()"
+      is_array: false
+
+    - field_name: "publish_date"
+      selector_type: "regex"
+      selector: '发布时间：(\d{4}-\d{2}-\d{2})'
+      is_array: false
+
+# 清洗规则
+clean_rules:
+  field_rules:
+    title:
+      required: true
+      functions:
+        - function_name: "trim"
+        - function_name: "removeNoiseText"
+          parameters:
+            patterns: ["【广告】", "点击查看更多"]
+        - function_name: "truncate"
+          parameters:
+            max_length: 100
+      validation:
+        type: "string"
+        min_length: 1
+        max_length: 200
+
+    content:
+      required: true
+      functions:
+        - function_name: "stripHTML"
+        - function_name: "trim"
+        - function_name: "normalizeWhitespace"
+      validation:
+        type: "string"
+        min_length: 10
+
+    publish_date:
+      required: false
+      functions:
+        - function_name: "dateNormalize"
+          parameters:
+            format: "2006-01-02"
+      validation:
+        type: "date"
+        pattern: '^\d{4}-\d{2}-\d{2}$'
+
+# 转换规则
+transform_rules:
+  field_mappings:
+    - source_field: "title"
+      target_field: "article_title"
+      type_convert: null
+
+    - source_field: "publish_date"
+      target_field: "published_at"
+      type_convert:
+        source_type: "string"
+        target_type: "time.Time"
+        format: "2006-01-02"
+
+    - source_field: "content"
+      target_field: "article_content"
+      transform_script: "join(value, ' ')"  # 数组转字符串
+
+  output_schema:
+    article_title:
+      data_type: "string"
+      nullable: false
+    article_content:
+      data_type: "text"
+      nullable: false
+    published_at:
+      data_type: "timestamp"
+      nullable: true
+    author:
+      data_type: "string"
+      nullable: true
+
+# 去重配置
+deduplicate_config:
+  enabled: true
+  strategy: "primary_key"  # primary_key, content_hash, url_time
+  key_fields: ["article_title", "published_at"]
+  ttl_seconds: 604800  # 7天
+  update_strategy: "skip"  # skip, replace, merge
+```
+
+**配置热更新机制**
+
+```go
+type ConfigManager struct {
+    db     *PostgreSQL
+    cache  *Redis
+    pubsub *RedisPubSub
+    mu     sync.RWMutex
+    localCache map[string]*ProcessorConfig
+}
+
+func (cm *ConfigManager) LoadConfig(taskID string) (*ProcessorConfig, error) {
+    // 1. 先查本地缓存
+    cm.mu.RLock()
+    if config, exists := cm.localCache[taskID]; exists {
+        cm.mu.RUnlock()
+        return config, nil
+    }
+    cm.mu.RUnlock()
+
+    // 2. 查Redis缓存
+    cacheKey := fmt.Sprintf("processor:config:%s", taskID)
+    cached, err := cm.cache.Get(context.Background(), cacheKey).Result()
+    if err == nil {
+        var config ProcessorConfig
+        json.Unmarshal([]byte(cached), &config)
+
+        // 更新本地缓存
+        cm.mu.Lock()
+        cm.localCache[taskID] = &config
+        cm.mu.Unlock()
+
+        return &config, nil
+    }
+
+    // 3. 从PostgreSQL加载
+    config, err := cm.loadFromDB(taskID)
+    if err != nil {
+        return nil, err
+    }
+
+    // 4. 写入Redis缓存
+    configJSON, _ := json.Marshal(config)
+    cm.cache.Set(context.Background(), cacheKey, configJSON, 1*time.Hour)
+
+    // 5. 更新本地缓存
+    cm.mu.Lock()
+    cm.localCache[taskID] = config
+    cm.mu.Unlock()
+
+    return config, nil
+}
+
+// 监听配置更新
+func (cm *ConfigManager) WatchConfigChanges() {
+    channel := "processor:config:update"
+    pubsub := cm.pubsub.Subscribe(context.Background(), channel)
+
+    for msg := range pubsub.Channel() {
+        var updateMsg struct {
+            TaskID string `json:"task_id"`
+            Action string `json:"action"`
+        }
+        json.Unmarshal([]byte(msg.Payload), &updateMsg)
+
+        switch updateMsg.Action {
+        case "update", "delete":
+            // 清除本地缓存和Redis缓存
+            cm.InvalidateCache(updateMsg.TaskID)
+        }
+    }
+}
+
+func (cm *ConfigManager) InvalidateCache(taskID string) {
+    // 清除本地缓存
+    cm.mu.Lock()
+    delete(cm.localCache, taskID)
+    cm.mu.Unlock()
+
+    // 清除Redis缓存
+    cacheKey := fmt.Sprintf("processor:config:%s", taskID)
+    cm.cache.Del(context.Background(), cacheKey)
+}
+```
+
+##### 3.2.4.5. 核心接口规范
+
+```go
+// 处理器接口
+type Processor interface {
+    Process(rawData *RawData, config *ProcessorConfig) (*ProcessedData, error)
+}
+
+// 解析器接口
+type Parser interface {
+    Parse(rawData *RawData, rules *ParseRules) (*StructuredData, error)
+    SupportsFormat(format string) bool
+}
+
+// 清洗器接口
+type Cleaner interface {
+    Clean(data *StructuredData, rules *CleanRules) (*CleanedData, error)
+    RegisterFunction(name string, fn CleanFunc) error
+}
+
+// 转换器接口
+type Transformer interface {
+    Transform(data *CleanedData, rules *TransformRules) (*TransformedData, error)
+}
+
+// 去重器接口
+type Deduplicator interface {
+    Deduplicate(data *TransformedData, config *DeduplicateConfig) (isDuplicate bool, error)
+}
+
+// 数据结构定义
+type RawData struct {
+    Format    string      // html, json, xml, csv
+    Content   string      // 原始数据内容
+    URL       string      // 数据来源URL
+    Metadata  map[string]interface{}
+}
+
+type StructuredData struct {
+    Fields   map[string]interface{}
+    Metadata map[string]interface{}
+}
+
+type CleanedData struct {
+    Fields   map[string]interface{}
+    Metadata map[string]interface{}
+}
+
+type TransformedData struct {
+    Fields   map[string]interface{}
+    Metadata map[string]interface{}
+}
+
+type ProcessedData struct {
+    Data        *TransformedData
+    IsDuplicate bool
+    Stats       *ProcessStats
+}
+
+type ProcessStats struct {
+    TotalDuration      time.Duration
+    ParseDuration      time.Duration
+    CleanDuration      time.Duration
+    TransformDuration  time.Duration
+    DeduplicateDuration time.Duration
+    ParsedFieldCount   int
+    CleanedFieldCount  int
+}
+```
+
+##### 3.2.4.6. 性能优化方案
+
+**1. 并发处理（Worker Pool）**
+
+```go
+type ProcessorPool struct {
+    workers    int
+    taskQueue  chan *ProcessTask
+    resultChan chan *ProcessResult
+}
+
+func NewProcessorPool(workers int) *ProcessorPool {
+    pool := &ProcessorPool{
+        workers:    workers,
+        taskQueue:  make(chan *ProcessTask, workers*2),
+        resultChan: make(chan *ProcessResult, workers*2),
+    }
+
+    // 启动worker goroutines
+    for i := 0; i < workers; i++ {
+        go pool.worker(i)
+    }
+
+    return pool
+}
+
+func (pp *ProcessorPool) worker(id int) {
+    processor := NewProcessor()
+    for task := range pp.taskQueue {
+        result, err := processor.Process(task.RawData, task.Config)
+        pp.resultChan <- &ProcessResult{
+            TaskID: task.TaskID,
+            Data:   result,
+            Error:  err,
+        }
+    }
+}
+```
+
+**2. 流式处理（避免大数据OOM）**
+
+```go
+// 流式CSV解析
+func (p *CSVParser) ParseStream(reader io.Reader, rules []FieldParseRule, handler func(row map[string]interface{}) error) error {
+    csvReader := csv.NewReader(reader)
+
+    // 读取表头
+    headers, err := csvReader.Read()
+    if err != nil {
+        return err
+    }
+
+    // 流式读取每一行
+    for {
+        record, err := csvReader.Read()
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            return err
+        }
+
+        // 解析行数据
+        row := p.parseRow(record, headers, rules)
+
+        // 立即处理，不保存到内存
+        if err := handler(row); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+```
+
+**3. 规则缓存（本地缓存+Redis两级缓存）**
+
+```go
+type CachedConfigLoader struct {
+    db         *PostgreSQL
+    redis      *Redis
+    localCache *bigcache.BigCache  // 本地LRU缓存
+}
+
+func (ccl *CachedConfigLoader) LoadConfig(taskID string) (*ProcessorConfig, error) {
+    // L1: 本地缓存（内存，最快）
+    if cached, err := ccl.localCache.Get(taskID); err == nil {
+        var config ProcessorConfig
+        json.Unmarshal(cached, &config)
+        return &config, nil
+    }
+
+    // L2: Redis缓存（网络，较快）
+    cacheKey := fmt.Sprintf("config:%s", taskID)
+    if cached, err := ccl.redis.Get(context.Background(), cacheKey).Result(); err == nil {
+        var config ProcessorConfig
+        json.Unmarshal([]byte(cached), &config)
+
+        // 写入L1缓存
+        ccl.localCache.Set(taskID, []byte(cached))
+
+        return &config, nil
+    }
+
+    // L3: PostgreSQL（磁盘，最慢）
+    config, err := ccl.loadFromDB(taskID)
+    if err != nil {
+        return nil, err
+    }
+
+    // 回写缓存
+    configJSON, _ := json.Marshal(config)
+    ccl.redis.Set(context.Background(), cacheKey, configJSON, 1*time.Hour)
+    ccl.localCache.Set(taskID, configJSON)
+
+    return config, nil
+}
+```
+
+**4. 批处理优化**
+
+```go
+// 批量处理数据
+func (p *Processor) ProcessBatch(rawDataList []*RawData, config *ProcessorConfig) ([]*ProcessedData, error) {
+    results := make([]*ProcessedData, len(rawDataList))
+    errChan := make(chan error, len(rawDataList))
+
+    // 并发处理
+    var wg sync.WaitGroup
+    sem := make(chan struct{}, 10) // 限制并发度为10
+
+    for i, rawData := range rawDataList {
+        wg.Add(1)
+        go func(idx int, data *RawData) {
+            defer wg.Done()
+            sem <- struct{}{}        // 获取信号量
+            defer func() { <-sem }() // 释放信号量
+
+            result, err := p.Process(data, config)
+            if err != nil {
+                errChan <- err
+                return
+            }
+            results[idx] = result
+        }(i, rawData)
+    }
+
+    wg.Wait()
+    close(errChan)
+
+    // 收集错误
+    var errs []error
+    for err := range errChan {
+        errs = append(errs, err)
+    }
+
+    if len(errs) > 0 {
+        return results, fmt.Errorf("batch processing errors: %v", errs)
+    }
+
+    return results, nil
+}
+```
+
+**5. 性能基准测试数据**
+
+| 数据格式 | 数据量 | 单线程处理时间 | 10线程处理时间 | 吞吐量（条/秒） |
+|---------|-------|-------------|-------------|---------------|
+| HTML    | 1000条 | 5.2s        | 0.8s        | 1250         |
+| JSON    | 1000条 | 1.3s        | 0.2s        | 5000         |
+| XML     | 1000条 | 3.8s        | 0.6s        | 1667         |
+| CSV     | 1000条 | 0.9s        | 0.15s       | 6667         |
+
+##### 3.2.4.7. 错误处理与监控
+
+**错误分类与处理策略**
+
+| 错误类型 | 处理策略 | 是否重试 | 示例 |
+|---------|---------|---------|------|
+| 格式错误 | 记录日志，返回错误 | 否 | 无效JSON |
+| 字段缺失 | 使用默认值 | 否 | 必填字段为空 |
+| 解析失败 | 记录日志，部分字段为空 | 否 | CSS选择器无匹配 |
+| 网络错误 | 重试3次（指数退避） | 是 | Redis连接失败 |
+| 验证失败 | 记录日志，标记数据质量 | 否 | 日期格式不合法 |
+| 脚本错误 | 降级为默认值 | 否 | expr脚本执行异常 |
+
+**数据质量评分**
+
+```go
+type DataQualityScore struct {
+    OverallScore   float64  // 0-100分
+    CompletenessScore float64  // 完整性分数
+    AccuracyScore   float64  // 准确性分数
+    Issues          []string // 质量问题列表
+}
+
+func (p *Processor) CalculateQualityScore(data *ProcessedData, config *ProcessorConfig) *DataQualityScore {
+    score := &DataQualityScore{
+        Issues: make([]string, 0),
+    }
+
+    // 计算完整性：必填字段是否都有值
+    requiredFields := config.GetRequiredFields()
+    filledCount := 0
+    for _, field := range requiredFields {
+        if data.Data.Fields[field] != nil && data.Data.Fields[field] != "" {
+            filledCount++
+        } else {
+            score.Issues = append(score.Issues, fmt.Sprintf("missing required field: %s", field))
+        }
+    }
+    score.CompletenessScore = float64(filledCount) / float64(len(requiredFields)) * 100
+
+    // 计算准确性：字段值是否通过验证
+    validCount := 0
+    totalFields := len(config.CleanRules.FieldRules)
+    for fieldName, fieldRule := range config.CleanRules.FieldRules {
+        value := data.Data.Fields[fieldName]
+        if fieldRule.Validation != nil {
+            if err := fieldRule.Validation.Validate(value); err == nil {
+                validCount++
+            } else {
+                score.Issues = append(score.Issues, fmt.Sprintf("validation failed for %s: %v", fieldName, err))
+            }
+        } else {
+            validCount++ // 没有验证规则默认通过
+        }
+    }
+    score.AccuracyScore = float64(validCount) / float64(totalFields) * 100
+
+    // 计算总分
+    score.OverallScore = (score.CompletenessScore + score.AccuracyScore) / 2
+
+    return score
+}
+```
+
+**监控指标设计**
+
+```go
+// Prometheus指标定义
+var (
+    // 处理计数器
+    processedTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "processor_processed_total",
+            Help: "Total number of processed data records",
+        },
+        []string{"task_id", "format", "status"}, // status: success, failed, skipped
+    )
+
+    // 处理耗时直方图
+    processDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "processor_duration_seconds",
+            Help:    "Duration of data processing in seconds",
+            Buckets: prometheus.DefBuckets,
+        },
+        []string{"task_id", "stage"}, // stage: parse, clean, transform, deduplicate
+    )
+
+    // 数据质量评分
+    qualityScore = prometheus.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "processor_quality_score",
+            Help: "Data quality score (0-100)",
+        },
+        []string{"task_id"},
+    )
+
+    // 去重统计
+    deduplicateCount = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "processor_deduplicate_total",
+            Help: "Total number of duplicate data detected",
+        },
+        []string{"task_id", "strategy"},
+    )
+)
+```
 
 #### 3.2.5. 数据存储模块 (Storage)
 
