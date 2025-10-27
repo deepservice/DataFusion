@@ -1,0 +1,174 @@
+@startuml
+title 反爬虫与反检测机制流程图
+
+start
+
+:接收采集任务;
+
+partition "1. 代理IP选择" {
+    :调用ProxyProvider接口;
+    if (是否启用代理池?) then (是)
+        :从代理池获取可用代理;
+        note right
+            策略选项:
+            - 轮询 (Round Robin)
+            - 随机 (Random)
+            - 加权 (Weighted)
+        end note
+        :设置HTTP代理配置;
+    else (否)
+        :使用本地直连;
+    endif
+}
+
+partition "2. User-Agent伪装" {
+    :从UA库随机选择User-Agent;
+    note right
+        UA库包含:
+        - Chrome (多版本)
+        - Firefox (多版本)
+        - Safari (macOS/iOS)
+        - Edge (Chromium内核)
+    end note
+    :生成匹配的Client Hints头部;
+    note right
+        一致性保证:
+        Sec-Ch-Ua: "Chromium";v="120"
+        Sec-Ch-Ua-Platform: "Linux"
+        Sec-Ch-Ua-Mobile: ?0
+    end note
+}
+
+partition "3. 浏览器指纹伪装 (RPA模式)" {
+    if (采集方式 == RPA?) then (是)
+        :启动Headless Chrome;
+        :注入反检测脚本;
+        note right
+            伪装项目:
+            - navigator.webdriver = false
+            - Canvas指纹随机化
+            - WebGL指纹随机化
+            - Timezone/Language随机化
+            - Screen Resolution随机化
+        end note
+        :设置Viewport尺寸;
+    else (否: API模式)
+        :跳过浏览器指纹伪装;
+    endif
+}
+
+partition "4. Cookie与Session管理" {
+    if (任务需要登录态?) then (是)
+        if (已有持久化Cookie?) then (是)
+            :从Redis/文件加载Cookie;
+            :注入到浏览器/HTTP客户端;
+        else (否)
+            if (外部登录态导入?) then (是)
+                :调用CookieImport接口;
+                :保存到Redis/文件;
+            else (否)
+                :执行登录流程;
+                note right
+                    可能需要:
+                    - 表单填写
+                    - 验证码识别
+                end note
+                :保存Cookie到持久化存储;
+            endif
+        endif
+    else (否)
+        :无需Cookie管理;
+    endif
+}
+
+partition "5. 请求频率控制" {
+    :检查分布式限流器(Redis);
+    if (超过频率限制?) then (是)
+        :计算等待时长;
+        note right
+            自适应策略:
+            - 基础延迟: 1-5秒
+            - 随机抖动: ±20%
+            - 人类行为模拟
+        end note
+        :休眠等待;
+    else (否)
+        :继续执行;
+    endif
+}
+
+partition "6. 执行采集请求" {
+    :发送HTTP请求 / 打开网页;
+
+    if (响应状态码?) then (429 Too Many Requests)
+        :解析Retry-After头部;
+        :动态调整请求频率;
+        :标记任务为待重试;
+        stop
+    else if (403 Forbidden) then
+        :检测是否为反爬检测;
+        if (疑似IP被封禁?) then (是)
+            :标记当前代理不可用;
+            :切换到新代理;
+            :重试请求;
+        else (否)
+            :记录错误日志;
+            :任务失败;
+            stop
+        endif
+    else if (需要验证码?) then (是)
+        :调用CaptchaSolver接口;
+        note right
+            验证码处理:
+            - 第三方打码平台
+            - 本地OCR识别(预留)
+        end note
+        if (识别成功?) then (是)
+            :提交验证码;
+            :继续采集;
+        else (否)
+            :任务失败;
+            stop
+        endif
+    else (200 OK)
+        :采集成功;
+    endif
+}
+
+partition "7. 行为模拟 (RPA模式)" {
+    if (采集方式 == RPA?) then (是)
+        :模拟人类行为;
+        note right
+            行为模拟:
+            - 随机滚动页面
+            - 鼠标移动轨迹
+            - 点击延迟 (100-500ms)
+            - 页面停留时间 (2-10秒)
+        end note
+    endif
+}
+
+partition "8. 数据提取与清理" {
+    :提取目标数据;
+    :清理浏览器上下文;
+    note right
+        清理项目:
+        - 关闭页面/标签
+        - 清除临时文件
+        - 释放浏览器实例
+    end note
+}
+
+partition "9. 持久化更新" {
+    if (Cookie有更新?) then (是)
+        :更新Redis/文件中的Cookie;
+    endif
+    :记录代理使用统计;
+    :更新限流计数器;
+}
+
+:返回采集结果;
+
+stop
+
+@enduml

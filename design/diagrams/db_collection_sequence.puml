@@ -1,0 +1,143 @@
+@startuml
+title 数据库采集流程时序图
+
+skinparam sequence {
+    ArrowColor DeepSkyBlue
+    ActorBorderColor DeepSkyBlue
+    LifeLineBorderColor blue
+    LifeLineBackgroundColor #A9DCDF
+
+    ParticipantBorderColor DeepSkyBlue
+    ParticipantBackgroundColor DodgerBlue
+    ParticipantFontColor #FFFFFF
+
+    ActorBackgroundColor aqua
+    ActorFontColor DeepSkyBlue
+
+    BoxBackgroundColor #EEEEEE
+}
+
+actor "用户" as User
+participant "Web UI" as UI
+participant "API网关" as Gateway
+participant "Master节点" as Master
+participant "PostgreSQL" as PG
+participant "RabbitMQ" as MQ
+participant "Worker节点" as Worker
+participant "Database\nCollector" as Collector
+database "目标数据库\n(MySQL/PG/MongoDB)" as TargetDB
+participant "数据处理模块" as Processor
+participant "数据存储模块" as Storage
+
+== 1. 数据库数据源配置 ==
+User -> UI: 创建数据库数据源
+UI -> Gateway: POST /api/v1/datasources
+Gateway -> Master: 验证并转发请求
+Master -> Master: 验证数据库连接信息
+Master -> TargetDB: 测试连接 (SELECT 1)
+TargetDB --> Master: 连接成功
+Master -> PG: 保存数据源配置\n(datasources表)
+PG --> Master: 保存成功
+Master --> Gateway: 返回数据源ID
+Gateway --> UI: 显示创建成功
+UI --> User: 显示数据源配置详情
+
+== 2. 数据库采集任务配置 ==
+User -> UI: 创建采集任务
+note right of UI
+  配置采集参数：
+  - 查询SQL或表名
+  - 增量字段 (timestamp/id)
+  - 分页大小
+  - 调度cron表达式
+end note
+UI -> Gateway: POST /api/v1/tasks
+Gateway -> Master: 创建任务
+Master -> PG: 保存任务配置\n(tasks, db_collection_configs表)
+PG --> Master: 保存成功
+Master --> Gateway: 返回任务ID
+Gateway --> UI: 创建成功
+UI --> User: 显示任务详情
+
+== 3. 定时调度触发采集 ==
+Master -> Master: 调度引擎扫描\n(Cron定时器触发)
+Master -> PG: 查询待执行任务
+PG --> Master: 返回任务列表
+Master -> Master: 构建采集任务消息
+Master -> MQ: 推送任务到队列\n(高优先级队列)
+MQ --> Master: ACK
+Master -> PG: 更新任务状态\nstatus='pending'
+
+== 4. Worker消费任务并执行采集 ==
+Worker -> MQ: 消费任务消息
+MQ --> Worker: 返回任务详情
+Worker -> PG: 查询任务完整配置\n(包含数据源信息)
+PG --> Worker: 返回配置
+Worker -> Worker: 初始化DatabaseCollector
+Worker -> Collector: Collect(task)
+
+== 5. 数据库连接与查询 ==
+Collector -> Collector: 从连接池获取连接
+Collector -> TargetDB: 建立数据库连接
+TargetDB --> Collector: 连接成功
+
+alt 全量采集模式
+    Collector -> TargetDB: SELECT * FROM table\nLIMIT 1000 OFFSET 0
+    TargetDB --> Collector: 返回第1页数据
+    loop 分页查询
+        Collector -> TargetDB: SELECT * FROM table\nLIMIT 1000 OFFSET N
+        TargetDB --> Collector: 返回第N页数据
+        Collector -> Collector: 累积数据
+    end
+else 增量采集模式
+    Collector -> PG: 查询上次采集的最大ID/时间戳
+    PG --> Collector: 返回checkpoint值
+    Collector -> TargetDB: SELECT * FROM table\nWHERE id > {checkpoint}\nORDER BY id\nLIMIT 1000
+    TargetDB --> Collector: 返回增量数据
+    loop 分页查询增量数据
+        Collector -> TargetDB: 继续查询下一页
+        TargetDB --> Collector: 返回数据
+    end
+end
+
+Collector -> Collector: 释放数据库连接到连接池
+Collector --> Worker: 返回RawData[]
+
+== 6. 数据处理与存储 ==
+Worker -> Processor: Process(rawData)
+Processor -> Processor: 数据清洗、转换
+Processor --> Worker: 返回ProcessedData
+Worker -> Storage: Store(processedData)
+Storage --> Worker: 存储成功
+
+== 7. 更新任务状态与Checkpoint ==
+Worker -> PG: 更新任务状态\nstatus='success'
+Worker -> PG: 更新采集checkpoint\n(最大ID/时间戳)
+PG --> Worker: 更新成功
+Worker -> MQ: ACK消息
+Worker -> Master: 上报任务完成(通过Redis Pub/Sub)
+Master -> UI: 推送任务状态更新(WebSocket)
+UI --> User: 显示任务执行成功
+
+== 8. 异常处理 ==
+alt 数据库连接失败
+    Collector -> TargetDB: 尝试连接
+    TargetDB --> Collector: 连接失败(网络超时/认证失败)
+    Collector --> Worker: 返回错误
+    Worker -> PG: 更新任务状态\nstatus='failed'
+    Worker -> Master: 触发告警
+    Master -> User: 发送告警通知\n(邮件/钉钉)
+else 查询超时
+    Collector -> TargetDB: 执行查询
+    TargetDB --> Collector: 查询超时
+    Collector -> Collector: 重试机制\n(最多3次)
+    alt 重试成功
+        Collector -> TargetDB: 重试查询
+        TargetDB --> Collector: 返回数据
+    else 重试失败
+        Collector --> Worker: 返回错误
+        Worker -> PG: 更新任务状态\nstatus='failed'
+    end
+end
+
+@enduml

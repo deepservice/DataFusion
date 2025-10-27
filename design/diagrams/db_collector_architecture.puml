@@ -1,0 +1,105 @@
+@startuml
+title 数据库采集器架构图
+
+package "Worker节点" {
+    component "采集器核心\n(Collector)" as CollectorCore {
+        component "DatabaseCollector" as DBCollector
+        component "连接池管理器\nConnectionPoolManager" as PoolManager
+        component "查询执行器\nQueryExecutor" as QueryExecutor
+        component "分页处理器\nPaginationHandler" as PaginationHandler
+        component "Checkpoint管理器\nCheckpointManager" as CheckpointManager
+    }
+
+    component "配置管理" as Config {
+        component "数据源配置\nDataSourceConfig" as DSConfig
+        component "采集策略配置\nCollectionStrategy" as Strategy
+    }
+
+    component "监控与日志" as Monitor {
+        component "性能指标\nMetrics Collector" as Metrics
+        component "结构化日志\nStructured Logger" as Logger
+    }
+}
+
+package "连接池层" {
+    database "MySQL\n连接池" as MySQLPool
+    database "PostgreSQL\n连接池" as PGPool
+    database "MongoDB\n连接池" as MongoPool
+}
+
+database "目标数据库" {
+    component "MySQL\n数据库" as MySQL
+    component "PostgreSQL\n数据库" as PostgreSQL
+    component "MongoDB\n数据库" as MongoDB
+}
+
+database "元数据存储\n(PostgreSQL)" as MetaDB {
+    component "datasources表\n(数据源配置)" as DSTable
+    component "db_collection_configs表\n(采集配置)" as ConfigTable
+    component "collection_checkpoints表\n(采集检查点)" as CheckpointTable
+}
+
+cloud "外部监控" {
+    component "Prometheus\n(指标采集)" as Prometheus
+    component "ELK\n(日志聚合)" as ELK
+}
+
+' 核心流程
+DBCollector --> PoolManager: 1. 获取数据库连接
+PoolManager --> MySQLPool: 2a. MySQL连接
+PoolManager --> PGPool: 2b. PostgreSQL连接
+PoolManager --> MongoPool: 2c. MongoDB连接
+
+MySQLPool --> MySQL: 3a. 复用连接
+PGPool --> PostgreSQL: 3b. 复用连接
+MongoPool --> MongoDB: 3c. 复用连接
+
+DBCollector --> QueryExecutor: 4. 执行SQL查询
+QueryExecutor --> PaginationHandler: 5. 分页处理
+
+DBCollector --> CheckpointManager: 6. 读取/更新Checkpoint
+CheckpointManager --> CheckpointTable: 7. 存储检查点
+
+' 配置读取
+DBCollector ..> Config: 读取配置
+Config ..> DSTable: 加载数据源配置
+Config ..> ConfigTable: 加载采集策略
+
+' 监控与日志
+DBCollector --> Monitor: 上报指标和日志
+Metrics --> Prometheus: 推送指标
+Logger --> ELK: 推送日志
+
+note right of PoolManager
+  <b>连接池配置</b>
+  - MaxOpenConns: 10
+  - MaxIdleConns: 5
+  - ConnMaxLifetime: 1h
+  - ConnMaxIdleTime: 10m
+end note
+
+note right of QueryExecutor
+  <b>查询策略</b>
+  - 全量查询: SELECT * FROM table
+  - 增量查询: WHERE id > checkpoint
+  - 分页大小: 1000行/页
+  - 查询超时: 30秒
+end note
+
+note right of CheckpointManager
+  <b>Checkpoint类型</b>
+  - 自增ID: max(id)
+  - 时间戳: max(updated_at)
+  - 组合键: (id, timestamp)
+  - 持久化: PostgreSQL
+end note
+
+note left of Metrics
+  <b>关键指标</b>
+  - db_query_duration_seconds
+  - db_rows_fetched_total
+  - db_connection_pool_size
+  - db_collection_errors_total
+end note
+
+@enduml

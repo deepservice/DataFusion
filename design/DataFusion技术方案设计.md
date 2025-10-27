@@ -1755,6 +1755,2956 @@ helm install datafusion ./datafusion-chart \
    *   放置在指定的plugins目录
    *   系统启动时自动加载和注册
 
+##### 3.2.3.4. 数据库采集技术方案
+
+![数据库采集流程时序图](diagrams/db_collection_sequence.png)
+
+针对关系型数据库(MySQL/PostgreSQL)和NoSQL数据库(MongoDB)的数据采集场景，系统提供了基于**查询轮询**的高效采集方案，并预留CDC(Change Data Capture)扩展接口用于未来的实时增量同步需求。
+
+**1. 采集模式设计**
+
+系统支持三种数据库采集模式，适配不同的业务场景：
+
+**(1) 全量采集模式**
+
+适用场景：初次采集、定期全量备份、小数据量表
+
+```go
+type FullLoadConfig struct {
+    Table          string   // 表名
+    Columns        []string // 需要采集的列（空数组表示SELECT *）
+    WhereClause    string   // 过滤条件（可选）
+    PageSize       int      // 分页大小（默认1000）
+    OrderBy        string   // 排序字段（用于分页）
+}
+
+// 示例：全量采集用户表
+{
+    "table": "users",
+    "columns": ["id", "username", "email", "created_at"],
+    "where_clause": "status = 'active'",
+    "page_size": 1000,
+    "order_by": "id"
+}
+```
+
+实现原理：
+- 使用LIMIT/OFFSET分页查询，避免一次性加载大量数据
+- 按主键或索引字段排序，保证分页稳定性
+- 支持WHERE条件过滤，减少无效数据采集
+
+**(2) 增量采集模式**
+
+适用场景：高频更新表、只需同步新增/变更数据、降低数据库压力
+
+```go
+type IncrementalConfig struct {
+    Table              string   // 表名
+    Columns            []string // 采集的列
+    IncrementalColumn  string   // 增量字段（timestamp/id）
+    IncrementalType    string   // 增量类型：timestamp/auto_increment
+    CheckpointStorage  string   // checkpoint存储位置：postgresql/redis
+    PageSize           int      // 分页大小
+}
+
+// 示例：基于时间戳的增量采集
+{
+    "table": "orders",
+    "columns": ["id", "user_id", "amount", "updated_at"],
+    "incremental_column": "updated_at",
+    "incremental_type": "timestamp",
+    "checkpoint_storage": "postgresql",
+    "page_size": 1000
+}
+
+// 示例：基于自增ID的增量采集
+{
+    "table": "logs",
+    "incremental_column": "log_id",
+    "incremental_type": "auto_increment",
+    "checkpoint_storage": "redis"
+}
+```
+
+实现原理：
+- 每次采集前从checkpoint存储读取上次采集的最大值
+- 构造SQL：`SELECT * FROM table WHERE incremental_column > {checkpoint} ORDER BY incremental_column LIMIT 1000`
+- 采集完成后更新checkpoint为本次采集的最大值
+- checkpoint双写PostgreSQL（持久化）和Redis（高性能查询）
+
+**(3) 定时快照模式**
+
+适用场景：执行复杂SQL查询、跨表JOIN、数据聚合统计
+
+```go
+type SnapshotConfig struct {
+    SQL        string            // 自定义SQL查询
+    Parameters map[string]string // SQL参数（支持变量替换）
+    Timeout    int               // 查询超时（秒）
+}
+
+// 示例：自定义SQL查询
+{
+    "sql": "SELECT u.id, u.username, COUNT(o.id) as order_count FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.created_at >= '{start_date}' GROUP BY u.id",
+    "parameters": {
+        "start_date": "2024-01-01"
+    },
+    "timeout": 60
+}
+```
+
+支持的SQL参数变量：
+- `{today}`: 当前日期（YYYY-MM-DD）
+- `{yesterday}`: 昨天日期
+- `{start_date}`, `{end_date}`: 用户自定义参数
+- `{last_checkpoint}`: 上次采集的checkpoint值
+
+**2. 数据库连接池管理**
+
+![数据库采集器架构图](diagrams/db_collector_architecture.png)
+
+为了高效复用数据库连接，避免频繁建立/断开连接的开销，系统为每个数据源维护独立的连接池：
+
+```go
+type ConnectionPoolConfig struct {
+    MaxOpenConns    int           // 最大打开连接数（默认10）
+    MaxIdleConns    int           // 最大空闲连接数（默认5）
+    ConnMaxLifetime time.Duration // 连接最大生存时间（默认1小时）
+    ConnMaxIdleTime time.Duration // 连接最大空闲时间（默认10分钟）
+}
+
+type DatabaseCollector struct {
+    pools map[string]*sql.DB // 数据源ID -> 连接池
+    mu    sync.RWMutex
+}
+
+func (dc *DatabaseCollector) GetConnection(datasourceID string) (*sql.DB, error) {
+    dc.mu.RLock()
+    pool, exists := dc.pools[datasourceID]
+    dc.mu.RUnlock()
+
+    if exists {
+        return pool, nil
+    }
+
+    // 不存在则创建新连接池
+    dc.mu.Lock()
+    defer dc.mu.Unlock()
+
+    // 双重检查
+    if pool, exists := dc.pools[datasourceID]; exists {
+        return pool, nil
+    }
+
+    // 从PostgreSQL加载数据源配置
+    dsConfig, err := dc.loadDataSourceConfig(datasourceID)
+    if err != nil {
+        return nil, err
+    }
+
+    // 创建连接池
+    db, err := sql.Open(dsConfig.Driver, dsConfig.DSN)
+    if err != nil {
+        return nil, err
+    }
+
+    // 配置连接池参数
+    db.SetMaxOpenConns(dsConfig.PoolConfig.MaxOpenConns)
+    db.SetMaxIdleConns(dsConfig.PoolConfig.MaxIdleConns)
+    db.SetConnMaxLifetime(dsConfig.PoolConfig.ConnMaxLifetime)
+    db.SetConnMaxIdleTime(dsConfig.PoolConfig.ConnMaxIdleTime)
+
+    // 测试连接
+    if err := db.Ping(); err != nil {
+        db.Close()
+        return nil, fmt.Errorf("failed to ping database: %w", err)
+    }
+
+    dc.pools[datasourceID] = db
+    return db, nil
+}
+
+func (dc *DatabaseCollector) Close() error {
+    dc.mu.Lock()
+    defer dc.mu.Unlock()
+
+    for id, pool := range dc.pools {
+        if err := pool.Close(); err != nil {
+            log.Errorf("Failed to close connection pool for datasource %s: %v", id, err)
+        }
+    }
+    dc.pools = make(map[string]*sql.DB)
+    return nil
+}
+```
+
+连接池优势：
+- **性能提升**：避免TCP三次握手和数据库认证开销，复用连接可提升3-5倍性能
+- **资源隔离**：每个数据源独立连接池，互不影响
+- **自动清理**：超过MaxLifetime或MaxIdleTime的连接自动关闭，防止连接泄漏
+- **并发控制**：MaxOpenConns限制最大并发数，保护目标数据库
+
+**3. 分页查询引擎**
+
+为了避免大表查询导致内存溢出，系统实现了通用的分页查询引擎：
+
+```go
+type PagedQueryExecutor struct {
+    db       *sql.DB
+    pageSize int
+}
+
+// 全量分页查询
+func (pqe *PagedQueryExecutor) ExecuteFullLoad(config *FullLoadConfig) ([]*RawData, error) {
+    var allData []*RawData
+    offset := 0
+
+    for {
+        // 构造分页SQL
+        sql := pqe.buildPagedSQL(config, offset)
+
+        // 执行查询
+        rows, err := pqe.db.Query(sql)
+        if err != nil {
+            return nil, fmt.Errorf("query failed at offset %d: %w", offset, err)
+        }
+
+        // 解析结果
+        pageData, err := pqe.parseRows(rows)
+        rows.Close()
+        if err != nil {
+            return nil, err
+        }
+
+        // 累积数据
+        allData = append(allData, pageData...)
+
+        // 判断是否还有更多数据
+        if len(pageData) < config.PageSize {
+            break
+        }
+
+        offset += config.PageSize
+    }
+
+    return allData, nil
+}
+
+func (pqe *PagedQueryExecutor) buildPagedSQL(config *FullLoadConfig, offset int) string {
+    // 构造SELECT子句
+    columns := "*"
+    if len(config.Columns) > 0 {
+        columns = strings.Join(config.Columns, ", ")
+    }
+
+    // 构造WHERE子句
+    whereClause := ""
+    if config.WhereClause != "" {
+        whereClause = " WHERE " + config.WhereClause
+    }
+
+    // 构造ORDER BY子句
+    orderBy := ""
+    if config.OrderBy != "" {
+        orderBy = " ORDER BY " + config.OrderBy
+    }
+
+    return fmt.Sprintf(
+        "SELECT %s FROM %s%s%s LIMIT %d OFFSET %d",
+        columns, config.Table, whereClause, orderBy, config.PageSize, offset,
+    )
+}
+
+// 增量分页查询
+func (pqe *PagedQueryExecutor) ExecuteIncremental(config *IncrementalConfig) ([]*RawData, error) {
+    // 读取checkpoint
+    checkpoint, err := pqe.getCheckpoint(config.Table, config.IncrementalColumn)
+    if err != nil {
+        return nil, err
+    }
+
+    var allData []*RawData
+    lastValue := checkpoint
+
+    for {
+        // 构造增量SQL
+        sql := pqe.buildIncrementalSQL(config, lastValue)
+
+        rows, err := pqe.db.Query(sql)
+        if err != nil {
+            return nil, err
+        }
+
+        pageData, maxValue, err := pqe.parseRowsWithMax(rows, config.IncrementalColumn)
+        rows.Close()
+        if err != nil {
+            return nil, err
+        }
+
+        allData = append(allData, pageData...)
+
+        if len(pageData) < config.PageSize {
+            // 更新checkpoint为本次采集的最大值
+            if maxValue != nil {
+                pqe.updateCheckpoint(config.Table, config.IncrementalColumn, maxValue)
+            }
+            break
+        }
+
+        lastValue = maxValue
+    }
+
+    return allData, nil
+}
+```
+
+**4. Checkpoint管理机制**
+
+Checkpoint用于记录增量采集的进度，确保数据不丢失、不重复：
+
+```go
+type CheckpointManager struct {
+    pg    *sql.DB    // PostgreSQL（持久化存储）
+    redis *redis.Client // Redis（高性能缓存）
+}
+
+// Checkpoint数据结构
+type Checkpoint struct {
+    DataSourceID      string      // 数据源ID
+    Table             string      // 表名
+    IncrementalColumn string      // 增量字段
+    CheckpointValue   interface{} // Checkpoint值（timestamp/int）
+    UpdatedAt         time.Time   // 更新时间
+}
+
+// 读取Checkpoint（优先从Redis读取）
+func (cm *CheckpointManager) Get(datasourceID, table, column string) (interface{}, error) {
+    key := fmt.Sprintf("checkpoint:%s:%s:%s", datasourceID, table, column)
+
+    // 1. 尝试从Redis读取
+    val, err := cm.redis.Get(context.Background(), key).Result()
+    if err == nil {
+        return cm.parseCheckpointValue(val), nil
+    }
+
+    // 2. Redis miss，从PostgreSQL读取
+    var checkpoint Checkpoint
+    err = cm.pg.QueryRow(
+        "SELECT checkpoint_value, updated_at FROM collection_checkpoints WHERE datasource_id = $1 AND table_name = $2 AND incremental_column = $3",
+        datasourceID, table, column,
+    ).Scan(&checkpoint.CheckpointValue, &checkpoint.UpdatedAt)
+
+    if err == sql.ErrNoRows {
+        return nil, nil // 首次采集，无checkpoint
+    }
+    if err != nil {
+        return nil, err
+    }
+
+    // 3. 回写Redis缓存
+    cm.redis.Set(context.Background(), key, checkpoint.CheckpointValue, 24*time.Hour)
+
+    return checkpoint.CheckpointValue, nil
+}
+
+// 更新Checkpoint（双写PostgreSQL和Redis）
+func (cm *CheckpointManager) Update(datasourceID, table, column string, value interface{}) error {
+    key := fmt.Sprintf("checkpoint:%s:%s:%s", datasourceID, table, column)
+
+    // 1. 更新PostgreSQL（持久化）
+    _, err := cm.pg.Exec(`
+        INSERT INTO collection_checkpoints (datasource_id, table_name, incremental_column, checkpoint_value, updated_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (datasource_id, table_name, incremental_column)
+        DO UPDATE SET checkpoint_value = $4, updated_at = $5
+    `, datasourceID, table, column, value, time.Now())
+    if err != nil {
+        return fmt.Errorf("failed to update checkpoint in PostgreSQL: %w", err)
+    }
+
+    // 2. 更新Redis（缓存）
+    err = cm.redis.Set(context.Background(), key, value, 24*time.Hour).Err()
+    if err != nil {
+        log.Warnf("Failed to update checkpoint in Redis: %v", err)
+        // Redis失败不中断流程，仅记录日志
+    }
+
+    return nil
+}
+```
+
+PostgreSQL表结构：
+
+```sql
+CREATE TABLE collection_checkpoints (
+    id                  SERIAL PRIMARY KEY,
+    datasource_id       VARCHAR(64) NOT NULL,
+    table_name          VARCHAR(128) NOT NULL,
+    incremental_column  VARCHAR(64) NOT NULL,
+    checkpoint_value    TEXT NOT NULL,  -- 存储为字符串，支持timestamp/int/uuid等多种类型
+    updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(datasource_id, table_name, incremental_column)
+);
+
+CREATE INDEX idx_checkpoints_lookup ON collection_checkpoints(datasource_id, table_name, incremental_column);
+```
+
+**5. 跨库JOIN查询支持**
+
+对于需要跨表关联的复杂查询场景，系统支持自定义SQL模式：
+
+```json
+{
+  "collection_method": "database",
+  "db_config": {
+    "mode": "snapshot",
+    "sql": "SELECT u.id, u.username, u.email, COUNT(o.id) as order_count, SUM(o.amount) as total_amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE u.created_at >= '{start_date}' GROUP BY u.id, u.username, u.email HAVING COUNT(o.id) > 0 ORDER BY total_amount DESC",
+    "parameters": {
+      "start_date": "2024-01-01"
+    },
+    "timeout": 120
+  }
+}
+```
+
+注意事项：
+- 复杂JOIN查询可能消耗较多数据库资源，建议设置合理的timeout
+- 对于大表JOIN，建议在数据库端创建合适的索引
+- 可以使用数据库视图（View）简化查询逻辑
+
+**6. CDC方案预留接口（未来扩展）**
+
+为了支持未来的实时增量同步需求，系统预留了CDC接口设计：
+
+```go
+// CDC接口定义（预留）
+type CDCCollector interface {
+    // 启动CDC监听
+    Start(config *CDCConfig) error
+
+    // 停止CDC监听
+    Stop() error
+
+    // 获取变更事件流
+    GetChangeStream() <-chan *ChangeEvent
+}
+
+type CDCConfig struct {
+    Driver   string // mysql/postgresql/mongodb
+    DSN      string
+    Tables   []string // 监听的表列表
+    Position string   // 起始位置（Binlog position/LSN）
+}
+
+type ChangeEvent struct {
+    Database  string
+    Table     string
+    Operation string // INSERT/UPDATE/DELETE
+    Before    map[string]interface{} // 变更前的数据
+    After     map[string]interface{} // 变更后的数据
+    Timestamp time.Time
+}
+
+// MySQL Binlog CDC实现（未来扩展）
+// 基于go-mysql库解析Binlog日志
+// 支持GTID模式，保证exactly-once语义
+
+// PostgreSQL WAL CDC实现（未来扩展）
+// 基于logical replication协议
+// 使用pgoutput或wal2json插件
+
+// MongoDB Change Streams实现（未来扩展）
+// 使用MongoDB原生Change Streams API
+// 支持Resume Token实现断点续传
+```
+
+**7. 配置参数设计**
+
+完整的数据库采集配置示例：
+
+```json
+{
+  "collection_method": "database",
+  "db_config": {
+    "mode": "incremental",
+    "table": "orders",
+    "columns": ["id", "user_id", "amount", "status", "created_at", "updated_at"],
+    "incremental_column": "updated_at",
+    "incremental_type": "timestamp",
+    "page_size": 1000,
+    "timeout": 30,
+    "connection_pool": {
+      "max_open_conns": 10,
+      "max_idle_conns": 5,
+      "conn_max_lifetime": 3600,
+      "conn_max_idle_time": 600
+    }
+  }
+}
+```
+
+**8. 错误处理与重试**
+
+数据库采集过程中可能遇到的错误及处理策略：
+
+| 错误类型 | 示例 | 是否重试 | 处理策略 |
+|---------|------|---------|---------|
+| **连接错误** | 网络超时、DNS解析失败 | 是 | 指数退避重试（最多3次） |
+| **认证错误** | 密码错误、权限不足 | 否 | 标记任务失败，发送告警 |
+| **查询超时** | 复杂SQL执行超时 | 是 | 重试1次，建议优化SQL或增加timeout |
+| **表不存在** | Table 'xxx' doesn't exist | 否 | 标记任务失败，记录详细日志 |
+| **字段缺失** | Unknown column 'xxx' | 否 | 标记任务失败，提示检查配置 |
+| **连接池耗尽** | Too many connections | 是 | 等待可用连接，超时则失败 |
+
+```go
+func (dc *DatabaseCollector) Collect(task *Task) (*RawData, error) {
+    return retry.Do(
+        func() (*RawData, error) {
+            return dc.doCollect(task)
+        },
+        retry.Attempts(3),
+        retry.Delay(time.Second),
+        retry.DelayType(retry.BackOffDelay),
+        retry.RetryIf(func(err error) bool {
+            // 仅对可重试错误进行重试
+            return IsRetryableDBError(err)
+        }),
+    )
+}
+
+func IsRetryableDBError(err error) bool {
+    if err == nil {
+        return false
+    }
+
+    errMsg := err.Error()
+
+    // 网络相关错误
+    if strings.Contains(errMsg, "timeout") ||
+       strings.Contains(errMsg, "connection refused") ||
+       strings.Contains(errMsg, "no such host") {
+        return true
+    }
+
+    // 临时性错误
+    if strings.Contains(errMsg, "too many connections") ||
+       strings.Contains(errMsg, "deadlock") {
+        return true
+    }
+
+    return false
+}
+```
+
+**9. 性能优化建议**
+
+| 优化项 | 说明 | 预期收益 |
+|-------|------|---------|
+| **索引优化** | 在incremental_column和ORDER BY字段上创建索引 | 查询速度提升5-10倍 |
+| **分区表** | 对于超大表（亿级），使用分区表分散数据 | 单次查询速度提升3-5倍 |
+| **只读副本** | 从只读副本采集数据，避免影响主库性能 | 消除对主库的影响 |
+| **连接池复用** | 合理配置MaxOpenConns和MaxIdleConns | 减少50%的连接开销 |
+| **并行采集** | 对于多表采集，使用goroutine并行执行 | 总耗时缩短至1/N |
+| **批量提交** | 采集后的数据批量写入目标存储 | 写入吞吐量提升10倍+ |
+
+**10. 监控指标**
+
+数据库采集器暴露以下Prometheus指标：
+
+```go
+// 查询执行时长
+db_query_duration_seconds{datasource="xxx", table="xxx", mode="incremental"} 0.125
+
+// 采集行数
+db_rows_fetched_total{datasource="xxx", table="xxx"} 15420
+
+// 连接池状态
+db_connection_pool_size{datasource="xxx", state="open"} 10
+db_connection_pool_size{datasource="xxx", state="idle"} 5
+db_connection_pool_size{datasource="xxx", state="in_use"} 5
+
+// 错误统计
+db_collection_errors_total{datasource="xxx", table="xxx", error_type="timeout"} 3
+
+// Checkpoint更新时间
+db_checkpoint_update_timestamp{datasource="xxx", table="xxx"} 1730022000
+```
+
+##### 3.2.3.5. 反爬虫与反检测机制
+
+![反爬虫与反检测流程图](diagrams/anti_detection_flow.png)
+
+在数据采集过程中，目标网站往往部署了多种反爬虫检测手段。为了提高采集成功率和系统稳定性，DataFusion设计了一套完整的反检测机制，包括代理IP管理、浏览器指纹伪装、请求频率控制等多层防护策略。
+
+**1. IP代理池管理（接口预留）**
+
+系统定义了统一的代理提供商接口，支持对接第三方代理服务或自建代理池：
+
+```go
+// 代理提供商接口（可对接第三方服务）
+type ProxyProvider interface {
+    // 获取可用代理
+    GetProxy(ctx context.Context) (*Proxy, error)
+
+    // 释放代理（归还到池中）
+    ReleaseProxy(proxy *Proxy) error
+
+    // 标记代理不可用
+    MarkProxyFailed(proxy *Proxy, reason string) error
+
+    // 获取代理池统计信息
+    GetStats() *ProxyPoolStats
+
+    // 健康检查
+    HealthCheck() error
+}
+
+type Proxy struct {
+    ID       string // 代理ID
+    Server   string // 代理服务器地址（如：http://proxy.example.com:8080）
+    Username string // 认证用户名（可选）
+    Password string // 认证密码（可选）
+    Protocol string // 协议类型：http/https/socks5
+    Country  string // 代理所在国家/地区
+    Speed    int    // 响应速度（毫秒）
+    Status   string // 状态：active/failed/banned
+}
+
+type ProxyPoolStats struct {
+    TotalCount     int // 总代理数
+    ActiveCount    int // 可用代理数
+    FailedCount    int // 失败代理数
+    SuccessRate    float64 // 成功率
+    AvgResponseTime int // 平均响应时间（毫秒）
+}
+```
+
+**(1) 内置轮询代理提供商**
+
+```go
+type RoundRobinProxyProvider struct {
+    proxies []*Proxy
+    current int
+    mu      sync.Mutex
+}
+
+func (rp *RoundRobinProxyProvider) GetProxy(ctx context.Context) (*Proxy, error) {
+    rp.mu.Lock()
+    defer rp.mu.Unlock()
+
+    if len(rp.proxies) == 0 {
+        return nil, errors.New("no proxy available")
+    }
+
+    // 轮询选择
+    proxy := rp.proxies[rp.current]
+    rp.current = (rp.current + 1) % len(rp.proxies)
+
+    return proxy, nil
+}
+```
+
+**(2) 随机代理提供商**
+
+```go
+type RandomProxyProvider struct {
+    proxies []*Proxy
+    mu      sync.RWMutex
+}
+
+func (rp *RandomProxyProvider) GetProxy(ctx context.Context) (*Proxy, error) {
+    rp.mu.RLock()
+    defer rp.mu.RUnlock()
+
+    if len(rp.proxies) == 0 {
+        return nil, errors.New("no proxy available")
+    }
+
+    // 随机选择
+    idx := rand.Intn(len(rp.proxies))
+    return rp.proxies[idx], nil
+}
+```
+
+**(3) 加权代理提供商（根据速度和成功率）**
+
+```go
+type WeightedProxyProvider struct {
+    proxies []*ProxyWithWeight
+    mu      sync.RWMutex
+}
+
+type ProxyWithWeight struct {
+    Proxy       *Proxy
+    Weight      int     // 权重（基于成功率和速度计算）
+    SuccessRate float64
+}
+
+func (wp *WeightedProxyProvider) GetProxy(ctx context.Context) (*Proxy, error) {
+    wp.mu.RLock()
+    defer wp.mu.RUnlock()
+
+    // 计算总权重
+    totalWeight := 0
+    for _, pw := range wp.proxies {
+        totalWeight += pw.Weight
+    }
+
+    // 加权随机选择
+    r := rand.Intn(totalWeight)
+    for _, pw := range wp.proxies {
+        r -= pw.Weight
+        if r < 0 {
+            return pw.Proxy, nil
+        }
+    }
+
+    return wp.proxies[0].Proxy, nil
+}
+```
+
+**(4) 对接第三方代理服务商示例**
+
+```go
+// 第三方代理服务商适配器
+type ThirdPartyProxyProvider struct {
+    apiKey    string
+    apiURL    string
+    httpClient *http.Client
+}
+
+func (tp *ThirdPartyProxyProvider) GetProxy(ctx context.Context) (*Proxy, error) {
+    // 调用第三方API获取代理
+    resp, err := tp.httpClient.Get(fmt.Sprintf("%s/get_proxy?api_key=%s", tp.apiURL, tp.apiKey))
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    var result struct {
+        Server   string `json:"server"`
+        Port     int    `json:"port"`
+        Username string `json:"username"`
+        Password string `json:"password"`
+    }
+
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, err
+    }
+
+    return &Proxy{
+        Server:   fmt.Sprintf("http://%s:%d", result.Server, result.Port),
+        Username: result.Username,
+        Password: result.Password,
+        Protocol: "http",
+    }, nil
+}
+```
+
+配置示例：
+
+```json
+{
+  "proxy_config": {
+    "enabled": true,
+    "provider": "third_party",
+    "strategy": "weighted",
+    "third_party": {
+      "api_url": "https://api.proxy-provider.com",
+      "api_key": "your_api_key_here"
+    },
+    "static_proxies": [
+      {
+        "server": "http://proxy1.example.com:8080",
+        "username": "user1",
+        "password": "pass1"
+      },
+      {
+        "server": "http://proxy2.example.com:8080",
+        "username": "user2",
+        "password": "pass2"
+      }
+    ],
+    "health_check_interval": 300,
+    "max_retry_per_proxy": 2
+  }
+}
+```
+
+**2. User-Agent轮换策略**
+
+系统内置常见浏览器UA库，支持随机轮换和智能匹配：
+
+```go
+type UserAgentManager struct {
+    userAgents []UserAgent
+    mu         sync.RWMutex
+}
+
+type UserAgent struct {
+    UA           string // User-Agent字符串
+    Browser      string // 浏览器类型：Chrome/Firefox/Safari/Edge
+    Version      string // 浏览器版本
+    Platform     string // 操作系统：Windows/macOS/Linux
+    Mobile       bool   // 是否移动端
+    SecChUa      string // Sec-Ch-Ua头部
+    SecChUaPlatform string // Sec-Ch-Ua-Platform头部
+    SecChUaMobile   string // Sec-Ch-Ua-Mobile头部
+}
+
+var DefaultUserAgents = []UserAgent{
+    // Chrome on Windows
+    {
+        UA:              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Browser:         "Chrome",
+        Version:         "120.0.0.0",
+        Platform:        "Windows",
+        Mobile:          false,
+        SecChUa:         `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`,
+        SecChUaPlatform: `"Windows"`,
+        SecChUaMobile:   "?0",
+    },
+    // Chrome on Linux
+    {
+        UA:              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Browser:         "Chrome",
+        Version:         "120.0.0.0",
+        Platform:        "Linux",
+        Mobile:          false,
+        SecChUa:         `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`,
+        SecChUaPlatform: `"Linux"`,
+        SecChUaMobile:   "?0",
+    },
+    // Firefox on Windows
+    {
+        UA:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        Browser:  "Firefox",
+        Version:  "121.0",
+        Platform: "Windows",
+        Mobile:   false,
+    },
+    // Safari on macOS
+    {
+        UA:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+        Browser:  "Safari",
+        Version:  "17.1",
+        Platform: "macOS",
+        Mobile:   false,
+    },
+}
+
+// 随机获取User-Agent
+func (uam *UserAgentManager) GetRandom() UserAgent {
+    uam.mu.RLock()
+    defer uam.mu.RUnlock()
+
+    if len(uam.userAgents) == 0 {
+        return DefaultUserAgents[0]
+    }
+
+    idx := rand.Intn(len(uam.userAgents))
+    return uam.userAgents[idx]
+}
+
+// 根据平台筛选User-Agent
+func (uam *UserAgentManager) GetByPlatform(platform string) UserAgent {
+    uam.mu.RLock()
+    defer uam.mu.RUnlock()
+
+    var candidates []UserAgent
+    for _, ua := range uam.userAgents {
+        if ua.Platform == platform {
+            candidates = append(candidates, ua)
+        }
+    }
+
+    if len(candidates) == 0 {
+        return uam.GetRandom()
+    }
+
+    return candidates[rand.Intn(len(candidates))]
+}
+
+// 应用User-Agent到HTTP请求
+func ApplyUserAgent(req *http.Request, ua UserAgent) {
+    req.Header.Set("User-Agent", ua.UA)
+
+    // 添加Client Hints头部（仅Chromium系浏览器）
+    if ua.Browser == "Chrome" || ua.Browser == "Edge" {
+        req.Header.Set("Sec-Ch-Ua", ua.SecChUa)
+        req.Header.Set("Sec-Ch-Ua-Platform", ua.SecChUaPlatform)
+        req.Header.Set("Sec-Ch-Ua-Mobile", ua.SecChUaMobile)
+    }
+
+    // 添加Accept语言
+    req.Header.Set("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7")
+
+    // 添加Accept编码
+    req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+
+    // 添加Accept
+    req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+}
+```
+
+**3. 浏览器指纹伪装（Linux环境）**
+
+针对RPA采集模式，在Linux环境下运行Headless Chrome时，需要注入反检测脚本：
+
+```go
+type AntiDetectionScript struct {
+    // 反检测脚本内容
+    Script string
+}
+
+// 生成反检测脚本
+func GenerateAntiDetectionScript() string {
+    return `
+// 1. 隐藏webdriver属性
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => false,
+});
+
+// 2. 覆盖chrome对象
+window.navigator.chrome = {
+    runtime: {},
+};
+
+// 3. 覆盖permissions对象
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+
+// 4. 覆盖plugins
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5],
+});
+
+// 5. 覆盖languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+});
+
+// 6. Canvas指纹随机化
+const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+HTMLCanvasElement.prototype.toDataURL = function(type) {
+    if (type === 'image/png' && this.width === 280 && this.height === 60) {
+        // 检测到Canvas指纹探测，添加随机噪点
+        const context = this.getContext('2d');
+        const imageData = context.getImageData(0, 0, this.width, this.height);
+        for (let i = 0; i < imageData.data.length; i += 4) {
+            imageData.data[i] += Math.floor(Math.random() * 10) - 5;
+        }
+        context.putImageData(imageData, 0, 0);
+    }
+    return originalToDataURL.apply(this, arguments);
+};
+
+// 7. WebGL指纹随机化
+const getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) {
+        return 'Intel Inc.';
+    }
+    if (parameter === 37446) {
+        return 'Intel Iris OpenGL Engine';
+    }
+    return getParameter.apply(this, arguments);
+};
+
+// 8. 随机化屏幕分辨率偏移
+const originalWidth = screen.width;
+const originalHeight = screen.height;
+Object.defineProperty(screen, 'width', {
+    get: () => originalWidth + Math.floor(Math.random() * 10) - 5,
+});
+Object.defineProperty(screen, 'height', {
+    get: () => originalHeight + Math.floor(Math.random() * 10) - 5,
+});
+
+// 9. 随机化时区偏移（可选）
+// Date.prototype.getTimezoneOffset = function() { return -480; }; // UTC+8
+
+// 10. 覆盖Notification权限
+Object.defineProperty(Notification, 'permission', {
+    get: () => 'default',
+});
+
+console.log('[AntiDetection] Script injected successfully');
+`
+}
+
+// 应用反检测脚本到Playwright页面
+func ApplyAntiDetection(page playwright.Page) error {
+    script := GenerateAntiDetectionScript()
+
+    // 在页面加载前注入脚本
+    return page.AddInitScript(playwright.Script{
+        Content: playwright.String(script),
+    })
+}
+```
+
+在创建浏览器实例时应用：
+
+```go
+func (r *RPACollector) setupAntiDetection(page playwright.Page, config *RPAConfig) error {
+    // 1. 注入反检测脚本
+    if err := ApplyAntiDetection(page); err != nil {
+        return fmt.Errorf("failed to apply anti-detection script: %w", err)
+    }
+
+    // 2. 设置随机Viewport
+    width := 1920 + rand.Intn(100) - 50
+    height := 1080 + rand.Intn(100) - 50
+    page.SetViewportSize(width, height)
+
+    // 3. 设置随机时区
+    timezones := []string{"America/New_York", "Europe/London", "Asia/Shanghai", "Asia/Tokyo"}
+    timezone := timezones[rand.Intn(len(timezones))]
+    page.SetExtraHTTPHeaders(map[string]string{
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    // 4. 设置地理位置（如果需要）
+    if config.Geolocation != nil {
+        page.Context().SetGeolocation(playwright.Geolocation{
+            Latitude:  config.Geolocation.Latitude,
+            Longitude: config.Geolocation.Longitude,
+        })
+    }
+
+    return nil
+}
+```
+
+**4. Cookie与Session管理**
+
+**(1) Cookie持久化存储**
+
+```go
+type CookieManager struct {
+    redis *redis.Client
+    pg    *sql.DB
+}
+
+// 保存Cookie到Redis和PostgreSQL
+func (cm *CookieManager) SaveCookies(datasourceID string, cookies []*http.Cookie) error {
+    key := fmt.Sprintf("cookies:%s", datasourceID)
+
+    // 序列化Cookie
+    data, err := json.Marshal(cookies)
+    if err != nil {
+        return err
+    }
+
+    // 保存到Redis（缓存，24小时过期）
+    err = cm.redis.Set(context.Background(), key, data, 24*time.Hour).Err()
+    if err != nil {
+        log.Warnf("Failed to save cookies to Redis: %v", err)
+    }
+
+    // 保存到PostgreSQL（持久化）
+    _, err = cm.pg.Exec(`
+        INSERT INTO datasource_cookies (datasource_id, cookies, updated_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (datasource_id)
+        DO UPDATE SET cookies = $2, updated_at = $3
+    `, datasourceID, string(data), time.Now())
+
+    return err
+}
+
+// 从存储加载Cookie
+func (cm *CookieManager) LoadCookies(datasourceID string) ([]*http.Cookie, error) {
+    key := fmt.Sprintf("cookies:%s", datasourceID)
+
+    // 优先从Redis读取
+    data, err := cm.redis.Get(context.Background(), key).Result()
+    if err == nil {
+        var cookies []*http.Cookie
+        if err := json.Unmarshal([]byte(data), &cookies); err == nil {
+            return cookies, nil
+        }
+    }
+
+    // Redis miss，从PostgreSQL读取
+    var cookiesJSON string
+    err = cm.pg.QueryRow(
+        "SELECT cookies FROM datasource_cookies WHERE datasource_id = $1",
+        datasourceID,
+    ).Scan(&cookiesJSON)
+
+    if err == sql.ErrNoRows {
+        return nil, nil // 无Cookie
+    }
+    if err != nil {
+        return nil, err
+    }
+
+    var cookies []*http.Cookie
+    if err := json.Unmarshal([]byte(cookiesJSON), &cookies); err != nil {
+        return nil, err
+    }
+
+    // 回写Redis
+    cm.redis.Set(context.Background(), key, cookiesJSON, 24*time.Hour)
+
+    return cookies, nil
+}
+
+// 外部Cookie导入接口
+func (cm *CookieManager) ImportCookies(datasourceID string, cookiesJSON string) error {
+    var cookies []*http.Cookie
+    if err := json.Unmarshal([]byte(cookiesJSON), &cookies); err != nil {
+        return fmt.Errorf("invalid cookie format: %w", err)
+    }
+
+    return cm.SaveCookies(datasourceID, cookies)
+}
+```
+
+PostgreSQL表结构：
+
+```sql
+CREATE TABLE datasource_cookies (
+    id             SERIAL PRIMARY KEY,
+    datasource_id  VARCHAR(64) NOT NULL UNIQUE,
+    cookies        TEXT NOT NULL,  -- JSON格式存储Cookie数组
+    updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_cookies_datasource ON datasource_cookies(datasource_id);
+```
+
+**(2) Playwright中的Cookie管理**
+
+```go
+func (r *RPACollector) applyCookies(page playwright.Page, datasourceID string) error {
+    // 加载持久化的Cookie
+    cookies, err := r.cookieManager.LoadCookies(datasourceID)
+    if err != nil {
+        return err
+    }
+
+    if len(cookies) == 0 {
+        return nil // 无Cookie，跳过
+    }
+
+    // 转换为Playwright Cookie格式
+    var pwCookies []playwright.OptionalCookie
+    for _, c := range cookies {
+        pwCookies = append(pwCookies, playwright.OptionalCookie{
+            Name:     c.Name,
+            Value:    c.Value,
+            Domain:   playwright.String(c.Domain),
+            Path:     playwright.String(c.Path),
+            Expires:  playwright.Float(float64(c.Expires.Unix())),
+            HttpOnly: playwright.Bool(c.HttpOnly),
+            Secure:   playwright.Bool(c.Secure),
+            SameSite: playwright.SameSiteAttributeLax,
+        })
+    }
+
+    // 添加Cookie到浏览器上下文
+    return page.Context().AddCookies(pwCookies...)
+}
+
+// 采集完成后保存更新的Cookie
+func (r *RPACollector) saveCookiesAfterCollection(page playwright.Page, datasourceID string) error {
+    // 获取当前所有Cookie
+    pwCookies, err := page.Context().Cookies()
+    if err != nil {
+        return err
+    }
+
+    // 转换为http.Cookie格式
+    var cookies []*http.Cookie
+    for _, c := range pwCookies {
+        cookies = append(cookies, &http.Cookie{
+            Name:     c.Name,
+            Value:    c.Value,
+            Domain:   c.Domain,
+            Path:     c.Path,
+            Expires:  time.Unix(int64(c.Expires), 0),
+            HttpOnly: c.HttpOnly,
+            Secure:   c.Secure,
+        })
+    }
+
+    // 持久化保存
+    return r.cookieManager.SaveCookies(datasourceID, cookies)
+}
+```
+
+**5. 请求频率智能调节**
+
+**(1) 分布式限流器（基于Redis）**
+
+```go
+type DistributedRateLimiter struct {
+    redis  *redis.Client
+    lua    *redis.Script // Lua脚本，实现令牌桶算法
+}
+
+// 令牌桶算法Lua脚本
+const tokenBucketLuaScript = `
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local requested = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+
+local bucket = redis.call('HMGET', key, 'tokens', 'last_update')
+local tokens = tonumber(bucket[1]) or capacity
+local last_update = tonumber(bucket[2]) or now
+
+-- 计算新增的令牌数
+local elapsed = now - last_update
+local new_tokens = math.floor(elapsed * rate)
+tokens = math.min(capacity, tokens + new_tokens)
+
+-- 尝试获取令牌
+if tokens >= requested then
+    tokens = tokens - requested
+    redis.call('HMSET', key, 'tokens', tokens, 'last_update', now)
+    redis.call('EXPIRE', key, 3600)
+    return 1  -- 成功获取令牌
+else
+    return 0  -- 令牌不足
+end
+`
+
+func NewDistributedRateLimiter(redis *redis.Client) *DistributedRateLimiter {
+    return &DistributedRateLimiter{
+        redis: redis,
+        lua:   redis.NewScript(tokenBucketLuaScript),
+    }
+}
+
+// 尝试获取令牌
+func (drl *DistributedRateLimiter) Acquire(datasourceID string, capacity, rate int) (bool, error) {
+    key := fmt.Sprintf("rate_limit:%s", datasourceID)
+    now := time.Now().Unix()
+
+    result, err := drl.lua.Run(
+        context.Background(),
+        drl.redis,
+        []string{key},
+        capacity,  // 桶容量
+        rate,      // 每秒生成令牌数
+        1,         // 请求令牌数
+        now,
+    ).Int()
+
+    if err != nil {
+        return false, err
+    }
+
+    return result == 1, nil
+}
+
+// 等待令牌可用
+func (drl *DistributedRateLimiter) WaitAndAcquire(datasourceID string, capacity, rate int, timeout time.Duration) error {
+    deadline := time.Now().Add(timeout)
+
+    for {
+        ok, err := drl.Acquire(datasourceID, capacity, rate)
+        if err != nil {
+            return err
+        }
+
+        if ok {
+            return nil
+        }
+
+        if time.Now().After(deadline) {
+            return errors.New("rate limit wait timeout")
+        }
+
+        // 等待一段时间后重试
+        time.Sleep(time.Duration(1000/rate) * time.Millisecond)
+    }
+}
+```
+
+**(2) 自适应限流（根据响应码动态调整）**
+
+```go
+type AdaptiveRateLimiter struct {
+    baseLimiter   *DistributedRateLimiter
+    baseRate      int // 基础速率（请求/秒）
+    currentRate   int // 当前速率
+    consecutiveLimits int // 连续遇到限流的次数
+    mu            sync.Mutex
+}
+
+func NewAdaptiveRateLimiter(redis *redis.Client, baseRate int) *AdaptiveRateLimiter {
+    return &AdaptiveRateLimiter{
+        baseLimiter: NewDistributedRateLimiter(redis),
+        baseRate:    baseRate,
+        currentRate: baseRate,
+    }
+}
+
+// 根据响应码调整速率
+func (arl *AdaptiveRateLimiter) AdjustRate(statusCode int) {
+    arl.mu.Lock()
+    defer arl.mu.Unlock()
+
+    if statusCode == 429 || statusCode == 503 {
+        // 遇到限流，降低速率
+        arl.consecutiveLimits++
+        arl.currentRate = arl.currentRate / 2
+        if arl.currentRate < 1 {
+            arl.currentRate = 1
+        }
+        log.Warnf("Rate limit detected (status %d), reducing rate to %d req/s", statusCode, arl.currentRate)
+    } else if statusCode >= 200 && statusCode < 300 {
+        // 请求成功，尝试恢复速率
+        if arl.consecutiveLimits > 0 {
+            arl.consecutiveLimits--
+        } else if arl.currentRate < arl.baseRate {
+            arl.currentRate = int(float64(arl.currentRate) * 1.2)
+            if arl.currentRate > arl.baseRate {
+                arl.currentRate = arl.baseRate
+            }
+            log.Infof("Recovering rate to %d req/s", arl.currentRate)
+        }
+    }
+}
+
+func (arl *AdaptiveRateLimiter) GetCurrentRate() int {
+    arl.mu.Lock()
+    defer arl.mu.Unlock()
+    return arl.currentRate
+}
+```
+
+**(3) 随机延迟（模拟人类行为）**
+
+```go
+type HumanBehaviorSimulator struct {
+    minDelay time.Duration
+    maxDelay time.Duration
+}
+
+func NewHumanBehaviorSimulator() *HumanBehaviorSimulator {
+    return &HumanBehaviorSimulator{
+        minDelay: 1 * time.Second,
+        maxDelay: 5 * time.Second,
+    }
+}
+
+// 生成随机延迟
+func (hbs *HumanBehaviorSimulator) RandomDelay() time.Duration {
+    deltaMs := hbs.maxDelay.Milliseconds() - hbs.minDelay.Milliseconds()
+    randomMs := hbs.minDelay.Milliseconds() + rand.Int63n(deltaMs)
+
+    // 添加20%的抖动
+    jitter := float64(randomMs) * 0.2 * (rand.Float64()*2 - 1)
+    finalMs := randomMs + int64(jitter)
+
+    return time.Duration(finalMs) * time.Millisecond
+}
+
+// 模拟页面停留时间
+func (hbs *HumanBehaviorSimulator) PageDwellTime() time.Duration {
+    // 2-10秒的页面停留时间
+    baseMs := 2000 + rand.Int63n(8000)
+    return time.Duration(baseMs) * time.Millisecond
+}
+
+// 模拟鼠标移动速度
+func (hbs *HumanBehaviorSimulator) MouseMoveDuration() time.Duration {
+    // 100-500ms的鼠标移动时间
+    return time.Duration(100+rand.Intn(400)) * time.Millisecond
+}
+```
+
+**6. 验证码处理（接口预留）**
+
+```go
+// 验证码识别器接口
+type CaptchaSolver interface {
+    // 识别验证码图片
+    Solve(imageData []byte, captchaType string) (string, error)
+
+    // 获取识别器名称
+    Name() string
+
+    // 检查识别器是否可用
+    IsAvailable() bool
+}
+
+// 第三方打码平台适配器
+type ThirdPartyCaptchaSolver struct {
+    apiKey  string
+    apiURL  string
+    timeout time.Duration
+}
+
+func (tpcs *ThirdPartyCaptchaSolver) Solve(imageData []byte, captchaType string) (string, error) {
+    // 调用第三方打码平台API
+    body := &bytes.Buffer{}
+    writer := multipart.NewWriter(body)
+
+    part, err := writer.CreateFormFile("image", "captcha.png")
+    if err != nil {
+        return "", err
+    }
+    part.Write(imageData)
+
+    writer.WriteField("api_key", tpcs.apiKey)
+    writer.WriteField("type", captchaType)
+    writer.Close()
+
+    req, err := http.NewRequest("POST", tpcs.apiURL+"/solve", body)
+    if err != nil {
+        return "", err
+    }
+    req.Header.Set("Content-Type", writer.FormDataContentType())
+
+    client := &http.Client{Timeout: tpcs.timeout}
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+
+    var result struct {
+        Success bool   `json:"success"`
+        Code    string `json:"code"`
+        Message string `json:"message"`
+    }
+
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return "", err
+    }
+
+    if !result.Success {
+        return "", fmt.Errorf("captcha solve failed: %s", result.Message)
+    }
+
+    return result.Code, nil
+}
+
+// 本地OCR识别器（预留）
+type LocalOCRSolver struct {
+    // 可以集成tesseract或其他OCR引擎
+}
+
+func (los *LocalOCRSolver) Solve(imageData []byte, captchaType string) (string, error) {
+    // TODO: 实现本地OCR识别
+    return "", errors.New("local OCR not implemented yet")
+}
+```
+
+配置示例：
+
+```json
+{
+  "captcha_config": {
+    "enabled": true,
+    "solver": "third_party",
+    "third_party": {
+      "api_url": "https://api.2captcha.com",
+      "api_key": "your_api_key_here",
+      "timeout": 120
+    }
+  }
+}
+```
+
+**7. RPA行为模拟**
+
+```go
+func (r *RPACollector) simulateHumanBehavior(page playwright.Page) error {
+    simulator := NewHumanBehaviorSimulator()
+
+    // 1. 随机滚动页面
+    if rand.Float64() < 0.8 { // 80%概率滚动
+        scrollSteps := 3 + rand.Intn(5) // 3-7次滚动
+        for i := 0; i < scrollSteps; i++ {
+            scrollY := 200 + rand.Intn(300) // 每次滚动200-500px
+            page.Evaluate(fmt.Sprintf("window.scrollBy(0, %d)", scrollY))
+            time.Sleep(simulator.MouseMoveDuration())
+        }
+    }
+
+    // 2. 随机鼠标移动
+    if rand.Float64() < 0.5 { // 50%概率移动鼠标
+        x := rand.Float64() * 800
+        y := rand.Float64() * 600
+        page.Mouse().Move(x, y, playwright.MouseMoveOptions{
+            Steps: playwright.Int(10 + rand.Intn(20)),
+        })
+    }
+
+    // 3. 页面停留时间
+    time.Sleep(simulator.PageDwellTime())
+
+    return nil
+}
+```
+
+**8. 综合配置示例**
+
+完整的反爬虫配置：
+
+```json
+{
+  "collection_method": "rpa",
+  "anti_detection_config": {
+    "proxy": {
+      "enabled": true,
+      "provider": "third_party",
+      "strategy": "weighted"
+    },
+    "user_agent": {
+      "rotate": true,
+      "platform": "Linux"
+    },
+    "fingerprint": {
+      "randomize_canvas": true,
+      "randomize_webgl": true,
+      "randomize_screen": true,
+      "timezone": "random"
+    },
+    "rate_limit": {
+      "enabled": true,
+      "base_rate": 5,
+      "adaptive": true,
+      "min_delay": 1000,
+      "max_delay": 5000
+    },
+    "behavior_simulation": {
+      "scroll_page": true,
+      "mouse_movement": true,
+      "page_dwell_time": true
+    },
+    "cookie": {
+      "persist": true,
+      "import_external": false
+    },
+    "captcha": {
+      "solver": "third_party",
+      "auto_retry": true
+    }
+  }
+}
+```
+
+**9. 监控指标**
+
+```go
+// 反检测相关指标
+anti_detection_proxy_requests_total{datasource="xxx", proxy="xxx", status="success"} 1250
+anti_detection_proxy_requests_total{datasource="xxx", proxy="xxx", status="failed"} 15
+
+anti_detection_captcha_solve_total{datasource="xxx", solver="third_party", success="true"} 42
+anti_detection_captcha_solve_duration_seconds{datasource="xxx"} 2.5
+
+anti_detection_rate_limit_triggered_total{datasource="xxx"} 8
+anti_detection_current_rate{datasource="xxx"} 3.5
+```
+
+##### 3.2.3.6. 浏览器池管理
+
+![浏览器池架构图](diagrams/browser_pool_architecture.png)
+
+为了提高RPA采集的性能和资源利用率，系统实现了浏览器实例池化管理。在Linux环境下运行Headless Chrome，通过池化技术复用浏览器进程，同时严格控制资源消耗。
+
+**1. 池化架构设计**
+
+根据用户需求确认，系统采用**独占模式**：每个任务独占一个浏览器实例，用完即销毁。这种模式的优势是：
+- 避免任务间的状态污染
+- 简化资源清理逻辑
+- 降低安全风险
+
+```go
+type BrowserPoolConfig struct {
+    MaxPoolSize        int           // 最大池容量（默认10）
+    InstanceMemoryLimit int64        // 单实例内存限制（字节，默认1GB）
+    InstanceTimeout    time.Duration // 实例超时时间（默认300秒）
+    AcquisitionTimeout time.Duration // 获取实例超时（默认60秒）
+    CleanupInterval    time.Duration // 清理检查间隔（默认30秒）
+}
+
+type BrowserPool struct {
+    config      *BrowserPoolConfig
+    instances   []*BrowserInstance
+    semaphore   chan struct{}       // 信号量，控制最大并发数
+    mu          sync.RWMutex
+    playwright  *playwright.Playwright
+    closeChan   chan struct{}
+}
+
+type BrowserInstance struct {
+    ID          string
+    Browser     playwright.Browser
+    CreatedAt   time.Time
+    LastUsedAt  time.Time
+    Status      InstanceStatus // idle/in_use/failed
+    ProcessID   int            // Chrome进程PID
+    MemoryUsage int64          // 当前内存使用（字节）
+}
+
+type InstanceStatus string
+
+const (
+    InstanceStatusIdle   InstanceStatus = "idle"
+    InstanceStatusInUse  InstanceStatus = "in_use"
+    InstanceStatusFailed InstanceStatus = "failed"
+)
+
+func NewBrowserPool(config *BrowserPoolConfig) (*BrowserPool, error) {
+    pw, err := playwright.Run()
+    if err != nil {
+        return nil, fmt.Errorf("failed to start playwright: %w", err)
+    }
+
+    pool := &BrowserPool{
+        config:     config,
+        instances:  make([]*BrowserInstance, 0),
+        semaphore:  make(chan struct{}, config.MaxPoolSize),
+        playwright: pw,
+        closeChan:  make(chan struct{}),
+    }
+
+    // 启动后台清理协程
+    go pool.cleanupLoop()
+
+    return pool, nil
+}
+```
+
+**2. 实例生命周期管理**
+
+**(1) 按需创建（Lazy Initialization）**
+
+```go
+func (bp *BrowserPool) Acquire(ctx context.Context) (*BrowserInstance, error) {
+    // 1. 获取信号量（阻塞直到有可用槽位）
+    select {
+    case bp.semaphore <- struct{}{}:
+        // 成功获取槽位
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    case <-time.After(bp.config.AcquisitionTimeout):
+        return nil, errors.New("acquire browser instance timeout")
+    }
+
+    // 2. 创建新的浏览器实例
+    instance, err := bp.createInstance(ctx)
+    if err != nil {
+        <-bp.semaphore // 释放信号量
+        return nil, err
+    }
+
+    // 3. 记录到池中
+    bp.mu.Lock()
+    bp.instances = append(bp.instances, instance)
+    instance.Status = InstanceStatusInUse
+    instance.LastUsedAt = time.Now()
+    bp.mu.Unlock()
+
+    log.Infof("Browser instance %s acquired (total: %d/%d)", instance.ID, len(bp.instances), bp.config.MaxPoolSize)
+
+    return instance, nil
+}
+
+func (bp *BrowserPool) createInstance(ctx context.Context) (*BrowserInstance, error) {
+    // 配置Chrome启动参数（Linux优化）
+    launchOptions := playwright.BrowserTypeLaunchOptions{
+        Headless: playwright.Bool(true),
+        Args: []string{
+            "--no-sandbox",                    // 禁用沙箱（Linux容器必需）
+            "--disable-dev-shm-usage",         // 使用/tmp而非/dev/shm
+            "--disable-gpu",                   // 禁用GPU
+            "--disable-software-rasterizer",   // 禁用软件光栅化
+            "--disable-extensions",            // 禁用扩展
+            "--disable-background-networking", // 禁用后台网络
+            "--disable-sync",                  // 禁用同步
+            fmt.Sprintf("--max-old-space-size=%d", bp.config.InstanceMemoryLimit/1024/1024), // 内存限制
+        },
+    }
+
+    // 启动浏览器
+    browser, err := bp.playwright.Chromium.Launch(launchOptions)
+    if err != nil {
+        return nil, fmt.Errorf("failed to launch browser: %w", err)
+    }
+
+    instance := &BrowserInstance{
+        ID:         uuid.New().String(),
+        Browser:    browser,
+        CreatedAt:  time.Now(),
+        LastUsedAt: time.Now(),
+        Status:     InstanceStatusIdle,
+    }
+
+    // 获取Chrome进程PID（用于资源监控）
+    // 注意：Playwright的Browser对象没有直接暴露PID，需要通过其他方式获取
+    // 这里简化处理，实际可通过ps命令查找
+
+    log.Infof("Browser instance %s created", instance.ID)
+
+    return instance, nil
+}
+```
+
+**(2) 使用完成后销毁**
+
+```go
+func (bp *BrowserPool) Release(instance *BrowserInstance) error {
+    defer func() {
+        <-bp.semaphore // 释放信号量
+    }()
+
+    bp.mu.Lock()
+    defer bp.mu.Unlock()
+
+    // 关闭浏览器
+    if err := instance.Browser.Close(); err != nil {
+        log.Errorf("Failed to close browser instance %s: %v", instance.ID, err)
+    }
+
+    // 从池中移除
+    for i, inst := range bp.instances {
+        if inst.ID == instance.ID {
+            bp.instances = append(bp.instances[:i], bp.instances[i+1:]...)
+            break
+        }
+    }
+
+    log.Infof("Browser instance %s released (remaining: %d)", instance.ID, len(bp.instances))
+
+    return nil
+}
+```
+
+**(3) 异常实例清理**
+
+```go
+func (bp *BrowserPool) cleanupLoop() {
+    ticker := time.NewTicker(bp.config.CleanupInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ticker.C:
+            bp.cleanup()
+        case <-bp.closeChan:
+            return
+        }
+    }
+}
+
+func (bp *BrowserPool) cleanup() {
+    bp.mu.Lock()
+    defer bp.mu.Unlock()
+
+    now := time.Now()
+    var toRemove []int
+
+    for i, instance := range bp.instances {
+        // 检查超时实例
+        if instance.Status == InstanceStatusInUse && now.Sub(instance.LastUsedAt) > bp.config.InstanceTimeout {
+            log.Warnf("Browser instance %s timeout, marking as failed", instance.ID)
+            instance.Status = InstanceStatusFailed
+            toRemove = append(toRemove, i)
+        }
+
+        // 检查内存超限实例
+        if instance.MemoryUsage > bp.config.InstanceMemoryLimit {
+            log.Warnf("Browser instance %s memory exceeded limit (%d > %d), killing",
+                instance.ID, instance.MemoryUsage, bp.config.InstanceMemoryLimit)
+            instance.Status = InstanceStatusFailed
+            toRemove = append(toRemove, i)
+        }
+    }
+
+    // 移除失效实例
+    for i := len(toRemove) - 1; i >= 0; i-- {
+        idx := toRemove[i]
+        instance := bp.instances[idx]
+
+        // 强制关闭浏览器
+        instance.Browser.Close()
+
+        // 如果有PID，尝试kill进程
+        if instance.ProcessID > 0 {
+            syscall.Kill(instance.ProcessID, syscall.SIGKILL)
+        }
+
+        // 从池中移除
+        bp.instances = append(bp.instances[:idx], bp.instances[idx+1:]...)
+
+        // 释放信号量
+        <-bp.semaphore
+    }
+
+    if len(toRemove) > 0 {
+        log.Infof("Cleaned up %d failed browser instances", len(toRemove))
+    }
+}
+```
+
+**3. 资源隔离与监控**
+
+**(1) 内存监控**
+
+```go
+type ResourceMonitor struct {
+    pool *BrowserPool
+}
+
+func (rm *ResourceMonitor) MonitorMemory(instance *BrowserInstance) {
+    if instance.ProcessID == 0 {
+        return
+    }
+
+    // 读取进程内存使用（Linux）
+    memFile := fmt.Sprintf("/proc/%d/status", instance.ProcessID)
+    data, err := os.ReadFile(memFile)
+    if err != nil {
+        return
+    }
+
+    // 解析VmRSS（实际物理内存使用）
+    lines := strings.Split(string(data), "\n")
+    for _, line := range lines {
+        if strings.HasPrefix(line, "VmRSS:") {
+            fields := strings.Fields(line)
+            if len(fields) >= 2 {
+                kbUsed, _ := strconv.ParseInt(fields[1], 10, 64)
+                instance.MemoryUsage = kbUsed * 1024 // 转换为字节
+                break
+            }
+        }
+    }
+}
+
+func (rm *ResourceMonitor) StartMonitoring() {
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        rm.pool.mu.RLock()
+        instances := make([]*BrowserInstance, len(rm.pool.instances))
+        copy(instances, rm.pool.instances)
+        rm.pool.mu.RUnlock()
+
+        for _, instance := range instances {
+            rm.MonitorMemory(instance)
+
+            // 上报Prometheus指标
+            browserInstanceMemoryBytes.WithLabelValues(instance.ID).Set(float64(instance.MemoryUsage))
+        }
+    }
+}
+```
+
+**(2) CPU监控**
+
+```go
+func (rm *ResourceMonitor) MonitorCPU(instance *BrowserInstance) float64 {
+    if instance.ProcessID == 0 {
+        return 0
+    }
+
+    // 读取CPU使用（Linux）
+    statFile := fmt.Sprintf("/proc/%d/stat", instance.ProcessID)
+    data, err := os.ReadFile(statFile)
+    if err != nil {
+        return 0
+    }
+
+    fields := strings.Fields(string(data))
+    if len(fields) < 15 {
+        return 0
+    }
+
+    // 解析utime和stime
+    utime, _ := strconv.ParseInt(fields[13], 10, 64)
+    stime, _ := strconv.ParseInt(fields[14], 10, 64)
+    totalTime := utime + stime
+
+    // 计算CPU使用率（简化版，实际需要计算时间差）
+    // 这里仅作示意
+    cpuPercent := float64(totalTime) / 100.0
+
+    return cpuPercent
+}
+```
+
+**4. 并发控制**
+
+使用信号量（Semaphore）实现简单高效的并发控制：
+
+```go
+// 信号量已在BrowserPool结构体中定义
+semaphore: make(chan struct{}, config.MaxPoolSize)
+
+// 获取槽位（阻塞）
+bp.semaphore <- struct{}{}
+
+// 释放槽位
+<-bp.semaphore
+```
+
+优势：
+- 实现简单，性能高
+- 自动排队等待
+- 支持超时控制
+
+**5. 使用示例**
+
+```go
+func (r *RPACollector) Collect(task *Task) (*RawData, error) {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+    defer cancel()
+
+    // 1. 从浏览器池获取实例
+    instance, err := r.browserPool.Acquire(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to acquire browser: %w", err)
+    }
+    defer r.browserPool.Release(instance) // 确保释放
+
+    // 2. 创建新页面
+    page, err := instance.Browser.NewPage()
+    if err != nil {
+        return nil, err
+    }
+    defer page.Close()
+
+    // 3. 应用反检测措施
+    if err := r.setupAntiDetection(page, task.RPAConfig); err != nil {
+        return nil, err
+    }
+
+    // 4. 导航到目标URL
+    if err := page.Goto(task.URL); err != nil {
+        return nil, err
+    }
+
+    // 5. 执行自定义脚本
+    if task.RPAConfig.CustomScript != "" {
+        if _, err := page.Evaluate(task.RPAConfig.CustomScript); err != nil {
+            return nil, err
+        }
+    }
+
+    // 6. 获取页面内容
+    html, err := page.Content()
+    if err != nil {
+        return nil, err
+    }
+
+    return &RawData{
+        HTML: html,
+        URL:  task.URL,
+    }, nil
+}
+```
+
+**6. 配置示例**
+
+```json
+{
+  "browser_pool_config": {
+    "max_pool_size": 10,
+    "instance_memory_limit": 1073741824,
+    "instance_timeout": 300,
+    "acquisition_timeout": 60,
+    "cleanup_interval": 30
+  }
+}
+```
+
+**7. 监控指标**
+
+```go
+// 浏览器池指标
+browser_pool_size{status="total"} 8
+browser_pool_size{status="in_use"} 5
+browser_pool_size{status="idle"} 0
+browser_pool_size{status="failed"} 3
+
+// 单个实例指标
+browser_instance_memory_bytes{instance_id="xxx"} 524288000
+browser_instance_cpu_percent{instance_id="xxx"} 15.2
+browser_instance_age_seconds{instance_id="xxx"} 120
+
+// 获取等待时间
+browser_acquisition_wait_seconds{datasource="xxx"} 0.5
+
+// 清理统计
+browser_cleanup_total{reason="timeout"} 12
+browser_cleanup_total{reason="memory_exceeded"} 5
+```
+
+**8. 最佳实践**
+
+| 配置项 | 推荐值 | 说明 |
+|-------|--------|------|
+| max_pool_size | 10 | 根据服务器CPU核心数调整，建议2倍于核心数 |
+| instance_memory_limit | 1GB | Chrome实例通常占用500MB-1GB内存 |
+| instance_timeout | 300s | 防止任务卡死，5分钟足够大部分页面加载 |
+| acquisition_timeout | 60s | 等待可用实例的最长时间 |
+| cleanup_interval | 30s | 定期清理失效实例，避免资源泄漏 |
+
+**9. 故障恢复**
+
+```go
+func (bp *BrowserPool) HealthCheck() error {
+    bp.mu.RLock()
+    defer bp.mu.RUnlock()
+
+    if len(bp.instances) > bp.config.MaxPoolSize {
+        return fmt.Errorf("pool size exceeded limit: %d > %d", len(bp.instances), bp.config.MaxPoolSize)
+    }
+
+    failedCount := 0
+    for _, instance := range bp.instances {
+        if instance.Status == InstanceStatusFailed {
+            failedCount++
+        }
+    }
+
+    if failedCount > len(bp.instances)/2 {
+        return fmt.Errorf("too many failed instances: %d/%d", failedCount, len(bp.instances))
+    }
+
+    return nil
+}
+
+func (bp *BrowserPool) Close() error {
+    close(bp.closeChan)
+
+    bp.mu.Lock()
+    defer bp.mu.Unlock()
+
+    // 关闭所有浏览器实例
+    for _, instance := range bp.instances {
+        instance.Browser.Close()
+    }
+
+    bp.instances = nil
+
+    // 停止Playwright
+    return bp.playwright.Stop()
+}
+```
+
+##### 3.2.3.7. 采集数据质量保证
+
+![数据质量检查流程图](diagrams/data_quality_check.png)
+
+为了确保采集到的数据满足业务需求，系统设计了完整的数据质量检查机制，在数据进入处理模块之前进行预校验，及早发现和处理低质量数据。
+
+**1. 完整性检查**
+
+```go
+type CompletenessChecker struct {
+    requiredFields []string
+    optionalFields []string
+}
+
+type CompletenessResult struct {
+    TotalFields    int     // 总字段数
+    ValidFields    int     // 有效字段数（非空）
+    MissingFields  []string // 缺失字段
+    EmptyFields    []string // 空值字段
+    CompletenessScore float64 // 完整性得分（0-100）
+}
+
+func (cc *CompletenessChecker) Check(data map[string]interface{}) *CompletenessResult {
+    result := &CompletenessResult{
+        TotalFields:   len(cc.requiredFields) + len(cc.optionalFields),
+        MissingFields: make([]string, 0),
+        EmptyFields:   make([]string, 0),
+    }
+
+    // 检查必填字段
+    for _, field := range cc.requiredFields {
+        value, exists := data[field]
+        if !exists {
+            result.MissingFields = append(result.MissingFields, field)
+        } else if isEmpty(value) {
+            result.EmptyFields = append(result.EmptyFields, field)
+        } else {
+            result.ValidFields++
+        }
+    }
+
+    // 检查可选字段
+    for _, field := range cc.optionalFields {
+        value, exists := data[field]
+        if exists && !isEmpty(value) {
+            result.ValidFields++
+        }
+    }
+
+    // 计算完整性得分
+    result.CompletenessScore = float64(result.ValidFields) / float64(result.TotalFields) * 100
+
+    return result
+}
+
+func isEmpty(value interface{}) bool {
+    if value == nil {
+        return true
+    }
+
+    switch v := value.(type) {
+    case string:
+        return strings.TrimSpace(v) == ""
+    case []interface{}:
+        return len(v) == 0
+    case map[string]interface{}:
+        return len(v) == 0
+    default:
+        return false
+    }
+}
+```
+
+**2. 格式校验**
+
+```go
+type FormatValidator struct {
+    rules map[string]*FieldFormatRule
+}
+
+type FieldFormatRule struct {
+    FieldName string
+    DataType  DataType // string/int/float/date/url/email/enum
+    Pattern   string   // 正则表达式（可选）
+    MinLength int      // 最小长度
+    MaxLength int      // 最大长度
+    MinValue  float64  // 最小值（数值类型）
+    MaxValue  float64  // 最大值（数值类型）
+    EnumValues []string // 枚举值列表
+}
+
+type DataType string
+
+const (
+    DataTypeString DataType = "string"
+    DataTypeInt    DataType = "int"
+    DataTypeFloat  DataType = "float"
+    DataTypeDate   DataType = "date"
+    DataTypeURL    DataType = "url"
+    DataTypeEmail  DataType = "email"
+    DataTypeEnum   DataType = "enum"
+)
+
+func (fv *FormatValidator) Validate(data map[string]interface{}) map[string]error {
+    errors := make(map[string]error)
+
+    for fieldName, rule := range fv.rules {
+        value, exists := data[fieldName]
+        if !exists {
+            continue // 字段不存在，由完整性检查处理
+        }
+
+        if err := fv.validateField(value, rule); err != nil {
+            errors[fieldName] = err
+        }
+    }
+
+    return errors
+}
+
+func (fv *FormatValidator) validateField(value interface{}, rule *FieldFormatRule) error {
+    switch rule.DataType {
+    case DataTypeString:
+        str, ok := value.(string)
+        if !ok {
+            return fmt.Errorf("expected string, got %T", value)
+        }
+        if len(str) < rule.MinLength || (rule.MaxLength > 0 && len(str) > rule.MaxLength) {
+            return fmt.Errorf("string length out of range [%d, %d]", rule.MinLength, rule.MaxLength)
+        }
+        if rule.Pattern != "" {
+            matched, _ := regexp.MatchString(rule.Pattern, str)
+            if !matched {
+                return fmt.Errorf("string does not match pattern: %s", rule.Pattern)
+            }
+        }
+
+    case DataTypeInt:
+        var num int64
+        switch v := value.(type) {
+        case int:
+            num = int64(v)
+        case int64:
+            num = v
+        case float64:
+            num = int64(v)
+        case string:
+            parsed, err := strconv.ParseInt(v, 10, 64)
+            if err != nil {
+                return fmt.Errorf("invalid integer: %s", v)
+            }
+            num = parsed
+        default:
+            return fmt.Errorf("expected integer, got %T", value)
+        }
+        if float64(num) < rule.MinValue || float64(num) > rule.MaxValue {
+            return fmt.Errorf("integer out of range [%.0f, %.0f]", rule.MinValue, rule.MaxValue)
+        }
+
+    case DataTypeFloat:
+        var num float64
+        switch v := value.(type) {
+        case float64:
+            num = v
+        case int:
+            num = float64(v)
+        case string:
+            parsed, err := strconv.ParseFloat(v, 64)
+            if err != nil {
+                return fmt.Errorf("invalid float: %s", v)
+            }
+            num = parsed
+        default:
+            return fmt.Errorf("expected float, got %T", value)
+        }
+        if num < rule.MinValue || num > rule.MaxValue {
+            return fmt.Errorf("float out of range [%.2f, %.2f]", rule.MinValue, rule.MaxValue)
+        }
+
+    case DataTypeDate:
+        str, ok := value.(string)
+        if !ok {
+            return fmt.Errorf("expected date string, got %T", value)
+        }
+        // 尝试多种日期格式
+        formats := []string{
+            "2006-01-02",
+            "2006-01-02 15:04:05",
+            "2006/01/02",
+            time.RFC3339,
+        }
+        var parsed bool
+        for _, format := range formats {
+            if _, err := time.Parse(format, str); err == nil {
+                parsed = true
+                break
+            }
+        }
+        if !parsed {
+            return fmt.Errorf("invalid date format: %s", str)
+        }
+
+    case DataTypeURL:
+        str, ok := value.(string)
+        if !ok {
+            return fmt.Errorf("expected URL string, got %T", value)
+        }
+        u, err := url.Parse(str)
+        if err != nil || u.Scheme == "" || u.Host == "" {
+            return fmt.Errorf("invalid URL: %s", str)
+        }
+
+    case DataTypeEmail:
+        str, ok := value.(string)
+        if !ok {
+            return fmt.Errorf("expected email string, got %T", value)
+        }
+        emailRegex := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+        matched, _ := regexp.MatchString(emailRegex, str)
+        if !matched {
+            return fmt.Errorf("invalid email: %s", str)
+        }
+
+    case DataTypeEnum:
+        str := fmt.Sprintf("%v", value)
+        found := false
+        for _, enumValue := range rule.EnumValues {
+            if str == enumValue {
+                found = true
+                break
+            }
+        }
+        if !found {
+            return fmt.Errorf("value not in enum: %s (allowed: %v)", str, rule.EnumValues)
+        }
+    }
+
+    return nil
+}
+```
+
+**3. 业务规则验证（预留扩展）**
+
+```go
+type BusinessRuleValidator struct {
+    rules []BusinessRule
+}
+
+type BusinessRule interface {
+    Name() string
+    Validate(data map[string]interface{}) error
+}
+
+// 示例：自定义业务规则
+type PriceRangeRule struct {
+    MinPrice float64
+    MaxPrice float64
+}
+
+func (prr *PriceRangeRule) Name() string {
+    return "price_range_check"
+}
+
+func (prr *PriceRangeRule) Validate(data map[string]interface{}) error {
+    price, ok := data["price"].(float64)
+    if !ok {
+        return errors.New("price field missing or invalid")
+    }
+
+    if price < prr.MinPrice || price > prr.MaxPrice {
+        return fmt.Errorf("price %.2f out of valid range [%.2f, %.2f]", price, prr.MinPrice, prr.MaxPrice)
+    }
+
+    return nil
+}
+```
+
+**4. 质量评分与分级**
+
+```go
+type DataQualityChecker struct {
+    completenessChecker *CompletenessChecker
+    formatValidator     *FormatValidator
+    businessValidator   *BusinessRuleValidator
+}
+
+type QualityReport struct {
+    CompletenessScore float64            // 完整性得分（0-100）
+    FormatErrorRate   float64            // 格式错误率（0-100）
+    BusinessRulePassed bool              // 业务规则是否通过
+    OverallScore      float64            // 综合得分（0-100）
+    Grade             QualityGrade       // 质量等级
+    Errors            map[string]error   // 详细错误信息
+    Warnings          []string           // 警告信息
+}
+
+type QualityGrade string
+
+const (
+    QualityGradeExcellent QualityGrade = "excellent" // 优秀（>=90）
+    QualityGradeGood      QualityGrade = "good"      // 良好（>=75）
+    QualityGradeFair      QualityGrade = "fair"      // 及格（>=60）
+    QualityGradePoor      QualityGrade = "poor"      // 不及格（<60）
+)
+
+func (dqc *DataQualityChecker) Check(data map[string]interface{}) *QualityReport {
+    report := &QualityReport{
+        Errors:   make(map[string]error),
+        Warnings: make([]string, 0),
+    }
+
+    // 1. 完整性检查
+    completenessResult := dqc.completenessChecker.Check(data)
+    report.CompletenessScore = completenessResult.CompletenessScore
+
+    if len(completenessResult.MissingFields) > 0 {
+        report.Warnings = append(report.Warnings, fmt.Sprintf("Missing fields: %v", completenessResult.MissingFields))
+    }
+
+    // 2. 格式校验
+    formatErrors := dqc.formatValidator.Validate(data)
+    report.Errors = formatErrors
+
+    totalFields := len(dqc.formatValidator.rules)
+    errorFields := len(formatErrors)
+    report.FormatErrorRate = float64(errorFields) / float64(totalFields) * 100
+
+    // 3. 业务规则验证
+    report.BusinessRulePassed = true
+    for _, rule := range dqc.businessValidator.rules {
+        if err := rule.Validate(data); err != nil {
+            report.BusinessRulePassed = false
+            report.Errors[rule.Name()] = err
+        }
+    }
+
+    // 4. 计算综合得分
+    // 权重：完整性40%、格式正确率40%、业务规则20%
+    formatCorrectRate := 100.0 - report.FormatErrorRate
+    businessScore := 0.0
+    if report.BusinessRulePassed {
+        businessScore = 100.0
+    }
+
+    report.OverallScore = report.CompletenessScore*0.4 + formatCorrectRate*0.4 + businessScore*0.2
+
+    // 5. 确定质量等级
+    if report.OverallScore >= 90 {
+        report.Grade = QualityGradeExcellent
+    } else if report.OverallScore >= 75 {
+        report.Grade = QualityGradeGood
+    } else if report.OverallScore >= 60 {
+        report.Grade = QualityGradeFair
+    } else {
+        report.Grade = QualityGradePoor
+    }
+
+    return report
+}
+```
+
+**5. 采样检查机制**
+
+```go
+type SamplingChecker struct {
+    baseChecker  *DataQualityChecker
+    samplingRate float64 // 采样率（0.0-1.0）
+    deepCheckRate float64 // 深度检查率（0.0-1.0）
+}
+
+func (sc *SamplingChecker) ShouldCheck() bool {
+    return rand.Float64() < sc.samplingRate
+}
+
+func (sc *SamplingChecker) ShouldDeepCheck() bool {
+    return rand.Float64() < sc.deepCheckRate
+}
+
+func (sc *SamplingChecker) Check(data map[string]interface{}) *QualityReport {
+    if !sc.ShouldCheck() {
+        // 跳过检查
+        return nil
+    }
+
+    if sc.ShouldDeepCheck() {
+        // 执行深度检查（包含所有业务规则）
+        return sc.baseChecker.Check(data)
+    }
+
+    // 执行基础检查（仅完整性和格式）
+    report := &QualityReport{
+        Errors: make(map[string]error),
+    }
+
+    completenessResult := sc.baseChecker.completenessChecker.Check(data)
+    report.CompletenessScore = completenessResult.CompletenessScore
+
+    formatErrors := sc.baseChecker.formatValidator.Validate(data)
+    report.Errors = formatErrors
+
+    return report
+}
+```
+
+**6. 质量报告持久化**
+
+```sql
+CREATE TABLE data_quality_reports (
+    id                  SERIAL PRIMARY KEY,
+    task_id             VARCHAR(64) NOT NULL,
+    datasource_id       VARCHAR(64) NOT NULL,
+    completeness_score  FLOAT NOT NULL,
+    format_error_rate   FLOAT NOT NULL,
+    business_rule_passed BOOLEAN NOT NULL,
+    overall_score       FLOAT NOT NULL,
+    grade               VARCHAR(20) NOT NULL,
+    errors              JSONB,
+    warnings            JSONB,
+    created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_quality_reports_task ON data_quality_reports(task_id);
+CREATE INDEX idx_quality_reports_grade ON data_quality_reports(grade);
+CREATE INDEX idx_quality_reports_score ON data_quality_reports(overall_score);
+```
+
+**7. 监控指标**
+
+```go
+// 数据质量指标
+data_quality_score{datasource="xxx", grade="excellent"} 95.5
+data_quality_completeness_rate{datasource="xxx"} 98.2
+data_quality_format_error_rate{datasource="xxx"} 2.3
+data_quality_check_total{datasource="xxx", result="pass"} 8520
+data_quality_check_total{datasource="xxx", result="fail"} 180
+```
+
+##### 3.2.3.8. 与其他模块的集成
+
+数据采集模块作为系统的数据入口，需要与调度引擎、数据处理、数据存储、监控告警等多个模块紧密配合。本节描述采集模块与其他模块之间的接口设计和数据流转规范。
+
+**1. 与调度引擎模块（3.2.2）的集成**
+
+**(1) 任务接收**
+
+Worker节点从RabbitMQ消息队列消费采集任务：
+
+```go
+type TaskConsumer struct {
+    rabbitmq *amqp.Connection
+    channel  *amqp.Channel
+    queue    string
+}
+
+func (tc *TaskConsumer) StartConsuming() error {
+    msgs, err := tc.channel.Consume(
+        tc.queue, // 队列名称
+        "",       // 消费者标签
+        false,    // 自动ACK（禁用，需要手动ACK）
+        false,    // 独占
+        false,    // no-local
+        false,    // no-wait
+        nil,      // 参数
+    )
+    if err != nil {
+        return err
+    }
+
+    go func() {
+        for msg := range msgs {
+            // 解析任务消息
+            var task Task
+            if err := json.Unmarshal(msg.Body, &task); err != nil {
+                log.Errorf("Failed to unmarshal task: %v", err)
+                msg.Nack(false, false) // 拒绝消息，不重新入队
+                continue
+            }
+
+            // 执行采集任务
+            if err := tc.executeTask(&task); err != nil {
+                log.Errorf("Task %s failed: %v", task.ID, err)
+
+                // 根据重试策略决定是否重新入队
+                if task.RetryCount < task.MaxRetries {
+                    msg.Nack(false, true) // 重新入队
+                } else {
+                    msg.Nack(false, false) // 达到最大重试次数，拒绝
+                }
+            } else {
+                msg.Ack(false) // 确认消息
+            }
+        }
+    }()
+
+    return nil
+}
+```
+
+任务消息格式：
+
+```json
+{
+  "task_id": "uuid-xxxx",
+  "datasource_id": "ds-001",
+  "collection_method": "rpa",
+  "config": {
+    "url": "https://example.com",
+    "rpa_config": { ... }
+  },
+  "priority": 5,
+  "retry_count": 0,
+  "max_retries": 3,
+  "created_at": "2025-01-27T10:00:00Z"
+}
+```
+
+**(2) 状态上报**
+
+Worker通过Redis Pub/Sub实时上报任务状态变更：
+
+```go
+type StatusReporter struct {
+    redis *redis.Client
+}
+
+func (sr *StatusReporter) ReportStatus(taskID string, status TaskStatus, message string) error {
+    statusUpdate := StatusUpdate{
+        TaskID:    taskID,
+        Status:    status,
+        Message:   message,
+        Timestamp: time.Now(),
+    }
+
+    data, _ := json.Marshal(statusUpdate)
+
+    // 发布到Redis频道
+    return sr.redis.Publish(
+        context.Background(),
+        "task_status_updates",
+        data,
+    ).Err()
+}
+
+type TaskStatus string
+
+const (
+    TaskStatusPending   TaskStatus = "pending"
+    TaskStatusRunning   TaskStatus = "running"
+    TaskStatusSuccess   TaskStatus = "success"
+    TaskStatusFailed    TaskStatus = "failed"
+    TaskStatusRetrying  TaskStatus = "retrying"
+)
+```
+
+**(3) 心跳上报**
+
+Worker定期向Master上报心跳，证明自己在线：
+
+```go
+type HeartbeatReporter struct {
+    redis    *redis.Client
+    workerID string
+    interval time.Duration
+}
+
+func (hr *HeartbeatReporter) Start() {
+    ticker := time.NewTicker(hr.interval)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        heartbeat := WorkerHeartbeat{
+            WorkerID:  hr.workerID,
+            Timestamp: time.Now(),
+            Status:    "active",
+            TaskCount: getRunningTaskCount(),
+        }
+
+        data, _ := json.Marshal(heartbeat)
+
+        // 保存到Redis，30秒过期
+        key := fmt.Sprintf("worker:heartbeat:%s", hr.workerID)
+        hr.redis.Set(context.Background(), key, data, 30*time.Second)
+    }
+}
+```
+
+**2. 与数据处理模块（3.2.4）的集成**
+
+**(1) 数据传递格式**
+
+采集模块将原始数据封装为标准的RawData结构传递给处理模块：
+
+```go
+type RawData struct {
+    TaskID       string                 // 任务ID
+    DatasourceID string                 // 数据源ID
+    CollectionMethod string             // 采集方式：rpa/api/database
+    ContentType  ContentType            // 内容类型
+    Data         interface{}            // 原始数据
+    Metadata     map[string]interface{} // 元数据
+    CollectedAt  time.Time              // 采集时间
+}
+
+type ContentType string
+
+const (
+    ContentTypeHTML ContentType = "html"
+    ContentTypeJSON ContentType = "json"
+    ContentTypeXML  ContentType = "xml"
+    ContentTypeCSV  ContentType = "csv"
+)
+
+// 传递给处理模块
+func (c *Collector) handoffToProcessor(rawData *RawData) error {
+    // 调用处理模块的Process方法
+    processedData, err := c.processor.Process(rawData)
+    if err != nil {
+        return fmt.Errorf("processing failed: %w", err)
+    }
+
+    // 传递给存储模块
+    return c.storage.Store(processedData)
+}
+```
+
+**(2) 元数据传递**
+
+```go
+metadata := map[string]interface{}{
+    "url":              task.URL,
+    "http_status_code": 200,
+    "response_time_ms": 350,
+    "content_length":   15420,
+    "encoding":         "utf-8",
+    "collected_at":     time.Now(),
+    "worker_id":        workerID,
+}
+```
+
+**3. 与数据存储模块（3.2.5）的集成**
+
+**(1) 临时数据存储**
+
+大文件或二进制数据先存储到MinIO，再将路径传递给处理模块：
+
+```go
+type TempStorageManager struct {
+    minio *minio.Client
+}
+
+func (tsm *TempStorageManager) SaveTempData(taskID string, data []byte) (string, error) {
+    // 生成临时文件路径
+    objectName := fmt.Sprintf("temp/%s/%s.dat", time.Now().Format("2006-01-02"), taskID)
+
+    // 上传到MinIO
+    _, err := tsm.minio.PutObject(
+        context.Background(),
+        "datafusion-temp",
+        objectName,
+        bytes.NewReader(data),
+        int64(len(data)),
+        minio.PutObjectOptions{},
+    )
+
+    if err != nil {
+        return "", err
+    }
+
+    return objectName, nil
+}
+```
+
+**(2) 数据清理**
+
+临时数据在处理完成后自动清理（TTL=24小时）：
+
+```go
+func (tsm *TempStorageManager) CleanupExpiredData() error {
+    // 列出所有临时对象
+    objectCh := tsm.minio.ListObjects(
+        context.Background(),
+        "datafusion-temp",
+        minio.ListObjectsOptions{
+            Prefix:    "temp/",
+            Recursive: true,
+        },
+    )
+
+    now := time.Now()
+    for object := range objectCh {
+        if object.Err != nil {
+            continue
+        }
+
+        // 检查对象是否过期（>24小时）
+        if now.Sub(object.LastModified) > 24*time.Hour {
+            tsm.minio.RemoveObject(
+                context.Background(),
+                "datafusion-temp",
+                object.Key,
+                minio.RemoveObjectOptions{},
+            )
+            log.Infof("Cleaned up expired temp data: %s", object.Key)
+        }
+    }
+
+    return nil
+}
+```
+
+**4. 与监控告警模块的集成**
+
+**(1) Prometheus指标暴露**
+
+Worker节点暴露/metrics端点供Prometheus抓取：
+
+```go
+import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+var (
+    // 采集请求总数
+    collectionRequestsTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "collection_requests_total",
+            Help: "Total number of collection requests",
+        },
+        []string{"datasource", "method", "status"},
+    )
+
+    // 采集耗时
+    collectionDurationSeconds = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "collection_duration_seconds",
+            Help:    "Collection duration in seconds",
+            Buckets: prometheus.DefBuckets,
+        },
+        []string{"datasource", "method"},
+    )
+
+    // 采集数据量
+    collectionDataBytes = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "collection_data_bytes",
+            Help: "Total bytes of collected data",
+        },
+        []string{"datasource"},
+    )
+)
+
+func init() {
+    prometheus.MustRegister(collectionRequestsTotal)
+    prometheus.MustRegister(collectionDurationSeconds)
+    prometheus.MustRegister(collectionDataBytes)
+}
+
+func StartMetricsServer(port int) {
+    http.Handle("/metrics", promhttp.Handler())
+    http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
+}
+```
+
+**(2) 日志推送到ELK**
+
+使用结构化日志（JSON格式），通过Filebeat采集推送到ELK：
+
+```go
+import "github.com/sirupsen/logrus"
+
+func setupLogging() {
+    logrus.SetFormatter(&logrus.JSONFormatter{})
+    logrus.SetOutput(os.Stdout)
+    logrus.SetLevel(logrus.InfoLevel)
+}
+
+func logCollectionEvent(taskID, datasourceID, method, status string, duration time.Duration, err error) {
+    fields := logrus.Fields{
+        "task_id":       taskID,
+        "datasource_id": datasourceID,
+        "method":        method,
+        "status":        status,
+        "duration_ms":   duration.Milliseconds(),
+        "worker_id":     getWorkerID(),
+        "timestamp":     time.Now().Unix(),
+    }
+
+    if err != nil {
+        fields["error"] = err.Error()
+        logrus.WithFields(fields).Error("Collection failed")
+    } else {
+        logrus.WithFields(fields).Info("Collection completed")
+    }
+}
+```
+
+Filebeat配置示例：
+
+```yaml
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+    - /var/log/datafusion/worker-*.log
+  json.keys_under_root: true
+  json.add_error_key: true
+
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+  index: "datafusion-worker-%{+yyyy.MM.dd}"
+```
+
+**5. 数据流转完整示例**
+
+```go
+func (c *Collector) ExecuteTask(task *Task) error {
+    // 1. 上报状态：开始执行
+    c.statusReporter.ReportStatus(task.ID, TaskStatusRunning, "Starting collection")
+
+    // 2. 记录开始时间
+    startTime := time.Now()
+
+    // 3. 根据采集方式调用相应的采集器
+    var rawData *RawData
+    var err error
+
+    switch task.CollectionMethod {
+    case "rpa":
+        rawData, err = c.rpaCollector.Collect(task)
+    case "api":
+        rawData, err = c.apiCollector.Collect(task)
+    case "database":
+        rawData, err = c.dbCollector.Collect(task)
+    default:
+        err = fmt.Errorf("unsupported collection method: %s", task.CollectionMethod)
+    }
+
+    // 4. 记录指标
+    duration := time.Since(startTime)
+    status := "success"
+    if err != nil {
+        status = "failed"
+    }
+
+    collectionRequestsTotal.WithLabelValues(
+        task.DatasourceID,
+        task.CollectionMethod,
+        status,
+    ).Inc()
+
+    collectionDurationSeconds.WithLabelValues(
+        task.DatasourceID,
+        task.CollectionMethod,
+    ).Observe(duration.Seconds())
+
+    // 5. 记录日志
+    logCollectionEvent(task.ID, task.DatasourceID, task.CollectionMethod, status, duration, err)
+
+    // 6. 处理失败情况
+    if err != nil {
+        c.statusReporter.ReportStatus(task.ID, TaskStatusFailed, err.Error())
+        return err
+    }
+
+    // 7. 记录数据量
+    dataSize := len(rawData.Data.(string))
+    collectionDataBytes.WithLabelValues(task.DatasourceID).Add(float64(dataSize))
+
+    // 8. 数据质量检查（可选）
+    if c.qualityChecker != nil {
+        qualityReport := c.qualityChecker.Check(rawData)
+        if qualityReport != nil && qualityReport.Grade == QualityGradePoor {
+            c.statusReporter.ReportStatus(task.ID, TaskStatusFailed, "Data quality check failed")
+            return fmt.Errorf("data quality too low: score=%.2f", qualityReport.OverallScore)
+        }
+    }
+
+    // 9. 传递给处理模块
+    if err := c.handoffToProcessor(rawData); err != nil {
+        c.statusReporter.ReportStatus(task.ID, TaskStatusFailed, err.Error())
+        return err
+    }
+
+    // 10. 上报状态：成功完成
+    c.statusReporter.ReportStatus(task.ID, TaskStatusSuccess, "Collection completed successfully")
+
+    return nil
+}
+```
+
+**6. 接口规范总结**
+
+| 集成对象 | 接口类型 | 数据格式 | 说明 |
+|---------|---------|---------|------|
+| **调度引擎** | RabbitMQ消息队列 | JSON | Worker消费任务消息 |
+| **调度引擎** | Redis Pub/Sub | JSON | Worker上报任务状态 |
+| **调度引擎** | Redis Key | JSON | Worker上报心跳 |
+| **数据处理** | Go方法调用 | RawData结构体 | 同步传递原始数据 |
+| **数据存储** | MinIO对象存储 | 二进制 | 临时存储大文件 |
+| **监控告警** | HTTP /metrics | Prometheus格式 | 暴露指标供抓取 |
+| **监控告警** | 日志文件 | JSON | Filebeat采集推送到ELK |
+
 #### 3.2.4. 数据处理模块 (Processor)
 
 数据处理模块是DataFusion系统的核心数据加工引擎，负责将Worker采集到的原始数据（HTML、JSON、XML、CSV等）转换为结构化、标准化、可存储的目标数据。该模块采用**管道式处理架构（Pipeline Pattern）**和**责任链设计模式（Chain of Responsibility）**，通过4个处理阶段顺序执行：数据解析（Parser）→ 数据清洗（Cleaner）→ 数据转换（Transformer）→ 数据去重（Deduplicator）。

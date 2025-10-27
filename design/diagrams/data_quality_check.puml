@@ -1,0 +1,207 @@
+@startuml
+title 数据质量检查流程图
+
+start
+
+:采集器返回原始数据\nRawData;
+
+partition "1. 数据接收与预处理" {
+    :初始化质量检查器\nDataQualityChecker;
+    :加载质量规则配置;
+    note right
+        规则配置来源:
+        - PostgreSQL (quality_rules表)
+        - Redis缓存
+    end note
+}
+
+partition "2. 完整性检查" {
+    :检查必填字段是否存在;
+
+    fork
+        :统计空值字段数量;
+    fork again
+        :统计缺失字段数量;
+    end fork
+
+    :计算完整性得分;
+    note right
+        完整性得分 =
+        (有效字段数 / 总字段数) × 100
+    end note
+
+    if (完整性得分 < 阈值?) then (是: <60%)
+        :标记为低质量数据;
+        :记录详细错误信息;
+    else (否: ≥60%)
+        :通过完整性检查;
+    endif
+}
+
+partition "3. 格式校验" {
+    :遍历所有字段;
+
+    repeat
+        :读取字段值和预期类型;
+
+        switch (字段类型?)
+        case (字符串)
+            :检查长度范围;
+            if (包含正则规则?) then (是)
+                :执行正则匹配;
+                if (匹配失败?) then (是)
+                    :记录格式错误;
+                endif
+            endif
+        case (整数)
+            :检查数值范围;
+            :验证是否为整数;
+        case (浮点数)
+            :检查数值范围;
+            :验证小数位数;
+        case (日期时间)
+            :验证日期格式;
+            :检查合理性(未来日期/过早日期);
+        case (枚举)
+            :检查是否在允许值列表中;
+        case (URL)
+            :验证URL格式;
+            :检查协议(http/https);
+        case (邮箱)
+            :验证邮箱格式;
+        endswitch
+
+    repeat while (还有更多字段?)
+
+    :计算格式正确率;
+    note right
+        格式正确率 =
+        (格式正确字段数 / 总字段数) × 100
+    end note
+}
+
+partition "4. 业务规则验证" {
+    if (配置了自定义验证规则?) then (是)
+        :执行自定义验证函数;
+        note right
+            支持类型:
+            - 表达式验证 (expr)
+            - Lua脚本验证
+            - Go插件验证
+        end note
+
+        if (验证通过?) then (否)
+            :记录业务规则错误;
+        endif
+    endif
+}
+
+partition "5. 数据去重检查" {
+    :计算数据指纹 (Hash);
+    note right
+        Hash算法:
+        - MD5 (快速)
+        - SHA256 (安全)
+        - 自定义字段组合
+    end note
+
+    :查询布隆过滤器 (Redis);
+
+    if (可能重复?) then (是)
+        :查询精确去重表 (PostgreSQL);
+        if (确认重复?) then (是)
+            :标记为重复数据;
+            :跳过后续处理;
+            stop
+        endif
+    endif
+
+    :添加指纹到布隆过滤器;
+}
+
+partition "6. 质量评分与分级" {
+    :汇总检查结果;
+
+    fork
+        :完整性得分: S1;
+    fork again
+        :格式正确率: S2;
+    fork again
+        :业务规则通过率: S3;
+    end fork
+
+    :计算综合质量得分;
+    note right
+        综合得分 =
+        S1 × 0.4 + S2 × 0.4 + S3 × 0.2
+    end note
+
+    if (综合得分 >= 90?) then (是)
+        :质量等级 = 优秀;
+        #LightGreen:数据可直接使用;
+    else if (综合得分 >= 75?) then (是)
+        :质量等级 = 良好;
+        #LightYellow:数据可使用\n(建议人工抽查);
+    else if (综合得分 >= 60?) then (是)
+        :质量等级 = 及格;
+        #Orange:数据需要人工复核;
+        :触发人工复核工作流;
+    else (否: <60%)
+        :质量等级 = 不及格;
+        #LightCoral:拒绝数据;
+        :触发告警通知;
+    endif
+}
+
+partition "7. 采样检查机制" {
+    if (启用采样检查?) then (是)
+        :根据采样率决定是否深度检查;
+        note right
+            采样策略:
+            - 固定比例 (如10%)
+            - 动态调整 (基于历史质量)
+            - 新数据源全量检查
+        end note
+
+        if (命中采样?) then (是)
+            :执行深度质量检查;
+            note right
+                深度检查:
+                - 数据一致性校验
+                - 跨字段关联验证
+                - 数据分布异常检测
+            end note
+        else (否)
+            :仅执行基础检查;
+        endif
+    endif
+}
+
+partition "8. 结果记录与上报" {
+    :保存质量检查报告;
+    note right
+        记录到:
+        - PostgreSQL (data_quality_reports表)
+        - 包含详细错误信息
+    end note
+
+    :推送质量指标到Prometheus;
+    note right
+        指标:
+        - data_quality_score
+        - data_completeness_rate
+        - data_format_error_rate
+        - data_duplicate_rate
+    end note
+
+    if (质量不及格?) then (是)
+        :发送告警通知;
+        :记录到错误队列;
+    endif
+}
+
+:返回质量检查结果;
+
+stop
+
+@enduml

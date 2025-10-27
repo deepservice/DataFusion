@@ -1,0 +1,110 @@
+@startuml
+title 浏览器池架构图
+
+package "Worker节点" {
+    rectangle "RPA Collector" as Collector {
+        [任务调度器\nTask Scheduler] as Scheduler
+    }
+
+    rectangle "浏览器池管理器\nBrowser Pool Manager" as PoolManager {
+        [实例工厂\nInstance Factory] as Factory
+        [资源监控\nResource Monitor] as Monitor
+        [清理器\nCleaner] as Cleaner
+    }
+
+    frame "浏览器实例池\nBrowser Instance Pool" as Pool {
+        component "Chrome实例#1\n(空闲)" as Chrome1 #LightGreen
+        component "Chrome实例#2\n(使用中)" as Chrome2 #LightCoral
+        component "Chrome实例#3\n(空闲)" as Chrome3 #LightGreen
+        component "..." as MoreChrome
+    }
+
+    rectangle "并发控制\nConcurrency Controller" as ConcurrentController {
+        [信号量\nSemaphore] as Semaphore
+        [等待队列\nWait Queue] as WaitQueue
+    }
+
+    note right of Pool
+        <b>池配置参数</b>
+        - max_pool_size: 10
+        - instance_memory_limit: 1GB
+        - instance_timeout: 300s
+        - acquisition_timeout: 60s
+        - cleanup_interval: 30s
+    end note
+}
+
+package "Linux系统资源" {
+    component "Chrome进程#1\n(PID: 1001)" as Process1
+    component "Chrome进程#2\n(PID: 1002)" as Process2
+    component "Chrome进程#3\n(PID: 1003)" as Process3
+
+    rectangle "系统资源监控" as SysMonitor {
+        [内存使用\nMemory Usage] as Memory
+        [CPU使用\nCPU Usage] as CPU
+    }
+}
+
+cloud "Playwright/Puppeteer" {
+    [CDP协议\nChrome DevTools Protocol] as CDP
+}
+
+database "Prometheus" as Prometheus
+
+' 核心流程 - 请求浏览器实例
+Scheduler --> ConcurrentController : 1. 请求浏览器实例
+ConcurrentController --> Semaphore : 2. 获取信号量
+Semaphore --> WaitQueue : 3. 超限时排队
+ConcurrentController --> PoolManager : 4. Acquire()
+PoolManager --> Pool : 5. 查找空闲实例
+PoolManager --> Factory : 6. 无空闲时创建
+Factory --> CDP : 7. 启动Chrome
+CDP --> Process2 : 8. 启动进程
+PoolManager --> Collector : 9. 返回实例
+
+' 使用与释放
+Collector --> CDP : 10. 执行采集任务
+CDP --> Process2 : 11. 页面操作
+Collector --> PoolManager : 12. Release()释放
+PoolManager --> Chrome2 : 13. 清理上下文
+PoolManager --> Semaphore : 14. 释放信号量
+
+' 资源监控
+Monitor --> Pool : 定期扫描
+Monitor ..> Process1 : 查询资源
+Monitor ..> Process2 : 查询资源
+Monitor ..> Process3 : 查询资源
+Process1 --> Memory : 上报内存
+Process2 --> CPU : 上报CPU
+Monitor --> Cleaner : 触发清理
+Cleaner --> Pool : 移除异常实例
+
+' 指标上报
+Monitor --> Prometheus : 推送指标
+
+note right of CDP
+    <b>启动参数(Linux优化)</b>
+    --no-sandbox
+    --disable-dev-shm-usage
+    --disable-gpu
+    --max-old-space-size=1024
+end note
+
+note right of Prometheus
+    <b>关键指标</b>
+    - browser_pool_size
+    - browser_pool_active
+    - browser_pool_idle
+    - browser_instance_memory_bytes
+    - browser_instance_cpu_percent
+end note
+
+note right of PoolManager
+    <b>清理操作</b>
+    - 关闭所有页面
+    - 清除Cookie/LocalStorage
+    - 重置网络条件
+    - 标记为空闲
+end note
+
+@enduml
