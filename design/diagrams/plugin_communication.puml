@@ -1,0 +1,115 @@
+@startuml plugin_communication
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+autonumber
+
+title 插件通信机制序列图
+
+actor "Worker Controller" as Worker
+participant "Plugin Manager" as PM
+participant "Communication Hub" as CH
+box "gRPC通信插件" #LightBlue
+    participant "gRPC Plugin\n(长驻进程)" as GRPC
+end box
+box "Stdin/Stdout通信插件" #LightGreen
+    participant "Script Plugin\n(临时进程)" as Script
+end box
+
+== gRPC通信方式 (常驻进程插件) ==
+
+Worker -> PM: ExecutePlugin(pluginName, request)
+activate PM
+
+PM -> PM: 查找插件实例
+PM -> CH: RouteMessage(plugin, request)
+activate CH
+
+CH -> GRPC: **gRPC Call**\nExecute(request)
+activate GRPC
+note right of GRPC
+  gRPC插件特点:
+  • 长驻内存进程
+  • 双向流式通信
+  • 支持并发请求
+  • 适合高频调用场景
+end note
+
+GRPC -> GRPC: 处理请求\n(Collect/Process/Write)
+GRPC --> CH: **gRPC Response**\nExecuteResponse(result)
+deactivate GRPC
+
+CH --> PM: 返回结果
+deactivate CH
+PM --> Worker: 返回处理结果
+deactivate PM
+
+== Stdin/Stdout通信方式 (脚本式插件) ==
+
+Worker -> PM: ExecutePlugin(scriptPlugin, request)
+activate PM
+
+PM -> PM: 查找插件配置
+PM -> CH: RouteMessage(plugin, request)
+activate CH
+
+CH -> Script: **Fork进程**\n启动插件可执行文件
+activate Script
+
+CH -> Script: **Stdin写入**\nJSON格式请求数据
+note right of Script
+  Stdin/Stdout插件特点:
+  • 临时进程 (按需启动)
+  • 简单的管道通信
+  • 支持多语言脚本 (Python/Node.js/Shell)
+  • 适合低频调用、快速开发
+  • 每次调用独立进程
+end note
+
+Script -> Script: 读取Stdin\n解析JSON请求
+Script -> Script: 执行插件逻辑\n(Collect/Process/Write)
+Script -> CH: **Stdout输出**\nJSON格式响应数据
+
+CH -> CH: 读取Stdout\n解析响应
+Script -> Script: 退出进程
+deactivate Script
+
+CH --> PM: 返回结果
+deactivate CH
+PM --> Worker: 返回处理结果
+deactivate PM
+
+== 异常处理场景 ==
+
+Worker -> PM: ExecutePlugin(faultyPlugin, request)
+activate PM
+PM -> CH: RouteMessage(plugin, request)
+activate CH
+
+CH -> GRPC: Execute(request)
+activate GRPC
+GRPC --> GRPC: ⚠ 插件崩溃/超时
+deactivate GRPC
+
+CH -> CH: 检测异常\n(超时5s / 进程退出)
+CH --> PM: PluginError(reason)
+deactivate CH
+
+PM -> PM: 标记插件为Failed状态
+PM -> PM: 触发重启策略\n(可选)
+PM --> Worker: 返回错误信息
+deactivate PM
+
+note over Worker, Script
+  **通信协议对比**
+
+  | 特性 | gRPC通信 | Stdin/Stdout通信 |
+  |------|----------|------------------|
+  | 性能 | 高 (常驻进程) | 中 (启动开销) |
+  | 并发 | 支持并发 | 单请求顺序处理 |
+  | 语言支持 | 需gRPC库 | 任意语言 |
+  | 适用场景 | 高频调用/复杂交互 | 低频调用/简单脚本 |
+  | 开发复杂度 | 中 (需.proto定义) | 低 (JSON标准输入输出) |
+end note
+
+@enduml

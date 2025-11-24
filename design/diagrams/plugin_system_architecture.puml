@@ -1,0 +1,157 @@
+@startuml plugin_system_architecture
+!define RECTANGLE class
+
+skinparam componentStyle rectangle
+skinparam defaultTextAlignment center
+skinparam ArrowColor #2C3E50
+skinparam ArrowThickness 2
+
+title DataFusion 插件系统总体架构
+
+' 定义颜色
+!define CORE_COLOR #3498DB
+!define PLUGIN_COLOR #E74C3C
+!define MANAGER_COLOR #27AE60
+!define COMM_COLOR #F39C12
+
+package "Worker 执行引擎" as Worker {
+    component "Worker Controller" as WC <<Core>> CORE_COLOR
+    component "Task Scheduler" as TS <<Core>> CORE_COLOR
+}
+
+package "插件管理层 (Plugin Management Layer)" as PluginMgmt {
+    component "Plugin Manager" as PM <<Manager>> MANAGER_COLOR {
+        [Plugin Registry]
+        [Lifecycle Manager]
+        [Config Manager]
+        [Health Monitor]
+    }
+
+    component "Plugin Loader" as PL <<Manager>> MANAGER_COLOR {
+        [Discovery Service]
+        [Version Manager]
+        [Dependency Resolver]
+    }
+
+    component "Communication Hub" as CH <<Communication>> COMM_COLOR {
+        [gRPC Server]
+        [Stdin/Stdout Handler]
+        [Message Router]
+    }
+}
+
+package "插件层 (Plugin Layer)" as Plugins {
+
+    package "采集器插件 (Collector Plugins)" as CollectorPlugins {
+        component "RPA Collector" as RPAC <<Plugin>> PLUGIN_COLOR
+        component "API Collector" as APIC <<Plugin>> PLUGIN_COLOR
+        component "Database Collector" as DBC <<Plugin>> PLUGIN_COLOR
+        component "Custom Collector" as CC <<Plugin>> PLUGIN_COLOR
+    }
+
+    package "处理器插件 (Processor Plugins)" as ProcessorPlugins {
+        component "HTML Parser" as HP <<Plugin>> PLUGIN_COLOR
+        component "JSON Parser" as JP <<Plugin>> PLUGIN_COLOR
+        component "Data Cleaner" as DCL <<Plugin>> PLUGIN_COLOR
+        component "Data Transformer" as DT <<Plugin>> PLUGIN_COLOR
+    }
+
+    package "存储器插件 (Storage Plugins)" as StoragePlugins {
+        component "PostgreSQL Storage" as PGS <<Plugin>> PLUGIN_COLOR
+        component "MongoDB Storage" as MGS <<Plugin>> PLUGIN_COLOR
+        component "File Storage" as FS <<Plugin>> PLUGIN_COLOR
+        component "Custom Storage" as CS <<Plugin>> PLUGIN_COLOR
+    }
+}
+
+package "插件运行环境 (Plugin Runtime)" as Runtime {
+    component "Process Isolator" as PI <<Security>> {
+        [cgroups]
+        [Resource Limiter]
+    }
+    component "Security Controller" as SC <<Security>> {
+        [Permission Checker]
+        [Code Signature Validator]
+    }
+}
+
+package "配置与存储" as Config {
+    database "PostgreSQL" as PG {
+        [Plugin Metadata]
+        [Plugin Config]
+    }
+    database "Redis Cache" as Redis {
+        [Plugin Status]
+        [Config Cache]
+    }
+}
+
+' Worker 与 Plugin Manager 的关系
+WC -down-> PM : 管理插件
+TS -down-> PM : 调用插件
+
+' Plugin Manager 内部关系
+PM -right-> PL : 加载插件
+PM -down-> CH : 通信调度
+
+' Plugin Loader 与插件的关系
+PL .down.> RPAC : 发现与加载
+PL .down.> APIC
+PL .down.> DBC
+PL .down.> HP
+PL .down.> JP
+PL .down.> PGS
+
+' Communication Hub 与插件的通信
+CH <-down-> RPAC : gRPC/Stdin
+CH <-down-> APIC : gRPC/Stdin
+CH <-down-> DBC : gRPC/Stdin
+CH <-down-> HP : gRPC/Stdin
+CH <-down-> JP : gRPC/Stdin
+CH <-down-> DCL : gRPC/Stdin
+CH <-down-> PGS : gRPC/Stdin
+CH <-down-> MGS : gRPC/Stdin
+
+' 插件运行环境
+PI .up.> RPAC : 进程隔离
+PI .up.> APIC
+PI .up.> HP
+PI .up.> PGS
+SC .up.> PM : 权限验证
+
+' 配置与存储
+PM -down-> PG : 读取元数据/配置
+PM -down-> Redis : 缓存状态
+PL -down-> PG : 查询插件信息
+
+note right of PluginMgmt
+  **插件管理层职责**
+  • 插件注册与发现
+  • 生命周期管理 (启动/停止/重启)
+  • 配置加载与热更新
+  • 健康检查与监控
+  • 通信协调
+end note
+
+note right of Plugins
+  **三大插件类型**
+  • Collector: 数据采集
+  • Processor: 数据处理
+  • Storage: 数据存储
+
+  **插件特性**
+  • 统一接口 (Plugin Interface)
+  • 独立进程 (Process Isolation)
+  • 多语言支持 (Go/Python/Node.js)
+  • 热插拔 (Hot Reload)
+end note
+
+note bottom of Runtime
+  **安全隔离机制**
+  • 进程级隔离
+  • 资源限制 (CPU/Memory)
+  • 权限控制 (文件/网络)
+  • 代码签名验证
+end note
+
+@enduml

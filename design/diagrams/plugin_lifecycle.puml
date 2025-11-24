@@ -1,0 +1,97 @@
+@startuml plugin_lifecycle
+!theme plain
+skinparam state {
+    BackgroundColor<<initial>> #90EE90
+    BackgroundColor<<running>> #87CEEB
+    BackgroundColor<<error>> #FFB6C1
+    BackgroundColor<<final>> #D3D3D3
+    BorderColor #2C3E50
+    BorderThickness 2
+    ArrowColor #2C3E50
+    ArrowThickness 2
+}
+
+title 插件生命周期状态转换图
+
+state "Unregistered\n未注册" as Unregistered <<initial>>
+state "Registered\n已注册" as Registered <<initial>>
+state "Loading\n加载中" as Loading
+state "Loaded\n已加载" as Loaded <<running>>
+state "Initializing\n初始化中" as Initializing
+state "Running\n运行中" as Running <<running>>
+state "Paused\n暂停" as Paused <<running>>
+state "Stopping\n停止中" as Stopping
+state "Stopped\n已停止" as Stopped <<final>>
+state "Failed\n失败" as Failed <<error>>
+state "Unloading\n卸载中" as Unloading
+state "Unloaded\n已卸载" as Unloaded <<final>>
+
+[*] -down-> Unregistered
+
+' 注册流程
+Unregistered -down-> Registered : register()\n插件元数据注册
+note right of Registered
+  插件已注册到Registry
+  但尚未加载到内存
+end note
+
+' 加载流程
+Registered -down-> Loading : load()\nWorker触发加载
+Loading -down-> Loaded : 加载成功\n二进制文件已加载
+Loading -right-> Failed : 加载失败\n文件不存在/签名校验失败
+
+' 初始化流程
+Loaded -down-> Initializing : initialize()\n调用Init()方法
+Initializing -down-> Running : 初始化成功\n健康检查通过
+Initializing -right-> Failed : 初始化失败\n依赖检查失败
+
+note right of Running
+  插件处于活跃状态
+  可处理Worker的请求
+  • Execute()调用
+  • 健康检查定时运行
+end note
+
+' 运行中的状态转换
+Running -right-> Paused : pause()\n暂停执行
+Paused -left-> Running : resume()\n恢复执行
+Running -down-> Stopping : stop()\nWorker主动停止
+Running -right-> Failed : 运行时错误\n超时/崩溃/异常
+
+' 暂停状态
+Paused -down-> Stopping : stop()\n停止插件
+
+' 失败处理
+Failed -up-> Loading : retry()\n重新加载
+Failed -down-> Stopping : abandon()\n放弃重试
+
+' 停止流程
+Stopping -down-> Stopped : 优雅停止成功\n清理资源完成
+Stopping -right-> Failed : 停止超时\n强制终止
+
+' 卸载流程
+Stopped -down-> Unloading : unload()\n从内存卸载
+Unloading -down-> Unloaded : 卸载完成
+Unloaded -right-> [*]
+
+' 紧急卸载
+Failed -down-> Unloading : force_unload()\n强制卸载
+Loaded -down-> Unloading : unload()\n未初始化直接卸载
+
+' 重新加载
+Unloaded -up-> Registered : reload()\n重新注册
+
+note bottom of Unloaded
+  插件已从系统移除
+  可重新注册和加载
+end note
+
+legend right
+  |= 状态类型 |= 说明 |
+  | <back:#90EE90>初始状态</back> | 插件刚注册/刚加载 |
+  | <back:#87CEEB>运行状态</back> | 插件活跃或暂停 |
+  | <back:#FFB6C1>错误状态</back> | 插件异常需处理 |
+  | <back:#D3D3D3>终止状态</back> | 插件停止/卸载 |
+endlegend
+
+@enduml

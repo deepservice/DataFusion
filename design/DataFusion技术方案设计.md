@@ -1374,6 +1374,1537 @@ helm install datafusion ./datafusion-chart \
 *   **功能:** 提供任务的增删改查、启动、停止等操作接口。维护任务的元数据，包括任务类型、数据源配置、采集规则、调度策略、存储方式等。
 *   **实现:** 基于 Go 开发，通过 RESTful API 对外提供服务。任务元数据持久化到 PostgreSQL 数据库。
 
+##### 3.2.1.1. 任务数据模型与Schema设计
+
+任务管理模块使用PostgreSQL作为元数据存储，主要包含任务定义表、任务实例表和任务执行历史表。
+
+**核心数据表设计:**
+
+```sql
+-- 任务定义表
+CREATE TABLE tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    task_type VARCHAR(50) NOT NULL, -- 'web_scraping', 'api_collection', 'database_sync'
+    datasource_id UUID REFERENCES datasources(id),
+    collection_config JSONB NOT NULL, -- RPA/API/DB specific configuration
+    parsing_rules JSONB, -- Field extraction and parsing rules
+    cleaning_rules JSONB, -- Data cleaning and validation rules
+    storage_config JSONB NOT NULL, -- Target storage configuration
+    schedule_config JSONB, -- Scheduling configuration
+    retry_config JSONB, -- Retry strategy configuration
+    priority INTEGER DEFAULT 2, -- 1=low, 2=medium, 3=high
+    status VARCHAR(50) NOT NULL DEFAULT 'draft', -- 'draft', 'active', 'paused', 'archived'
+    max_concurrent INTEGER DEFAULT 1, -- Maximum concurrent instances
+    timeout_seconds INTEGER DEFAULT 3600, -- Task execution timeout
+    alert_config JSONB, -- Alert notification configuration
+    tags TEXT[], -- Task tags for categorization
+    version INTEGER DEFAULT 1, -- Configuration version number
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP, -- Soft delete timestamp
+    CONSTRAINT chk_priority CHECK (priority BETWEEN 1 AND 3),
+    CONSTRAINT chk_status CHECK (status IN ('draft', 'active', 'paused', 'archived'))
+);
+
+-- 任务实例表
+CREATE TABLE task_instances (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID REFERENCES tasks(id) NOT NULL,
+    instance_id VARCHAR(128) UNIQUE NOT NULL, -- Format: task-{taskID}-{timestamp}
+    status VARCHAR(50) NOT NULL DEFAULT 'pending', -- 'pending', 'running', 'success', 'failed', 'cancelled', 'timeout'
+    trigger_type VARCHAR(50) NOT NULL, -- 'scheduled', 'manual', 'api', 'dependency'
+    triggered_by UUID REFERENCES users(id), -- For manual triggers
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    duration_ms INTEGER,
+    records_fetched INTEGER DEFAULT 0,
+    records_stored INTEGER DEFAULT 0,
+    records_failed INTEGER DEFAULT 0,
+    error_message TEXT,
+    error_code VARCHAR(50),
+    execution_logs JSONB, -- Structured execution logs
+    retry_count INTEGER DEFAULT 0,
+    worker_id VARCHAR(128), -- Worker node that executed the instance
+    resource_usage JSONB, -- CPU, memory, network usage stats
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_instance_status CHECK (status IN ('pending', 'running', 'success', 'failed', 'cancelled', 'timeout'))
+);
+
+-- 任务执行历史表 (用于长期存储和分析)
+CREATE TABLE task_execution_history (
+    id BIGSERIAL PRIMARY KEY,
+    task_id UUID NOT NULL,
+    task_name VARCHAR(255),
+    instance_id VARCHAR(128) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    duration_ms INTEGER,
+    records_count INTEGER,
+    error_summary TEXT,
+    execution_date DATE NOT NULL, -- Partition key
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) PARTITION BY RANGE (execution_date);
+
+-- 创建分区表 (按月分区)
+CREATE TABLE task_execution_history_2025_01 PARTITION OF task_execution_history
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+
+-- 性能优化索引
+CREATE INDEX idx_tasks_status ON tasks(status) WHERE deleted_at IS NULL;
+CREATE INDEX idx_tasks_type_status ON tasks(task_type, status) WHERE deleted_at IS NULL;
+CREATE INDEX idx_tasks_created_at ON tasks(created_at DESC);
+CREATE INDEX idx_tasks_datasource ON tasks(datasource_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_tasks_tags ON tasks USING GIN(tags);
+
+CREATE INDEX idx_task_instances_task_id ON task_instances(task_id);
+CREATE INDEX idx_task_instances_status ON task_instances(status);
+CREATE INDEX idx_task_instances_created_at ON task_instances(created_at DESC);
+CREATE INDEX idx_task_instances_instance_id ON task_instances(instance_id);
+CREATE INDEX idx_task_instances_task_status ON task_instances(task_id, status, created_at DESC);
+
+CREATE INDEX idx_history_task_date ON task_execution_history(task_id, execution_date DESC);
+CREATE INDEX idx_history_status ON task_execution_history(status, execution_date DESC);
+
+-- 自动更新updated_at触发器
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_tasks_updated_at BEFORE UPDATE ON tasks
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+```
+
+**任务配置JSON Schema示例:**
+
+```json
+{
+  "collection_config": {
+    "type": "web_scraping",
+    "url_pattern": "https://example.com/products?page={page}",
+    "page_range": {"start": 1, "end": 100},
+    "browser_config": {
+      "headless": true,
+      "user_agent": "Mozilla/5.0...",
+      "viewport": {"width": 1920, "height": 1080}
+    },
+    "wait_conditions": {
+      "selector": ".product-item",
+      "timeout": 10000
+    },
+    "pagination": {
+      "type": "url_param",
+      "param_name": "page"
+    }
+  },
+  "parsing_rules": [
+    {
+      "field": "product_name",
+      "selector": "h2.product-title",
+      "type": "text",
+      "required": true
+    },
+    {
+      "field": "price",
+      "selector": "span.price",
+      "type": "number",
+      "transform": "parseFloat",
+      "required": true
+    }
+  ],
+  "cleaning_rules": [
+    {
+      "field": "price",
+      "operations": [
+        {"type": "remove_currency_symbol"},
+        {"type": "validate_range", "min": 0, "max": 999999}
+      ]
+    }
+  ],
+  "storage_config": {
+    "type": "postgresql",
+    "table": "products",
+    "batch_size": 100,
+    "conflict_resolution": "update"
+  },
+  "schedule_config": {
+    "cron": "0 2 * * *",
+    "timezone": "Asia/Shanghai",
+    "enabled": true
+  },
+  "retry_config": {
+    "max_retries": 3,
+    "strategy": "exponential_backoff",
+    "initial_interval_seconds": 60,
+    "max_interval_seconds": 3600,
+    "retry_on": ["timeout", "network_error", "server_error"]
+  },
+  "alert_config": {
+    "on_failure": {
+      "enabled": true,
+      "channels": ["email", "webhook"],
+      "recipients": ["admin@example.com"]
+    },
+    "on_success": {
+      "enabled": false
+    }
+  }
+}
+```
+
+**Go语言数据模型定义:**
+
+```go
+package model
+
+import (
+    "time"
+    "github.com/google/uuid"
+)
+
+// Task represents a data collection task definition
+type Task struct {
+    ID               uuid.UUID              `db:"id" json:"id"`
+    Name             string                 `db:"name" json:"name"`
+    Description      string                 `db:"description" json:"description"`
+    TaskType         string                 `db:"task_type" json:"task_type"`
+    DatasourceID     uuid.UUID              `db:"datasource_id" json:"datasource_id"`
+    CollectionConfig map[string]interface{} `db:"collection_config" json:"collection_config"`
+    ParsingRules     []ParsingRule          `db:"parsing_rules" json:"parsing_rules"`
+    CleaningRules    []CleaningRule         `db:"cleaning_rules" json:"cleaning_rules"`
+    StorageConfig    StorageConfig          `db:"storage_config" json:"storage_config"`
+    ScheduleConfig   *ScheduleConfig        `db:"schedule_config" json:"schedule_config,omitempty"`
+    RetryConfig      *RetryConfig           `db:"retry_config" json:"retry_config,omitempty"`
+    Priority         int                    `db:"priority" json:"priority"`
+    Status           string                 `db:"status" json:"status"`
+    MaxConcurrent    int                    `db:"max_concurrent" json:"max_concurrent"`
+    TimeoutSeconds   int                    `db:"timeout_seconds" json:"timeout_seconds"`
+    AlertConfig      *AlertConfig           `db:"alert_config" json:"alert_config,omitempty"`
+    Tags             []string               `db:"tags" json:"tags"`
+    Version          int                    `db:"version" json:"version"`
+    CreatedBy        uuid.UUID              `db:"created_by" json:"created_by"`
+    CreatedAt        time.Time              `db:"created_at" json:"created_at"`
+    UpdatedAt        time.Time              `db:"updated_at" json:"updated_at"`
+    DeletedAt        *time.Time             `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+// TaskInstance represents a single execution instance of a task
+type TaskInstance struct {
+    ID             uuid.UUID              `db:"id" json:"id"`
+    TaskID         uuid.UUID              `db:"task_id" json:"task_id"`
+    InstanceID     string                 `db:"instance_id" json:"instance_id"`
+    Status         string                 `db:"status" json:"status"`
+    TriggerType    string                 `db:"trigger_type" json:"trigger_type"`
+    TriggeredBy    *uuid.UUID             `db:"triggered_by" json:"triggered_by,omitempty"`
+    StartTime      *time.Time             `db:"start_time" json:"start_time,omitempty"`
+    EndTime        *time.Time             `db:"end_time" json:"end_time,omitempty"`
+    DurationMs     *int                   `db:"duration_ms" json:"duration_ms,omitempty"`
+    RecordsFetched int                    `db:"records_fetched" json:"records_fetched"`
+    RecordsStored  int                    `db:"records_stored" json:"records_stored"`
+    RecordsFailed  int                    `db:"records_failed" json:"records_failed"`
+    ErrorMessage   string                 `db:"error_message" json:"error_message,omitempty"`
+    ErrorCode      string                 `db:"error_code" json:"error_code,omitempty"`
+    ExecutionLogs  map[string]interface{} `db:"execution_logs" json:"execution_logs,omitempty"`
+    RetryCount     int                    `db:"retry_count" json:"retry_count"`
+    WorkerID       string                 `db:"worker_id" json:"worker_id,omitempty"`
+    ResourceUsage  *ResourceUsage         `db:"resource_usage" json:"resource_usage,omitempty"`
+    CreatedAt      time.Time              `db:"created_at" json:"created_at"`
+}
+
+// ParsingRule defines how to extract data from source
+type ParsingRule struct {
+    Field     string                 `json:"field"`
+    Selector  string                 `json:"selector"`
+    Type      string                 `json:"type"` // text, number, date, html, etc.
+    Transform string                 `json:"transform,omitempty"`
+    Required  bool                   `json:"required"`
+    Default   interface{}            `json:"default,omitempty"`
+    Attributes map[string]interface{} `json:"attributes,omitempty"`
+}
+
+// CleaningRule defines data cleaning operations
+type CleaningRule struct {
+    Field      string      `json:"field"`
+    Operations []Operation `json:"operations"`
+}
+
+type Operation struct {
+    Type   string                 `json:"type"`
+    Params map[string]interface{} `json:"params,omitempty"`
+}
+
+// StorageConfig defines where and how to store collected data
+type StorageConfig struct {
+    Type               string                 `json:"type"` // postgresql, mongodb, elasticsearch, s3
+    Table              string                 `json:"table,omitempty"`
+    Database           string                 `json:"database,omitempty"`
+    BatchSize          int                    `json:"batch_size"`
+    ConflictResolution string                 `json:"conflict_resolution"` // insert, update, upsert, ignore
+    AdditionalConfig   map[string]interface{} `json:"additional_config,omitempty"`
+}
+
+// ScheduleConfig defines when and how often to run the task
+type ScheduleConfig struct {
+    Cron     string `json:"cron"`
+    Timezone string `json:"timezone"`
+    Enabled  bool   `json:"enabled"`
+}
+
+// RetryConfig defines retry behavior on failure
+type RetryConfig struct {
+    MaxRetries           int      `json:"max_retries"`
+    Strategy             string   `json:"strategy"` // fixed, linear, exponential_backoff
+    InitialIntervalSec   int      `json:"initial_interval_seconds"`
+    MaxIntervalSec       int      `json:"max_interval_seconds"`
+    RetryOn              []string `json:"retry_on"` // Error types to retry on
+}
+
+// AlertConfig defines notification settings
+type AlertConfig struct {
+    OnFailure NotificationConfig `json:"on_failure"`
+    OnSuccess NotificationConfig `json:"on_success"`
+}
+
+type NotificationConfig struct {
+    Enabled    bool     `json:"enabled"`
+    Channels   []string `json:"channels"` // email, webhook, slack
+    Recipients []string `json:"recipients"`
+}
+
+// ResourceUsage tracks resource consumption
+type ResourceUsage struct {
+    CPUPercent    float64 `json:"cpu_percent"`
+    MemoryMB      int     `json:"memory_mb"`
+    NetworkBytesTX int64  `json:"network_bytes_tx"`
+    NetworkBytesRX int64  `json:"network_bytes_rx"`
+}
+```
+
+**数据关系说明:**
+
+1. **tasks表** - 存储任务定义，是任务管理的核心表
+2. **task_instances表** - 存储每次任务执行的实例记录，与tasks表是一对多关系
+3. **task_execution_history表** - 长期存储历史执行记录，用于数据分析和报表，按月分区提高查询性能
+4. **datasources表** (在其他模块定义) - 存储数据源配置，与tasks表是一对多关系
+
+##### 3.2.1.2. RESTful API设计
+
+任务管理模块通过RESTful API对外提供服务，所有API遵循统一的请求/响应格式。
+
+**API端点列表:**
+
+| 方法 | 端点 | 描述 | 认证 |
+|------|------|------|------|
+| POST | /api/v1/tasks | 创建新任务 | Required |
+| GET | /api/v1/tasks | 获取任务列表(支持分页、过滤、排序) | Required |
+| GET | /api/v1/tasks/{id} | 获取任务详情 | Required |
+| PUT | /api/v1/tasks/{id} | 更新任务配置 | Required |
+| DELETE | /api/v1/tasks/{id} | 删除任务(软删除) | Required |
+| POST | /api/v1/tasks/{id}/start | 启动任务(手动触发) | Required |
+| POST | /api/v1/tasks/{id}/stop | 停止任务执行 | Required |
+| POST | /api/v1/tasks/{id}/pause | 暂停任务调度 | Required |
+| POST | /api/v1/tasks/{id}/resume | 恢复任务调度 | Required |
+| POST | /api/v1/tasks/{id}/execute | 立即执行任务(一次性) | Required |
+| GET | /api/v1/tasks/{id}/instances | 获取任务执行实例列表 | Required |
+| GET | /api/v1/tasks/{id}/instances/{instance_id} | 获取实例详情 | Required |
+| POST | /api/v1/tasks/{id}/instances/{instance_id}/cancel | 取消执行中的实例 | Required |
+| POST | /api/v1/tasks/{id}/clone | 克隆任务配置 | Required |
+| GET | /api/v1/tasks/{id}/statistics | 获取任务执行统计 | Required |
+
+**API请求/响应结构定义:**
+
+```go
+package handler
+
+import (
+    "net/http"
+    "time"
+
+    "github.com/gin-gonic/gin"
+    "github.com/google/uuid"
+    "github.com/datafusion/internal/model"
+    "github.com/datafusion/internal/service"
+)
+
+// CreateTaskRequest represents the request to create a new task
+type CreateTaskRequest struct {
+    Name             string                 `json:"name" binding:"required,min=1,max=255"`
+    Description      string                 `json:"description" binding:"max=2000"`
+    TaskType         string                 `json:"task_type" binding:"required,oneof=web_scraping api_collection database_sync"`
+    DatasourceID     string                 `json:"datasource_id" binding:"required,uuid"`
+    CollectionConfig map[string]interface{} `json:"collection_config" binding:"required"`
+    ParsingRules     []model.ParsingRule    `json:"parsing_rules"`
+    CleaningRules    []model.CleaningRule   `json:"cleaning_rules"`
+    StorageConfig    model.StorageConfig    `json:"storage_config" binding:"required"`
+    ScheduleConfig   *model.ScheduleConfig  `json:"schedule_config"`
+    RetryConfig      *model.RetryConfig     `json:"retry_config"`
+    Priority         int                    `json:"priority" binding:"min=1,max=3"`
+    MaxConcurrent    int                    `json:"max_concurrent" binding:"min=1,max=100"`
+    TimeoutSeconds   int                    `json:"timeout_seconds" binding:"min=60,max=86400"`
+    AlertConfig      *model.AlertConfig     `json:"alert_config"`
+    Tags             []string               `json:"tags"`
+}
+
+// TaskResponse represents a task in API responses
+type TaskResponse struct {
+    ID               string                 `json:"id"`
+    Name             string                 `json:"name"`
+    Description      string                 `json:"description"`
+    TaskType         string                 `json:"task_type"`
+    DatasourceID     string                 `json:"datasource_id"`
+    CollectionConfig map[string]interface{} `json:"collection_config"`
+    ParsingRules     []model.ParsingRule    `json:"parsing_rules"`
+    CleaningRules    []model.CleaningRule   `json:"cleaning_rules"`
+    StorageConfig    model.StorageConfig    `json:"storage_config"`
+    ScheduleConfig   *model.ScheduleConfig  `json:"schedule_config,omitempty"`
+    RetryConfig      *model.RetryConfig     `json:"retry_config,omitempty"`
+    Priority         int                    `json:"priority"`
+    Status           string                 `json:"status"`
+    MaxConcurrent    int                    `json:"max_concurrent"`
+    TimeoutSeconds   int                    `json:"timeout_seconds"`
+    AlertConfig      *model.AlertConfig     `json:"alert_config,omitempty"`
+    Tags             []string               `json:"tags"`
+    Version          int                    `json:"version"`
+    CreatedBy        string                 `json:"created_by"`
+    CreatedAt        time.Time              `json:"created_at"`
+    UpdatedAt        time.Time              `json:"updated_at"`
+    NextRunTime      *time.Time             `json:"next_run_time,omitempty"`
+    LastRunTime      *time.Time             `json:"last_run_time,omitempty"`
+    LastRunStatus    string                 `json:"last_run_status,omitempty"`
+}
+
+// ErrorResponse represents an error response
+type ErrorResponse struct {
+    Code      string                 `json:"code"`
+    Message   string                 `json:"message"`
+    Details   map[string]interface{} `json:"details,omitempty"`
+    RequestID string                 `json:"request_id"`
+    Timestamp time.Time              `json:"timestamp"`
+}
+
+// TaskHandler handles HTTP requests for task management
+type TaskHandler struct {
+    taskService    service.TaskService
+    validator      *Validator
+    logger         Logger
+}
+
+// CreateTask creates a new data collection task
+func (h *TaskHandler) CreateTask(c *gin.Context) {
+    var req CreateTaskRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Code:      "INVALID_REQUEST",
+            Message:   "Invalid request body",
+            Details:   map[string]interface{}{"error": err.Error()},
+            RequestID: c.GetString("request_id"),
+            Timestamp: time.Now(),
+        })
+        return
+    }
+
+    // Validate collection configuration based on task type
+    if err := h.validator.ValidateCollectionConfig(req.TaskType, req.CollectionConfig); err != nil {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Code:      "INVALID_CONFIG",
+            Message:   "Invalid collection configuration",
+            Details:   map[string]interface{}{"error": err.Error()},
+            RequestID: c.GetString("request_id"),
+            Timestamp: time.Now(),
+        })
+        return
+    }
+
+    // Get user ID from context
+    userID := c.GetString("user_id")
+    userUUID, err := uuid.Parse(userID)
+    if err != nil {
+        c.JSON(http.StatusUnauthorized, ErrorResponse{
+            Code:      "INVALID_USER",
+            Message:   "Invalid user ID",
+            RequestID: c.GetString("request_id"),
+            Timestamp: time.Now(),
+        })
+        return
+    }
+
+    // Convert request to task model
+    datasourceUUID, _ := uuid.Parse(req.DatasourceID)
+    task := &model.Task{
+        Name:             req.Name,
+        Description:      req.Description,
+        TaskType:         req.TaskType,
+        DatasourceID:     datasourceUUID,
+        CollectionConfig: req.CollectionConfig,
+        ParsingRules:     req.ParsingRules,
+        CleaningRules:    req.CleaningRules,
+        StorageConfig:    req.StorageConfig,
+        ScheduleConfig:   req.ScheduleConfig,
+        RetryConfig:      req.RetryConfig,
+        Priority:         req.Priority,
+        Status:           "draft",
+        MaxConcurrent:    req.MaxConcurrent,
+        TimeoutSeconds:   req.TimeoutSeconds,
+        AlertConfig:      req.AlertConfig,
+        Tags:             req.Tags,
+        CreatedBy:        userUUID,
+    }
+
+    // Create task
+    createdTask, err := h.taskService.CreateTask(c.Request.Context(), task)
+    if err != nil {
+        h.logger.Error("Failed to create task", "error", err)
+        c.JSON(http.StatusInternalServerError, ErrorResponse{
+            Code:      "INTERNAL_ERROR",
+            Message:   "Failed to create task",
+            RequestID: c.GetString("request_id"),
+            Timestamp: time.Now(),
+        })
+        return
+    }
+
+    c.JSON(http.StatusCreated, h.toTaskResponse(createdTask))
+}
+
+// ListTasks returns a paginated list of tasks with optional filters
+func (h *TaskHandler) ListTasks(c *gin.Context) {
+    page := c.DefaultQuery("page", "1")
+    pageSize := c.DefaultQuery("page_size", "20")
+    status := c.Query("status")
+    taskType := c.Query("task_type")
+    search := c.Query("search")
+
+    filter := service.TaskFilter{
+        Status:   status,
+        TaskType: taskType,
+        Search:   search,
+    }
+
+    tasks, total, err := h.taskService.ListTasks(c.Request.Context(), filter, page, pageSize)
+    if err != nil {
+        h.logger.Error("Failed to list tasks", "error", err)
+        c.JSON(http.StatusInternalServerError, ErrorResponse{
+            Code:      "INTERNAL_ERROR",
+            Message:   "Failed to list tasks",
+            RequestID: c.GetString("request_id"),
+            Timestamp: time.Now(),
+        })
+        return
+    }
+
+    c.JSON(http.StatusOK, map[string]interface{}{
+        "tasks": tasks,
+        "pagination": map[string]interface{}{
+            "page":       page,
+            "page_size":  pageSize,
+            "total":      total,
+        },
+    })
+}
+
+// ExecuteTask triggers immediate execution of a task
+func (h *TaskHandler) ExecuteTask(c *gin.Context) {
+    taskID := c.Param("id")
+    taskUUID, err := uuid.Parse(taskID)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Code:      "INVALID_TASK_ID",
+            Message:   "Invalid task ID format",
+            RequestID: c.GetString("request_id"),
+            Timestamp: time.Now(),
+        })
+        return
+    }
+
+    userID := c.GetString("user_id")
+    userUUID, _ := uuid.Parse(userID)
+
+    instance, err := h.taskService.ExecuteTask(c.Request.Context(), taskUUID, "manual", &userUUID)
+    if err != nil {
+        if err == service.ErrTaskNotFound {
+            c.JSON(http.StatusNotFound, ErrorResponse{
+                Code:      "TASK_NOT_FOUND",
+                Message:   "Task not found",
+                RequestID: c.GetString("request_id"),
+                Timestamp: time.Now(),
+            })
+            return
+        }
+        h.logger.Error("Failed to execute task", "error", err)
+        c.JSON(http.StatusInternalServerError, ErrorResponse{
+            Code:      "INTERNAL_ERROR",
+            Message:   "Failed to execute task",
+            RequestID: c.GetString("request_id"),
+            Timestamp: time.Now(),
+        })
+        return
+    }
+
+    c.JSON(http.StatusAccepted, map[string]interface{}{
+        "message":     "Task execution started",
+        "instance_id": instance.InstanceID,
+        "status":      instance.Status,
+    })
+}
+```
+
+**错误码规范:**
+
+| 错误码 | HTTP状态码 | 描述 | 是否重试 |
+|--------|-----------|------|---------|
+| INVALID_REQUEST | 400 | 请求参数格式错误 | 否 |
+| INVALID_CONFIG | 400 | 任务配置验证失败 | 否 |
+| INVALID_TASK_ID | 400 | 任务ID格式错误 | 否 |
+| UNAUTHORIZED | 401 | 未认证或Token无效 | 否 |
+| FORBIDDEN | 403 | 无权限执行操作 | 否 |
+| TASK_NOT_FOUND | 404 | 任务不存在 | 否 |
+| DATASOURCE_NOT_FOUND | 404 | 数据源不存在 | 否 |
+| CONCURRENT_MODIFICATION | 409 | 并发修改冲突 | 是 |
+| TASK_ALREADY_RUNNING | 409 | 任务已在运行中 | 否 |
+| MAX_CONCURRENT_REACHED | 429 | 达到最大并发限制 | 是 |
+| INTERNAL_ERROR | 500 | 服务器内部错误 | 是 |
+| DATABASE_ERROR | 500 | 数据库操作失败 | 是 |
+| QUEUE_ERROR | 500 | 消息队列操作失败 | 是 |
+
+##### 3.2.1.3. 任务生命周期状态机
+
+任务和任务实例都有明确的状态转换规则，通过状态机模式进行管理。
+
+**任务状态定义:**
+
+```go
+package model
+
+// TaskState represents the state of a task
+type TaskState string
+
+const (
+    TaskStateDraft    TaskState = "draft"    // 草稿状态，任务已创建但未激活
+    TaskStateActive   TaskState = "active"   // 活跃状态，任务可被调度执行
+    TaskStatePaused   TaskState = "paused"   // 暂停状态，暂时停止调度但保留配置
+    TaskStateArchived TaskState = "archived" // 归档状态，任务已停用不再执行
+)
+
+// TaskInstanceState represents the state of a task instance
+type TaskInstanceState string
+
+const (
+    InstanceStatePending   TaskInstanceState = "pending"   // 等待执行
+    InstanceStateRunning   TaskInstanceState = "running"   // 执行中
+    InstanceStateSuccess   TaskInstanceState = "success"   // 执行成功
+    InstanceStateFailed    TaskInstanceState = "failed"    // 执行失败
+    InstanceStateCancelled TaskInstanceState = "cancelled" // 已取消
+    InstanceStateTimeout   TaskInstanceState = "timeout"   // 执行超时
+)
+```
+
+**任务状态机实现:**
+
+```go
+package service
+
+import (
+    "fmt"
+    "github.com/datafusion/internal/model"
+)
+
+// TaskStateMachine manages task state transitions
+type TaskStateMachine struct {
+    transitions map[model.TaskState][]model.TaskState
+}
+
+// NewTaskStateMachine creates a new task state machine
+func NewTaskStateMachine() *TaskStateMachine {
+    return &TaskStateMachine{
+        transitions: map[model.TaskState][]model.TaskState{
+            model.TaskStateDraft: {
+                model.TaskStateActive,   // 从草稿激活任务
+                model.TaskStateArchived, // 从草稿直接归档
+            },
+            model.TaskStateActive: {
+                model.TaskStatePaused,   // 暂停活跃任务
+                model.TaskStateArchived, // 归档活跃任务
+            },
+            model.TaskStatePaused: {
+                model.TaskStateActive,   // 恢复暂停的任务
+                model.TaskStateArchived, // 归档暂停的任务
+            },
+            model.TaskStateArchived: {}, // 归档是终态，不可转换
+        },
+    }
+}
+
+// CanTransition checks if a state transition is valid
+func (sm *TaskStateMachine) CanTransition(from, to model.TaskState) bool {
+    allowedStates, exists := sm.transitions[from]
+    if !exists {
+        return false
+    }
+
+    for _, state := range allowedStates {
+        if state == to {
+            return true
+        }
+    }
+    return false
+}
+
+// ValidateTransition validates and returns error if transition is invalid
+func (sm *TaskStateMachine) ValidateTransition(from, to model.TaskState) error {
+    if !sm.CanTransition(from, to) {
+        return fmt.Errorf("invalid state transition from %s to %s", from, to)
+    }
+    return nil
+}
+```
+
+**状态更新服务实现(带乐观锁):**
+
+```go
+package service
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "time"
+
+    "github.com/google/uuid"
+    "github.com/datafusion/internal/model"
+)
+
+var (
+    ErrTaskNotFound           = fmt.Errorf("task not found")
+    ErrConcurrentModification = fmt.Errorf("task was modified by another user")
+    ErrInvalidStateTransition = fmt.Errorf("invalid state transition")
+)
+
+type taskService struct {
+    db           *sql.DB
+    stateMachine *TaskStateMachine
+    logger       Logger
+}
+
+// UpdateTaskState updates task state with optimistic locking
+func (s *taskService) UpdateTaskState(ctx context.Context, taskID uuid.UUID, newState model.TaskState) error {
+    // 先获取当前状态
+    var currentState model.TaskState
+    var version int
+    err := s.db.QueryRowContext(ctx, `
+        SELECT status, version
+        FROM tasks
+        WHERE id = $1 AND deleted_at IS NULL
+    `, taskID).Scan(&currentState, &version)
+
+    if err == sql.ErrNoRows {
+        return ErrTaskNotFound
+    }
+    if err != nil {
+        return fmt.Errorf("failed to get task: %w", err)
+    }
+
+    // 验证状态转换
+    if err := s.stateMachine.ValidateTransition(currentState, newState); err != nil {
+        return ErrInvalidStateTransition
+    }
+
+    // 使用乐观锁更新状态
+    result, err := s.db.ExecContext(ctx, `
+        UPDATE tasks
+        SET status = $1, version = version + 1, updated_at = $2
+        WHERE id = $3 AND version = $4 AND deleted_at IS NULL
+    `, newState, time.Now(), taskID, version)
+
+    if err != nil {
+        return fmt.Errorf("failed to update task state: %w", err)
+    }
+
+    rowsAffected, err := result.RowsAffected()
+    if err != nil {
+        return err
+    }
+
+    if rowsAffected == 0 {
+        // 版本号不匹配，说明有并发修改
+        return ErrConcurrentModification
+    }
+
+    s.logger.Info("Task state updated",
+        "task_id", taskID,
+        "from", currentState,
+        "to", newState,
+        "version", version+1,
+    )
+
+    return nil
+}
+```
+
+**状态转换流程图:**
+
+任务状态转换:
+```
+Draft (草稿)
+  ├─> Active (激活)
+  │     ├─> Paused (暂停)
+  │     │     ├─> Active (恢复)
+  │     │     └─> Archived (归档)
+  │     └─> Archived (归档)
+  └─> Archived (归档)
+```
+
+任务实例状态转换:
+```
+Pending (等待)
+  ├─> Running (执行中)
+  │     ├─> Success (成功) [终态]
+  │     ├─> Failed (失败) [终态，可能重试]
+  │     ├─> Timeout (超时) [终态，可能重试]
+  │     └─> Cancelled (取消) [终态]
+  └─> Cancelled (取消) [终态]
+```
+
+##### 3.2.1.4. 任务配置管理
+
+任务配置管理包括配置验证、变量替换、配置版本管理等功能。
+
+**配置验证器实现:**
+
+```go
+package validator
+
+import (
+    "fmt"
+    "regexp"
+    "github.com/datafusion/internal/model"
+)
+
+type Validator struct {
+    validators map[string]ConfigValidator
+}
+
+type ConfigValidator interface {
+    Validate(config map[string]interface{}) error
+}
+
+func NewValidator() *Validator {
+    return &Validator{
+        validators: map[string]ConfigValidator{
+            "web_scraping":    &WebScrapingValidator{},
+            "api_collection":  &APICollectionValidator{},
+            "database_sync":   &DatabaseSyncValidator{},
+        },
+    }
+}
+
+func (v *Validator) ValidateCollectionConfig(taskType string, config map[string]interface{}) error {
+    validator, exists := v.validators[taskType]
+    if !exists {
+        return fmt.Errorf("unsupported task type: %s", taskType)
+    }
+
+    return validator.Validate(config)
+}
+
+// WebScrapingValidator validates web scraping task configuration
+type WebScrapingValidator struct{}
+
+func (v *WebScrapingValidator) Validate(config map[string]interface{}) error {
+    // 验证URL模式
+    urlPattern, ok := config["url_pattern"].(string)
+    if !ok || urlPattern == "" {
+        return fmt.Errorf("url_pattern is required")
+    }
+
+    // 验证URL格式
+    urlRegex := regexp.MustCompile(`^https?://`)
+    if !urlRegex.MatchString(urlPattern) {
+        return fmt.Errorf("url_pattern must start with http:// or https://")
+    }
+
+    return nil
+}
+```
+
+**变量替换引擎:**
+
+任务配置支持使用变量，在执行时动态替换为实际值。
+
+```go
+package engine
+
+import (
+    "fmt"
+    "regexp"
+    "time"
+    "github.com/google/uuid"
+)
+
+// VariableSubstitutor handles variable substitution in task configuration
+type VariableSubstitutor struct {
+    variables map[string]func() string
+}
+
+func NewVariableSubstitutor() *VariableSubstitutor {
+    sub := &VariableSubstitutor{
+        variables: make(map[string]func() string),
+    }
+
+    // 注册内置变量
+    sub.variables["today"] = func() string {
+        return time.Now().Format("2006-01-02")
+    }
+    sub.variables["yesterday"] = func() string {
+        return time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+    }
+    sub.variables["now"] = func() string {
+        return time.Now().Format("2006-01-02 15:04:05")
+    }
+    sub.variables["timestamp"] = func() string {
+        return fmt.Sprintf("%d", time.Now().Unix())
+    }
+    sub.variables["uuid"] = func() string {
+        return uuid.New().String()
+    }
+
+    return sub
+}
+
+// Substitute replaces variables in the input string
+// Variables format: {variable_name}
+func (s *VariableSubstitutor) Substitute(input string) string {
+    re := regexp.MustCompile(`\{([a-zA-Z0-9_]+)\}`)
+
+    return re.ReplaceAllStringFunc(input, func(match string) string {
+        parts := re.FindStringSubmatch(match)
+        if len(parts) < 2 {
+            return match
+        }
+
+        varName := parts[1]
+        generator, exists := s.variables[varName]
+        if !exists {
+            return match // 变量不存在，保持原样
+        }
+
+        return generator()
+    })
+}
+
+// SubstituteMap recursively substitutes variables in a map
+func (s *VariableSubstitutor) SubstituteMap(config map[string]interface{}) map[string]interface{} {
+    result := make(map[string]interface{})
+
+    for key, value := range config {
+        switch v := value.(type) {
+        case string:
+            result[key] = s.Substitute(v)
+        case map[string]interface{}:
+            result[key] = s.SubstituteMap(v)
+        default:
+            result[key] = value
+        }
+    }
+
+    return result
+}
+```
+
+**使用示例:**
+
+```go
+// 配置示例
+config := map[string]interface{}{
+    "url_pattern": "https://example.com/api/data?date={today}",
+    "output_file": "/data/export_{timestamp}.json",
+    "query": "SELECT * FROM orders WHERE created_at >= '{yesterday} 00:00:00'",
+}
+
+// 变量替换
+substitutor := engine.NewVariableSubstitutor()
+resolvedConfig := substitutor.SubstituteMap(config)
+
+// 结果:
+// {
+//   "url_pattern": "https://example.com/api/data?date=2025-01-21",
+//   "output_file": "/data/export_1737417600.json",
+//   "query": "SELECT * FROM orders WHERE created_at >= '2025-01-20 00:00:00'"
+// }
+```
+
+##### 3.2.1.5. 任务实例管理
+
+任务实例是任务的具体执行记录，每次任务执行都会创建一个新的实例。
+
+**实例ID生成策略:**
+
+```go
+package service
+
+import (
+    "fmt"
+    "time"
+    "github.com/google/uuid"
+)
+
+// GenerateInstanceID generates a unique instance ID
+// Format: task-{shortTaskID}-{timestamp}-{random}
+func GenerateInstanceID(taskID uuid.UUID) string {
+    shortID := taskID.String()[:8]
+    timestamp := time.Now().Format("20060102-150405")
+    random := uuid.New().String()[:6]
+
+    return fmt.Sprintf("task-%s-%s-%s", shortID, timestamp, random)
+}
+
+// Example: task-a1b2c3d4-20250121-143052-9f8e7d
+```
+
+**实例创建服务:**
+
+```go
+package service
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/google/uuid"
+    "github.com/datafusion/internal/model"
+)
+
+// CreateTaskInstance creates a new task instance
+func (s *taskService) CreateTaskInstance(ctx context.Context, taskID uuid.UUID, triggerType string, triggeredBy *uuid.UUID) (*model.TaskInstance, error) {
+    // 检查任务是否存在且状态正确
+    task, err := s.GetTask(ctx, taskID)
+    if err != nil {
+        return nil, err
+    }
+
+    if task.Status != model.TaskStateActive {
+        return nil, fmt.Errorf("task is not active, current status: %s", task.Status)
+    }
+
+    // 检查是否达到最大并发限制
+    runningCount, err := s.getRunningInstanceCount(ctx, taskID)
+    if err != nil {
+        return nil, err
+    }
+
+    if runningCount >= task.MaxConcurrent {
+        return nil, fmt.Errorf("max concurrent instances reached: %d/%d", runningCount, task.MaxConcurrent)
+    }
+
+    // 创建实例
+    instance := &model.TaskInstance{
+        ID:          uuid.New(),
+        TaskID:      taskID,
+        InstanceID:  GenerateInstanceID(taskID),
+        Status:      string(model.InstanceStatePending),
+        TriggerType: triggerType,
+        TriggeredBy: triggeredBy,
+        RetryCount:  0,
+        CreatedAt:   time.Now(),
+    }
+
+    // 保存到数据库
+    _, err = s.db.ExecContext(ctx, `
+        INSERT INTO task_instances (
+            id, task_id, instance_id, status, trigger_type, triggered_by, retry_count, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `, instance.ID, instance.TaskID, instance.InstanceID, instance.Status,
+       instance.TriggerType, instance.TriggeredBy, instance.RetryCount, instance.CreatedAt)
+
+    if err != nil {
+        return nil, fmt.Errorf("failed to create task instance: %w", err)
+    }
+
+    s.logger.Info("Task instance created",
+        "task_id", taskID,
+        "instance_id", instance.InstanceID,
+        "trigger_type", triggerType,
+    )
+
+    return instance, nil
+}
+```
+
+**实例清理策略:**
+
+为避免task_instances表无限增长，需要定期清理历史实例数据。
+
+```go
+package job
+
+import (
+    "context"
+    "time"
+    "database/sql"
+)
+
+type InstanceCleanupJob struct {
+    db                *sql.DB
+    retentionDays     int
+    archiveToHistory  bool
+    logger            Logger
+}
+
+// Run executes the cleanup job
+func (j *InstanceCleanupJob) Run(ctx context.Context) error {
+    cutoffDate := time.Now().AddDate(0, 0, -j.retentionDays)
+
+    j.logger.Info("Starting instance cleanup",
+        "retention_days", j.retentionDays,
+        "cutoff_date", cutoffDate,
+    )
+
+    if j.archiveToHistory {
+        // 先归档到历史表
+        result, err := j.db.ExecContext(ctx, `
+            INSERT INTO task_execution_history (
+                task_id, task_name, instance_id, status,
+                start_time, end_time, duration_ms, records_count,
+                error_summary, execution_date, created_at
+            )
+            SELECT
+                ti.task_id,
+                t.name,
+                ti.instance_id,
+                ti.status,
+                ti.start_time,
+                ti.end_time,
+                ti.duration_ms,
+                ti.records_stored,
+                LEFT(ti.error_message, 500),
+                DATE(ti.created_at),
+                ti.created_at
+            FROM task_instances ti
+            JOIN tasks t ON t.id = ti.task_id
+            WHERE ti.created_at < $1
+              AND ti.status IN ('success', 'failed', 'cancelled', 'timeout')
+        `, cutoffDate)
+
+        if err != nil {
+            return err
+        }
+
+        archived, _ := result.RowsAffected()
+        j.logger.Info("Instances archived", "count", archived)
+    }
+
+    // 删除旧实例
+    result, err := j.db.ExecContext(ctx, `
+        DELETE FROM task_instances
+        WHERE created_at < $1
+          AND status IN ('success', 'failed', 'cancelled', 'timeout')
+    `, cutoffDate)
+
+    if err != nil {
+        return err
+    }
+
+    deleted, _ := result.RowsAffected()
+    j.logger.Info("Instances deleted", "count", deleted)
+
+    return nil
+}
+```
+
+##### 3.2.1.6. 重试机制设计
+
+任务执行失败时，根据配置的重试策略自动重试。
+
+**重试策略类型:**
+
+```go
+package retry
+
+import (
+    "context"
+    "fmt"
+    "math"
+    "time"
+)
+
+// Strategy represents a retry strategy
+type Strategy string
+
+const (
+    StrategyFixed              Strategy = "fixed"              // 固定间隔
+    StrategyLinear             Strategy = "linear"             // 线性增长
+    StrategyExponentialBackoff Strategy = "exponential_backoff" // 指数退避
+)
+
+// RetryPolicy defines retry behavior
+type RetryPolicy struct {
+    MaxRetries        int
+    Strategy          Strategy
+    InitialIntervalSec int
+    MaxIntervalSec    int
+    RetryOn           []string // Error types to retry on
+}
+
+// CalculateNextRetryDelay calculates the delay before next retry
+func (p *RetryPolicy) CalculateNextRetryDelay(attemptNumber int) time.Duration {
+    var delaySec int
+
+    switch p.Strategy {
+    case StrategyFixed:
+        delaySec = p.InitialIntervalSec
+
+    case StrategyLinear:
+        delaySec = p.InitialIntervalSec * attemptNumber
+
+    case StrategyExponentialBackoff:
+        // 2^attemptNumber * initial_interval
+        delaySec = int(math.Pow(2, float64(attemptNumber))) * p.InitialIntervalSec
+
+    default:
+        delaySec = p.InitialIntervalSec
+    }
+
+    // 限制最大间隔
+    if delaySec > p.MaxIntervalSec {
+        delaySec = p.MaxIntervalSec
+    }
+
+    return time.Duration(delaySec) * time.Second
+}
+
+// ShouldRetry determines if a retry should be attempted
+func (p *RetryPolicy) ShouldRetry(attemptNumber int, errorType string) bool {
+    // 检查是否超过最大重试次数
+    if attemptNumber >= p.MaxRetries {
+        return false
+    }
+
+    // 检查错误类型是否在重试列表中
+    if len(p.RetryOn) == 0 {
+        return true // 未指定错误类型，默认重试所有错误
+    }
+
+    for _, retryableError := range p.RetryOn {
+        if retryableError == errorType {
+            return true
+        }
+    }
+
+    return false
+}
+```
+
+**重试时间计算示例(指数退避):**
+- 第1次重试: 2^1 * 30 = 60秒后
+- 第2次重试: 2^2 * 30 = 120秒后
+- 第3次重试: 2^3 * 30 = 240秒后
+- 第4次重试: 2^4 * 30 = 480秒后
+- 第5次重试: 2^5 * 30 = 960秒后
+
+##### 3.2.1.7. 任务优先级管理
+
+任务支持三个优先级级别，影响任务调度和资源分配。
+
+**优先级定义:**
+
+```go
+package model
+
+// TaskPriority represents task execution priority
+type TaskPriority int
+
+const (
+    PriorityLow    TaskPriority = 1
+    PriorityMedium TaskPriority = 2
+    PriorityHigh   TaskPriority = 3
+)
+
+func (p TaskPriority) String() string {
+    switch p {
+    case PriorityLow:
+        return "low"
+    case PriorityMedium:
+        return "medium"
+    case PriorityHigh:
+        return "high"
+    default:
+        return "unknown"
+    }
+}
+```
+
+**优先级队列实现:**
+
+任务实例在推送到RabbitMQ时，根据优先级发送到不同的队列或设置消息优先级。
+
+```go
+package queue
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+
+    "github.com/streadway/amqp"
+    "github.com/datafusion/internal/model"
+)
+
+type TaskQueue struct {
+    conn    *amqp.Connection
+    channel *amqp.Channel
+    logger  Logger
+}
+
+func NewTaskQueue(amqpURL string, logger Logger) (*TaskQueue, error) {
+    conn, err := amqp.Dial(amqpURL)
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+    }
+
+    channel, err := conn.Channel()
+    if err != nil {
+        return nil, fmt.Errorf("failed to open channel: %w", err)
+    }
+
+    // 声明优先级队列
+    args := amqp.Table{
+        "x-max-priority": 10, // 支持0-10的优先级
+    }
+
+    _, err = channel.QueueDeclare(
+        "task_execution_queue", // 队列名称
+        true,                   // durable
+        false,                  // auto-delete
+        false,                  // exclusive
+        false,                  // no-wait
+        args,                   // arguments
+    )
+
+    if err != nil {
+        return nil, fmt.Errorf("failed to declare queue: %w", err)
+    }
+
+    return &TaskQueue{
+        conn:    conn,
+        channel: channel,
+        logger:  logger,
+    }, nil
+}
+
+// EnqueueTask adds a task instance to the execution queue
+func (q *TaskQueue) EnqueueTask(ctx context.Context, instance *model.TaskInstance, task *model.Task) error {
+    // 构造消息体
+    message := TaskExecutionMessage{
+        InstanceID:  instance.InstanceID,
+        TaskID:      task.ID.String(),
+        TaskType:    task.TaskType,
+        Priority:    task.Priority,
+        Config:      task.CollectionConfig,
+        EnqueueTime: time.Now(),
+    }
+
+    body, err := json.Marshal(message)
+    if err != nil {
+        return fmt.Errorf("failed to marshal message: %w", err)
+    }
+
+    // 映射任务优先级到RabbitMQ优先级 (1-3 -> 3-9)
+    mqPriority := uint8(task.Priority * 3)
+
+    // 发布消息
+    err = q.channel.Publish(
+        "",                     // exchange
+        "task_execution_queue", // routing key
+        false,                  // mandatory
+        false,                  // immediate
+        amqp.Publishing{
+            ContentType:  "application/json",
+            Body:         body,
+            Priority:     mqPriority,
+            DeliveryMode: amqp.Persistent,
+            Timestamp:    time.Now(),
+        },
+    )
+
+    if err != nil {
+        return fmt.Errorf("failed to publish message: %w", err)
+    }
+
+    q.logger.Info("Task enqueued",
+        "instance_id", instance.InstanceID,
+        "priority", task.Priority,
+        "mq_priority", mqPriority,
+    )
+
+    return nil
+}
+```
+
+##### 3.2.1.8. 与其他模块集成
+
+任务管理模块作为系统核心，需要与多个模块进行集成。
+
+**与调度引擎集成:**
+
+调度引擎定期扫描active状态的任务，根据schedule_config触发任务执行。
+
+```go
+package scheduler
+
+import (
+    "context"
+    "time"
+
+    "github.com/robfig/cron/v3"
+    "github.com/google/uuid"
+)
+
+type Scheduler struct {
+    taskService service.TaskService
+    cronEngine  *cron.Cron
+    logger      Logger
+}
+
+func NewScheduler(taskService service.TaskService, logger Logger) *Scheduler {
+    return &Scheduler{
+        taskService: taskService,
+        cronEngine:  cron.New(cron.WithSeconds()),
+        logger:      logger,
+    }
+}
+
+// LoadScheduledTasks loads all active tasks and registers their schedules
+func (s *Scheduler) LoadScheduledTasks(ctx context.Context) error {
+    tasks, err := s.taskService.GetActiveScheduledTasks(ctx)
+    if err != nil {
+        return err
+    }
+
+    for _, task := range tasks {
+        if task.ScheduleConfig != nil && task.ScheduleConfig.Enabled {
+            if err := s.registerTask(task); err != nil {
+                s.logger.Error("Failed to register task",
+                    "task_id", task.ID,
+                    "error", err,
+                )
+                continue
+            }
+        }
+    }
+
+    s.logger.Info("Scheduled tasks loaded", "count", len(tasks))
+    return nil
+}
+
+// registerTask registers a task with the cron engine
+func (s *Scheduler) registerTask(task *model.Task) error {
+    cronExpr := task.ScheduleConfig.Cron
+
+    _, err := s.cronEngine.AddFunc(cronExpr, func() {
+        ctx := context.Background()
+
+        s.logger.Info("Triggering scheduled task",
+            "task_id", task.ID,
+            "task_name", task.Name,
+        )
+
+        // 创建任务实例
+        instance, err := s.taskService.CreateTaskInstance(ctx, task.ID, "scheduled", nil)
+        if err != nil {
+            s.logger.Error("Failed to create task instance",
+                "task_id", task.ID,
+                "error", err,
+            )
+            return
+        }
+
+        // 推送到执行队列
+        if err := s.taskService.EnqueueInstance(ctx, instance, task); err != nil {
+            s.logger.Error("Failed to enqueue instance",
+                "instance_id", instance.InstanceID,
+                "error", err,
+            )
+        }
+    })
+
+    return err
+}
+```
+
+**与监控模块集成:**
+
+任务状态变更、执行结果需要上报到监控系统。
+
+```go
+package service
+
+import (
+    "github.com/prometheus/client_golang/prometheus"
+)
+
+// Metrics for task management
+var (
+    tasksTotal = prometheus.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "datafusion_tasks_total",
+            Help: "Total number of tasks by status",
+        },
+        []string{"status", "task_type"},
+    )
+
+    taskInstancesTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "datafusion_task_instances_total",
+            Help: "Total number of task instances by status",
+        },
+        []string{"status", "task_type", "trigger_type"},
+    )
+
+    taskExecutionDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "datafusion_task_execution_duration_seconds",
+            Help:    "Task execution duration in seconds",
+            Buckets: []float64{1, 5, 10, 30, 60, 300, 600, 1800, 3600},
+        },
+        []string{"task_type", "status"},
+    )
+)
+
+func init() {
+    prometheus.MustRegister(tasksTotal)
+    prometheus.MustRegister(taskInstancesTotal)
+    prometheus.MustRegister(taskExecutionDuration)
+}
+```
+
+**模块间通信流程:**
+
+1. **任务创建**: 用户通过API创建任务 → 任务管理模块验证并保存
+2. **任务调度**: 调度引擎扫描任务 → 创建实例 → 推送到队列
+3. **任务执行**: Worker从队列获取 → 执行采集 → 更新状态
+4. **结果存储**: Worker根据storage_config写入目标存储
+5. **状态监控**: 各模块上报指标 → Prometheus采集 → Grafana展示
+6. **告警通知**: 任务失败 → 触发告警 → 发送通知
+
+**性能优化建议:**
+
+| 优化项 | 描述 | 预期收益 |
+|--------|------|---------|
+| 数据库连接池 | 使用连接池复用数据库连接 | 减少连接开销70% |
+| 任务缓存 | 缓存活跃任务配置到Redis | 减少数据库查询90% |
+| 批量操作 | 批量创建/更新任务实例 | 提升吞吐量10倍 |
+| 索引优化 | 为常用查询字段添加索引 | 查询速度提升5-10倍 |
+| 异步处理 | 非关键操作异步执行 | 提升API响应速度50% |
+| 分区表 | 历史数据按时间分区 | 查询性能提升3-5倍 |
+
 #### 3.2.2. 调度引擎模块 (Scheduler)
 
 负责根据任务配置的调度策略，准时地触发任务执行。
@@ -1450,6 +2981,1694 @@ helm install datafusion ./datafusion-chart \
        Body:        taskJSON,
    })
    ```
+
+##### 3.2.2.3. 调度器生命周期管理
+
+调度器作为系统的关键组件，需要完善的生命周期管理机制来确保服务的稳定性和可靠性。
+
+**1. 调度器状态机**
+
+调度器定义了以下状态，状态之间的转换由生命周期方法触发：
+
+```go
+type SchedulerState int
+
+const (
+    StateInitializing SchedulerState = iota  // 初始化中
+    StateStarting                            // 启动中
+    StateRunning                             // 运行中
+    StatePausing                             // 暂停中
+    StatePaused                              // 已暂停
+    StateStopping                            // 停止中
+    StateStopped                             // 已停止
+    StateError                               // 错误状态
+)
+```
+
+**2. 启动流程（Start）**
+
+调度器启动时按以下步骤执行：
+
+```go
+func (s *Scheduler) Start(ctx context.Context) error {
+    // 1. 状态检查：确保当前状态为Stopped
+    if !s.compareAndSwapState(StateStopped, StateStarting) {
+        return fmt.Errorf("scheduler is already running or in invalid state")
+    }
+
+    // 2. 加载调度器配置
+    if err := s.loadConfig(ctx); err != nil {
+        s.setState(StateError)
+        return fmt.Errorf("failed to load config: %w", err)
+    }
+
+    // 3. 初始化依赖组件（数据库连接、Redis连接、消息队列等）
+    if err := s.initComponents(ctx); err != nil {
+        s.setState(StateError)
+        return fmt.Errorf("failed to initialize components: %w", err)
+    }
+
+    // 4. 从数据库加载所有启用的任务配置
+    tasks, err := s.taskService.GetActiveScheduledTasks(ctx)
+    if err != nil {
+        s.setState(StateError)
+        return fmt.Errorf("failed to load tasks: %w", err)
+    }
+
+    // 5. 注册任务到Cron引擎（验证Cron表达式、创建调度条目）
+    for _, task := range tasks {
+        if err := s.registerTask(task); err != nil {
+            s.logger.Error("failed to register task", "task_id", task.ID, "error", err)
+            // 记录但不阻断启动流程
+        }
+    }
+
+    // 6. 启动Cron引擎
+    s.cronEngine.Start()
+
+    // 7. 启动任务配置变更监听器（监听数据库变更通知）
+    s.wg.Add(1)
+    go s.watchTaskChanges(ctx)
+
+    // 8. 启动健康检查协程
+    s.wg.Add(1)
+    go s.healthCheck(ctx)
+
+    // 9. 执行崩溃恢复（处理系统重启期间错过的任务）
+    if err := s.recoverFromCrash(ctx); err != nil {
+        s.logger.Warn("crash recovery failed", "error", err)
+    }
+
+    s.setState(StateRunning)
+    s.logger.Info("scheduler started successfully", "task_count", len(tasks))
+
+    return nil
+}
+```
+
+**3. 优雅停止流程（Stop）**
+
+调度器停止时确保所有正在推送的任务完成，避免数据不一致：
+
+```go
+func (s *Scheduler) Stop(ctx context.Context) error {
+    if !s.compareAndSwapState(StateRunning, StateStopping) {
+        return fmt.Errorf("scheduler is not running")
+    }
+
+    s.logger.Info("scheduler is stopping...")
+
+    // 1. 停止Cron引擎（不再触发新任务）
+    <-s.cronEngine.Stop().Done()
+
+    // 2. 等待正在推送的任务完成（带超时机制）
+    shutdownTimeout := 30 * time.Second
+    done := make(chan struct{})
+    go func() {
+        s.wg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        s.logger.Info("all tasks completed gracefully")
+    case <-time.After(shutdownTimeout):
+        s.logger.Warn("shutdown timeout reached, forcing shutdown")
+    }
+
+    // 3. 关闭依赖组件（数据库、Redis、消息队列连接）
+    s.closeComponents()
+
+    // 4. 记录停止时间（用于下次启动时的崩溃恢复）
+    s.recordStopTime(ctx, time.Now())
+
+    s.setState(StateStopped)
+    s.logger.Info("scheduler stopped successfully")
+
+    return nil
+}
+```
+
+**4. Misfire处理机制**
+
+当调度器因故障停机或系统重启导致错过任务执行时，通过Misfire策略处理：
+
+**Misfire策略类型：**
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| `do_nothing` | 不处理，等待下次正常调度 | 对时效性要求不高的任务 |
+| `fire_now` | 立即执行一次 | 需要补偿执行的任务 |
+| `fire_once_now` | 立即执行一次，跳过其他错过的执行 | 只需最新数据的任务 |
+| `fire_all_missed` | 补偿执行所有错过的执行 | 每次执行都很重要的任务 |
+
+**实现代码：**
+
+```go
+// RecoverFromCrash 从崩溃中恢复
+func (s *Scheduler) recoverFromCrash(ctx context.Context) error {
+    // 1. 查找最后一次调度器停止时间
+    lastStopTime, err := s.getLastStopTime(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to get last stop time: %w", err)
+    }
+
+    // 2. 查找在此期间应该执行但未执行的任务
+    now := time.Now()
+    if now.Sub(lastStopTime) < 5*time.Second {
+        // 停机时间过短，可能是正常重启，不处理
+        return nil
+    }
+
+    misfiredTasks, err := s.findMisfiredTasks(ctx, lastStopTime, now)
+    if err != nil {
+        return fmt.Errorf("failed to find misfired tasks: %w", err)
+    }
+
+    s.logger.Info("found misfired tasks", "count", len(misfiredTasks))
+
+    // 3. 根据每个任务的Misfire策略处理
+    for _, task := range misfiredTasks {
+        if err := s.handleMisfiredTask(ctx, task, lastStopTime); err != nil {
+            s.logger.Error("failed to handle misfired task",
+                "task_id", task.ID,
+                "error", err,
+            )
+        }
+    }
+
+    return nil
+}
+
+// handleMisfiredTask 处理单个Misfire任务
+func (s *Scheduler) handleMisfiredTask(ctx context.Context, task *Task, misfiredAt time.Time) error {
+    policy := task.ScheduleConfig.MisfirePolicy
+    if policy == "" {
+        policy = "do_nothing"  // 默认策略
+    }
+
+    // 检查Misfire时间是否超过最大允许天数
+    if task.ScheduleConfig.MaxMisfireDays > 0 {
+        daysPassed := int(time.Since(misfiredAt).Hours() / 24)
+        if daysPassed > task.ScheduleConfig.MaxMisfireDays {
+            s.logger.Info("misfire task too old, skipping",
+                "task_id", task.ID,
+                "days_passed", daysPassed,
+            )
+            return nil
+        }
+    }
+
+    switch policy {
+    case "fire_now":
+        return s.triggerTask(ctx, task, "misfire_recovery")
+
+    case "fire_once_now":
+        return s.triggerTask(ctx, task, "misfire_recovery")
+
+    case "fire_all_missed":
+        missedTimes := s.calculateMissedExecutionTimes(task, misfiredAt, time.Now())
+        for _, execTime := range missedTimes {
+            if err := s.triggerTask(ctx, task, "misfire_recovery"); err != nil {
+                return err
+            }
+        }
+        return nil
+
+    case "do_nothing":
+        s.logger.Info("misfire task ignored by policy",
+            "task_id", task.ID,
+            "policy", policy,
+        )
+        return nil
+
+    default:
+        return fmt.Errorf("unknown misfire policy: %s", policy)
+    }
+}
+```
+
+**5. 配置字段扩展**
+
+在`ScheduleConfig`数据模型中新增以下字段：
+
+```go
+type ScheduleConfig struct {
+    Cron            string `json:"cron"`
+    Timezone        string `json:"timezone"`
+    Enabled         bool   `json:"enabled"`
+
+    // 新增：Misfire处理配置
+    MisfirePolicy   string `json:"misfire_policy"`    // do_nothing, fire_now, fire_once_now, fire_all_missed
+    MaxMisfireDays  int    `json:"max_misfire_days"`  // 超过N天的Misfire不再处理，0表示无限制
+}
+```
+
+**6. 暂停与恢复**
+
+支持在线暂停调度器（用于系统维护）：
+
+```go
+// Pause 暂停调度器（停止触发新任务，但不退出进程）
+func (s *Scheduler) Pause(ctx context.Context) error {
+    if !s.compareAndSwapState(StateRunning, StatePausing) {
+        return fmt.Errorf("scheduler is not running")
+    }
+
+    s.cronEngine.Stop()
+    s.setState(StatePaused)
+    s.logger.Info("scheduler paused")
+
+    return nil
+}
+
+// Resume 恢复调度器
+func (s *Scheduler) Resume(ctx context.Context) error {
+    if !s.compareAndSwapState(StatePaused, StateStarting) {
+        return fmt.Errorf("scheduler is not paused")
+    }
+
+    s.cronEngine.Start()
+    s.setState(StateRunning)
+    s.logger.Info("scheduler resumed")
+
+    return nil
+}
+```
+
+##### 3.2.2.4. 高可用架构设计
+
+为避免单点故障，调度器采用主从（Leader-Follower）架构，通过etcd实现领导选举。
+
+**1. 架构概述**
+
+- **多Master部署**：在不同节点上部署多个Master实例，每个实例都包含完整的调度器
+- **领导选举**：通过etcd的分布式锁机制选举出一个Leader，只有Leader执行调度
+- **故障转移**：Leader故障时，剩余节点自动选举新的Leader，实现秒级故障转移
+- **状态同步**：所有Master共享相同的数据库和Redis，确保状态一致性
+
+**2. 基于etcd的领导选举实现**
+
+```go
+package scheduler
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    clientv3 "go.etcd.io/etcd/client/v3"
+    "go.etcd.io/etcd/client/v3/concurrency"
+)
+
+type HAScheduler struct {
+    *Scheduler
+
+    etcdClient   *clientv3.Client
+    session      *concurrency.Session
+    election     *concurrency.Election
+    isLeader     atomic.Bool
+    nodeID       string
+    leaderKey    string
+}
+
+// NewHAScheduler 创建高可用调度器
+func NewHAScheduler(
+    scheduler *Scheduler,
+    etcdEndpoints []string,
+    nodeID string,
+) (*HAScheduler, error) {
+    cli, err := clientv3.New(clientv3.Config{
+        Endpoints:   etcdEndpoints,
+        DialTimeout: 5 * time.Second,
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to create etcd client: %w", err)
+    }
+
+    return &HAScheduler{
+        Scheduler:   scheduler,
+        etcdClient:  cli,
+        nodeID:      nodeID,
+        leaderKey:   "/datafusion/scheduler/leader",
+    }, nil
+}
+
+// Start 启动高可用调度器
+func (h *HAScheduler) Start(ctx context.Context) error {
+    // 1. 创建etcd会话（Session）
+    session, err := concurrency.NewSession(h.etcdClient, concurrency.WithTTL(10))
+    if err != nil {
+        return fmt.Errorf("failed to create etcd session: %w", err)
+    }
+    h.session = session
+
+    // 2. 创建选举对象
+    h.election = concurrency.NewElection(session, h.leaderKey)
+
+    // 3. 启动领导选举协程
+    go h.runLeaderElection(ctx)
+
+    // 4. 启动健康检查协程
+    go h.monitorLeadership(ctx)
+
+    h.logger.Info("HA scheduler started", "node_id", h.nodeID)
+
+    return nil
+}
+
+// runLeaderElection 运行领导选举
+func (h *HAScheduler) runLeaderElection(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        default:
+        }
+
+        // 尝试成为Leader（阻塞直到成功）
+        h.logger.Info("attempting to become leader", "node_id", h.nodeID)
+
+        if err := h.election.Campaign(ctx, h.nodeID); err != nil {
+            h.logger.Error("failed to campaign for leader", "error", err)
+            time.Sleep(5 * time.Second)
+            continue
+        }
+
+        // 成为Leader
+        h.onBecomeLeader(ctx)
+
+        // 阻塞直到失去Leader身份（Session过期或主动辞职）
+        <-h.session.Done()
+
+        // 失去Leader身份
+        h.onLoseLeader(ctx)
+
+        // 重新创建会话并参与选举
+        session, err := concurrency.NewSession(h.etcdClient, concurrency.WithTTL(10))
+        if err != nil {
+            h.logger.Error("failed to recreate session", "error", err)
+            time.Sleep(5 * time.Second)
+            continue
+        }
+        h.session = session
+        h.election = concurrency.NewElection(session, h.leaderKey)
+    }
+}
+
+// onBecomeLeader 成为Leader时的回调
+func (h *HAScheduler) onBecomeLeader(ctx context.Context) {
+    h.logger.Info("became leader", "node_id", h.nodeID)
+    h.isLeader.Store(true)
+
+    // 启动调度器
+    if err := h.Scheduler.Start(ctx); err != nil {
+        h.logger.Error("failed to start scheduler", "error", err)
+        // 主动放弃Leader身份
+        h.election.Resign(ctx)
+    }
+
+    // 记录Leader信息到etcd
+    h.recordLeaderInfo(ctx)
+}
+
+// onLoseLeader 失去Leader身份时的回调
+func (h *HAScheduler) onLoseLeader(ctx context.Context) {
+    h.logger.Warn("lost leader status", "node_id", h.nodeID)
+    h.isLeader.Store(false)
+
+    // 停止调度器（30秒超时）
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    if err := h.Scheduler.Stop(shutdownCtx); err != nil {
+        h.logger.Error("failed to stop scheduler gracefully", "error", err)
+    }
+}
+
+// monitorLeadership 监控Leader状态
+func (h *HAScheduler) monitorLeadership(ctx context.Context) {
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            leader, err := h.GetCurrentLeader(ctx)
+            if err != nil {
+                h.logger.Error("failed to get current leader", "error", err)
+                continue
+            }
+
+            h.logger.Debug("current leader", "leader", leader, "is_self", leader == h.nodeID)
+        }
+    }
+}
+
+// GetCurrentLeader 获取当前Leader节点ID
+func (h *HAScheduler) GetCurrentLeader(ctx context.Context) (string, error) {
+    resp, err := h.election.Leader(ctx)
+    if err != nil {
+        return "", err
+    }
+
+    if len(resp.Kvs) == 0 {
+        return "", fmt.Errorf("no leader elected")
+    }
+
+    return string(resp.Kvs[0].Value), nil
+}
+
+// recordLeaderInfo 记录Leader信息（用于监控）
+func (h *HAScheduler) recordLeaderInfo(ctx context.Context) {
+    leaderInfo := map[string]interface{}{
+        "node_id":    h.nodeID,
+        "start_time": time.Now().Format(time.RFC3339),
+        "hostname":   getHostname(),
+        "ip":         getLocalIP(),
+    }
+
+    data, _ := json.Marshal(leaderInfo)
+
+    _, err := h.etcdClient.Put(ctx, "/datafusion/scheduler/leader_info", string(data))
+    if err != nil {
+        h.logger.Error("failed to record leader info", "error", err)
+    }
+}
+```
+
+**3. 配置示例**
+
+```yaml
+scheduler:
+  ha:
+    enabled: true
+    mode: etcd  # 领导选举模式：etcd
+
+    etcd:
+      endpoints:
+        - http://etcd-1:2379
+        - http://etcd-2:2379
+        - http://etcd-3:2379
+      session_ttl: 10s          # Session TTL，Leader需在此时间内续期
+      leader_key: /datafusion/scheduler/leader
+      dial_timeout: 5s
+
+  # 节点ID（每个Master节点必须唯一）
+  node_id: master-node-1
+```
+
+**4. 故障转移流程**
+
+1. **Leader心跳失败**：Leader节点的etcd Session在10秒内未续期
+2. **Session过期**：etcd自动删除Leader的租约
+3. **触发新选举**：其他Follower节点检测到Leader消失，开始竞选
+4. **选出新Leader**：最先成功执行Campaign的节点成为新Leader
+5. **启动调度器**：新Leader启动调度器，继续执行任务调度
+6. **总耗时**：通常在5-15秒内完成故障转移
+
+**5. 避免重复调度的机制**
+
+- **唯一Leader**：同一时刻只有一个调度器处于Active状态
+- **分布式锁**：通过etcd的事务和租约机制确保互斥
+- **状态检查**：调度器在触发任务前检查是否为Leader
+- **任务去重**：任务实例ID基于时间戳和任务ID生成，确保唯一性
+
+##### 3.2.2.5. 调度策略扩展设计
+
+当前调度器仅支持Cron定时调度，为了满足更多样化的业务需求，设计了可扩展的调度策略架构。
+
+**1. 调度策略接口定义**
+
+```go
+// SchedulePolicy 调度策略接口
+type SchedulePolicy interface {
+    // Type 返回策略类型
+    Type() string
+
+    // Validate 验证策略配置是否有效
+    Validate() error
+
+    // NextExecutionTime 计算下次执行时间
+    // 参数：lastExecution - 上次执行时间（如果是第一次执行，传nil）
+    // 返回：下次执行时间和是否还有后续执行
+    NextExecutionTime(lastExecution *time.Time) (next time.Time, hasNext bool, err error)
+
+    // ShouldExecuteNow 判断当前时间是否应该执行
+    ShouldExecuteNow(now time.Time, lastExecution *time.Time) bool
+
+    // Description 返回策略的人类可读描述
+    Description() string
+}
+```
+
+**2. 支持的调度策略类型**
+
+| 策略类型 | 说明 | 配置示例 | 适用场景 |
+|---------|------|---------|---------|
+| `cron` | Cron表达式调度 | `{"cron": "0 2 * * *"}` | 固定时间点执行（每天凌晨2点） |
+| `fixed_rate` | 固定频率调度 | `{"interval": "5m"}` | 周期性执行（每隔5分钟） |
+| `one_time` | 一次性调度 | `{"execute_at": "2025-12-31T23:59:59Z"}` | 在指定时间执行一次 |
+| `dependency` | 依赖调度 | `{"depends_on": ["task-1", "task-2"]}` | 其他任务完成后执行 |
+
+**3. Cron调度策略实现**
+
+```go
+type CronSchedulePolicy struct {
+    cronExpr   string
+    timezone   *time.Location
+    schedule   cron.Schedule
+}
+
+func NewCronSchedulePolicy(cronExpr string, timezone string) (*CronSchedulePolicy, error) {
+    loc, err := time.LoadLocation(timezone)
+    if err != nil {
+        loc = time.UTC
+    }
+
+    parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+    schedule, err := parser.Parse(cronExpr)
+    if err != nil {
+        return nil, fmt.Errorf("invalid cron expression: %w", err)
+    }
+
+    return &CronSchedulePolicy{
+        cronExpr: cronExpr,
+        timezone: loc,
+        schedule: schedule,
+    }, nil
+}
+
+func (c *CronSchedulePolicy) Type() string {
+    return "cron"
+}
+
+func (c *CronSchedulePolicy) NextExecutionTime(lastExecution *time.Time) (time.Time, bool, error) {
+    var baseTime time.Time
+    if lastExecution != nil {
+        baseTime = *lastExecution
+    } else {
+        baseTime = time.Now().In(c.timezone)
+    }
+
+    nextTime := c.schedule.Next(baseTime)
+    return nextTime, true, nil  // Cron调度没有结束时间
+}
+
+func (c *CronSchedulePolicy) Description() string {
+    return fmt.Sprintf("Cron: %s (Timezone: %s)", c.cronExpr, c.timezone.String())
+}
+```
+
+**4. 固定频率调度策略实现**
+
+```go
+type FixedRateSchedulePolicy struct {
+    interval  time.Duration
+    startTime time.Time
+    endTime   *time.Time  // 可选的结束时间
+}
+
+func NewFixedRateSchedulePolicy(interval time.Duration, startTime time.Time, endTime *time.Time) (*FixedRateSchedulePolicy, error) {
+    if interval <= 0 {
+        return nil, fmt.Errorf("interval must be positive")
+    }
+
+    return &FixedRateSchedulePolicy{
+        interval:  interval,
+        startTime: startTime,
+        endTime:   endTime,
+    }, nil
+}
+
+func (f *FixedRateSchedulePolicy) Type() string {
+    return "fixed_rate"
+}
+
+func (f *FixedRateSchedulePolicy) NextExecutionTime(lastExecution *time.Time) (time.Time, bool, error) {
+    var nextTime time.Time
+
+    if lastExecution == nil {
+        nextTime = f.startTime
+    } else {
+        nextTime = lastExecution.Add(f.interval)
+    }
+
+    // 检查是否超过结束时间
+    if f.endTime != nil && nextTime.After(*f.endTime) {
+        return time.Time{}, false, nil
+    }
+
+    return nextTime, true, nil
+}
+
+func (f *FixedRateSchedulePolicy) Description() string {
+    desc := fmt.Sprintf("Fixed Rate: every %s", f.interval)
+    if f.endTime != nil {
+        desc += fmt.Sprintf(" until %s", f.endTime.Format(time.RFC3339))
+    }
+    return desc
+}
+```
+
+**配置示例：**
+
+```json
+{
+  "schedule_config": {
+    "type": "fixed_rate",
+    "config": {
+      "interval": "5m",
+      "start_time": "2025-01-01T00:00:00Z",
+      "end_time": "2025-12-31T23:59:59Z"
+    },
+    "enabled": true
+  }
+}
+```
+
+**5. 一次性调度策略实现**
+
+```go
+type OneTimeSchedulePolicy struct {
+    executeAt time.Time
+    executed  bool
+}
+
+func (o *OneTimeSchedulePolicy) Type() string {
+    return "one_time"
+}
+
+func (o *OneTimeSchedulePolicy) NextExecutionTime(lastExecution *time.Time) (time.Time, bool, error) {
+    if o.executed || lastExecution != nil {
+        return time.Time{}, false, nil  // 已执行，无下次
+    }
+
+    return o.executeAt, true, nil
+}
+```
+
+**配置示例：**
+
+```json
+{
+  "schedule_config": {
+    "type": "one_time",
+    "config": {
+      "execute_at": "2025-11-21T15:00:00Z"
+    },
+    "enabled": true
+  }
+}
+```
+
+**6. 依赖调度策略实现**
+
+```go
+type DependencySchedulePolicy struct {
+    dependsOn       []string  // 依赖的任务ID列表
+    dependencyType  string    // all（所有依赖完成） or any（任意依赖完成）
+    timeout         time.Duration
+    taskService     TaskService
+}
+
+func (d *DependencySchedulePolicy) Type() string {
+    return "dependency"
+}
+
+func (d *DependencySchedulePolicy) ShouldExecuteNow(now time.Time, lastExecution *time.Time) bool {
+    ctx := context.Background()
+
+    if d.dependencyType == "all" {
+        // 所有依赖任务都必须成功完成
+        for _, taskID := range d.dependsOn {
+            status, err := d.taskService.GetLatestInstanceStatus(ctx, taskID)
+            if err != nil || status != "success" {
+                return false
+            }
+        }
+        return true
+    } else {
+        // 任意一个依赖任务完成即可
+        for _, taskID := range d.dependsOn {
+            status, err := d.taskService.GetLatestInstanceStatus(ctx, taskID)
+            if err == nil && status == "success" {
+                return true
+            }
+        }
+        return false
+    }
+}
+```
+
+**配置示例：**
+
+```json
+{
+  "schedule_config": {
+    "type": "dependency",
+    "config": {
+      "depends_on": ["task-uuid-1", "task-uuid-2"],
+      "dependency_type": "all",
+      "timeout": "1h"
+    },
+    "enabled": true
+  }
+}
+```
+
+**7. 策略工厂和注册器**
+
+```go
+// SchedulePolicyFactory 策略工厂接口
+type SchedulePolicyFactory interface {
+    Create(config map[string]interface{}) (SchedulePolicy, error)
+    SupportedType() string
+}
+
+// PolicyRegistry 策略注册器（单例）
+type PolicyRegistry struct {
+    factories map[string]SchedulePolicyFactory
+    mu        sync.RWMutex
+}
+
+var defaultRegistry *PolicyRegistry
+
+func GetPolicyRegistry() *PolicyRegistry {
+    if defaultRegistry == nil {
+        defaultRegistry = &PolicyRegistry{
+            factories: make(map[string]SchedulePolicyFactory),
+        }
+        // 注册内置策略
+        defaultRegistry.Register(&CronSchedulePolicyFactory{})
+        defaultRegistry.Register(&FixedRateSchedulePolicyFactory{})
+        defaultRegistry.Register(&OneTimeSchedulePolicyFactory{})
+    }
+    return defaultRegistry
+}
+
+func (r *PolicyRegistry) Register(factory SchedulePolicyFactory) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    r.factories[factory.SupportedType()] = factory
+}
+
+func (r *PolicyRegistry) Create(policyType string, config map[string]interface{}) (SchedulePolicy, error) {
+    r.mu.RLock()
+    factory, ok := r.factories[policyType]
+    r.mu.RUnlock()
+
+    if !ok {
+        return nil, fmt.Errorf("unknown policy type: %s", policyType)
+    }
+
+    return factory.Create(config)
+}
+```
+
+**8. 数据模型更新**
+
+```go
+type ScheduleConfig struct {
+    Type    string                 `json:"type"`    // cron, fixed_rate, one_time, dependency
+    Config  map[string]interface{} `json:"config"`  // 策略特定的配置
+    Enabled bool                   `json:"enabled"`
+
+    // Misfire处理配置
+    MisfirePolicy   string `json:"misfire_policy"`
+    MaxMisfireDays  int    `json:"max_misfire_days"`
+}
+```
+
+##### 3.2.2.6. 并发控制优化
+
+在原有并发控制机制基础上，增加令牌超时、自动回收和动态配置等功能。
+
+**1. 带超时的令牌机制**
+
+原有设计存在令牌泄漏风险：Worker宕机后无法归还令牌。优化方案：
+
+```go
+type Token struct {
+    ID          string
+    TaskID      string
+    AcquiredAt  time.Time
+    ExpiresAt   time.Time
+    WorkerID    string
+}
+
+type ConcurrencyController struct {
+    redis         *redis.Client
+    globalLimit   int
+    taskLimits    map[string]int
+    defaultTTL    time.Duration  // 默认令牌过期时间（如30分钟）
+    renewInterval time.Duration  // 令牌续期间隔（如15分钟）
+}
+
+// AcquireToken 获取执行令牌（带超时）
+func (c *ConcurrencyController) AcquireToken(
+    ctx context.Context,
+    taskID string,
+    workerID string,
+    timeout time.Duration,
+) (*Token, error) {
+    tokenID := uuid.New().String()
+
+    // 使用Lua脚本实现原子操作：检查限制 + 获取令牌 + 设置过期时间
+    script := `
+        local tokensKey = KEYS[1]
+        local limit = tonumber(ARGV[1])
+        local tokenID = ARGV[2]
+        local ttl = tonumber(ARGV[3])
+
+        local current = redis.call('SCARD', tokensKey)
+        if current >= limit then
+            return 0
+        end
+
+        redis.call('SADD', tokensKey, tokenID)
+        redis.call('EXPIRE', tokensKey, ttl)
+        redis.call('SETEX', KEYS[2] .. ':' .. tokenID, ttl, '1')
+
+        return 1
+    `
+
+    result, err := c.redis.Eval(ctx, script,
+        []string{"datafusion:concurrency:global:tokens", "datafusion:concurrency:global"},
+        c.globalLimit,
+        tokenID,
+        int(c.defaultTTL.Seconds()),
+    ).Int()
+
+    if err != nil || result == 0 {
+        return nil, fmt.Errorf("failed to acquire token: limit reached")
+    }
+
+    token := &Token{
+        ID:         tokenID,
+        TaskID:     taskID,
+        AcquiredAt: time.Now(),
+        ExpiresAt:  time.Now().Add(c.defaultTTL),
+        WorkerID:   workerID,
+    }
+
+    return token, nil
+}
+```
+
+**2. 令牌续期机制**
+
+Worker在执行长时间任务时，需要定期续期令牌：
+
+```go
+// Worker端实现
+func (e *TaskExecutor) ExecuteTask(ctx context.Context, task *Task) error {
+    // 1. 获取令牌
+    token, err := e.concurrency.AcquireToken(ctx, task.ID.String(), e.workerID, 10*time.Second)
+    if err != nil {
+        return fmt.Errorf("failed to acquire token: %w", err)
+    }
+
+    // 2. 确保令牌最终被释放
+    defer e.concurrency.ReleaseToken(ctx, token)
+
+    // 3. 启动令牌续期协程
+    renewCtx, cancelRenew := context.WithCancel(ctx)
+    defer cancelRenew()
+
+    go e.renewTokenPeriodically(renewCtx, token)
+
+    // 4. 执行任务
+    return e.doExecuteTask(ctx, task)
+}
+
+func (e *TaskExecutor) renewTokenPeriodically(ctx context.Context, token *Token) {
+    ticker := time.NewTicker(e.concurrency.renewInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            if err := e.concurrency.RenewToken(ctx, token); err != nil {
+                e.logger.Error("failed to renew token", "error", err)
+                return
+            }
+        }
+    }
+}
+```
+
+**3. 调度器端提前检查**
+
+在推送任务到队列前检查并发限制，避免无效消息堆积：
+
+```go
+func (s *Scheduler) triggerTask(ctx context.Context, task *Task, scheduledAt time.Time) error {
+    // 1. 提前检查是否可以获取令牌（不实际获取）
+    if !s.concurrency.CanAcquire(ctx, task.ID.String()) {
+        s.logger.Warn("task skipped: concurrency limit reached",
+            "task_id", task.ID,
+            "task_name", task.Name,
+        )
+
+        // 记录跳过事件
+        s.recordSkippedEvent(ctx, task, "concurrency_limit_reached")
+        return nil  // 不算错误
+    }
+
+    // 2. 创建任务实例并推送到队列
+    instance, err := s.taskService.CreateTaskInstance(ctx, task.ID, "scheduled", nil)
+    if err != nil {
+        return fmt.Errorf("failed to create task instance: %w", err)
+    }
+
+    if err := s.msgBroker.PublishTask(ctx, instance, task); err != nil {
+        return fmt.Errorf("failed to publish task: %w", err)
+    }
+
+    return nil
+}
+
+// CanAcquire 检查是否可以获取令牌（不实际获取）
+func (c *ConcurrencyController) CanAcquire(ctx context.Context, taskID string) bool {
+    globalTokensKey := "datafusion:concurrency:global:tokens"
+    globalCount, err := c.redis.SCard(ctx, globalTokensKey).Result()
+    if err != nil || globalCount >= int64(c.globalLimit) {
+        return false
+    }
+
+    // 检查任务级限制
+    if limit, ok := c.taskLimits[taskID]; ok {
+        taskTokensKey := fmt.Sprintf("datafusion:concurrency:task:%s:tokens", taskID)
+        taskCount, err := c.redis.SCard(ctx, taskTokensKey).Result()
+        if err != nil || taskCount >= int64(limit) {
+            return false
+        }
+    }
+
+    return true
+}
+```
+
+**4. 动态配置调整**
+
+支持运行时调整并发限制，无需重启服务：
+
+```go
+// SetGlobalLimit 动态设置全局并发限制
+func (c *ConcurrencyController) SetGlobalLimit(limit int) error {
+    if limit <= 0 {
+        return fmt.Errorf("limit must be positive")
+    }
+
+    c.globalLimit = limit
+
+    // 持久化到etcd配置中心
+    ctx := context.Background()
+    data, _ := json.Marshal(map[string]int{"global_limit": limit})
+    _, err := c.etcdClient.Put(ctx, "/datafusion/config/concurrency/global_limit", string(data))
+
+    return err
+}
+
+// SetTaskLimit 动态设置任务级并发限制
+func (c *ConcurrencyController) SetTaskLimit(taskID string, limit int) error {
+    if limit <= 0 {
+        return fmt.Errorf("limit must be positive")
+    }
+
+    c.taskLimits[taskID] = limit
+
+    // 持久化到etcd
+    ctx := context.Background()
+    data, _ := json.Marshal(map[string]int{"limit": limit})
+    key := fmt.Sprintf("/datafusion/config/concurrency/task/%s", taskID)
+    _, err := c.etcdClient.Put(ctx, key, string(data))
+
+    return err
+}
+```
+
+**5. 配置示例**
+
+```yaml
+concurrency:
+  global:
+    limit: 100
+    token_ttl: 30m        # 令牌默认过期时间
+    renew_interval: 15m   # 续期间隔
+
+  tasks:
+    task-uuid-1:
+      limit: 5
+    task-uuid-2:
+      limit: 10
+```
+
+##### 3.2.2.7. 监控与可观测性
+
+完善的监控和可观测性是生产环境必不可少的，调度器需要暴露关键指标和日志。
+
+**1. Prometheus监控指标**
+
+```go
+package scheduler
+
+import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+    // 调度器状态指标
+    schedulerStatus = promauto.NewGaugeVec(prometheus.GaugeOpts{
+        Name: "datafusion_scheduler_status",
+        Help: "Scheduler status (0=stopped, 1=starting, 2=running, 3=paused, 4=error)",
+    }, []string{"node_id"})
+
+    schedulerIsLeader = promauto.NewGaugeVec(prometheus.GaugeOpts{
+        Name: "datafusion_scheduler_is_leader",
+        Help: "Whether this scheduler is the leader (0=follower, 1=leader)",
+    }, []string{"node_id"})
+
+    // 任务调度指标
+    tasksRegistered = promauto.NewGaugeVec(prometheus.GaugeOpts{
+        Name: "datafusion_scheduler_tasks_registered",
+        Help: "Number of tasks currently registered in the scheduler",
+    }, []string{"schedule_type"})  // cron, fixed_rate, one_time, dependency
+
+    taskScheduleTriggered = promauto.NewCounterVec(prometheus.CounterOpts{
+        Name: "datafusion_scheduler_task_triggered_total",
+        Help: "Total number of task schedule triggers",
+    }, []string{"task_id", "task_name", "trigger_type", "result"})  // result: success, failed, skipped
+
+    taskScheduleLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+        Name:    "datafusion_scheduler_task_schedule_latency_seconds",
+        Help:    "Latency between scheduled time and actual trigger time",
+        Buckets: []float64{0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 30},
+    }, []string{"task_id", "task_name"})
+
+    taskMisfired = promauto.NewCounterVec(prometheus.CounterOpts{
+        Name: "datafusion_scheduler_task_misfired_total",
+        Help: "Total number of misfired tasks",
+    }, []string{"task_id", "task_name", "reason"})
+
+    // 消息队列指标
+    messageQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+        Name: "datafusion_scheduler_queue_depth",
+        Help: "Number of messages in the task queue",
+    }, []string{"queue_name", "priority"})
+
+    messagePublished = promauto.NewCounterVec(prometheus.CounterOpts{
+        Name: "datafusion_scheduler_message_published_total",
+        Help: "Total number of messages published to queue",
+    }, []string{"queue_name", "priority", "result"})
+
+    // 并发控制指标
+    globalTokensUsed = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "datafusion_concurrency_global_tokens_used",
+        Help: "Number of global tokens currently in use",
+    })
+
+    globalTokensLimit = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "datafusion_concurrency_global_tokens_limit",
+        Help: "Global token limit",
+    })
+
+    taskTokensUsed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+        Name: "datafusion_concurrency_task_tokens_used",
+        Help: "Number of task tokens currently in use",
+    }, []string{"task_id", "task_name"})
+
+    // Cron引擎指标
+    cronEntriesActive = prometheus.NewGauge(prometheus.GaugeOpts{
+        Name: "datafusion_scheduler_cron_entries_active",
+        Help: "Number of active cron entries",
+    })
+)
+```
+
+**2. 结构化调度日志**
+
+```go
+// ScheduleEvent 调度事件（用于结构化日志和审计）
+type ScheduleEvent struct {
+    EventType      string    `json:"event_type"`       // task_triggered, task_skipped, task_misfired
+    TaskID         string    `json:"task_id"`
+    TaskName       string    `json:"task_name"`
+    ScheduleType   string    `json:"schedule_type"`
+    ScheduledAt    time.Time `json:"scheduled_at"`     // 计划执行时间
+    ActualAt       time.Time `json:"actual_at"`        // 实际触发时间
+    Latency        float64   `json:"latency_seconds"`  // 延迟（秒）
+    TriggerType    string    `json:"trigger_type"`     // scheduled, manual, dependency, misfire_recovery
+    InstanceID     string    `json:"instance_id,omitempty"`
+    Result         string    `json:"result"`           // success, failed, skipped
+    Reason         string    `json:"reason,omitempty"` // 跳过或失败的原因
+    NodeID         string    `json:"node_id"`
+    Timestamp      time.Time `json:"timestamp"`
+}
+
+// logScheduleEvent 记录调度事件
+func (s *Scheduler) logScheduleEvent(event *ScheduleEvent) {
+    s.logger.Info("schedule event",
+        zap.String("event_type", event.EventType),
+        zap.String("task_id", event.TaskID),
+        zap.String("task_name", event.TaskName),
+        zap.Time("scheduled_at", event.ScheduledAt),
+        zap.Time("actual_at", event.ActualAt),
+        zap.Float64("latency_seconds", event.Latency),
+        zap.String("trigger_type", event.TriggerType),
+        zap.String("result", event.Result),
+    )
+
+    // 记录到审计日志系统
+    s.auditLogger.LogEvent(event)
+}
+```
+
+**使用示例：**
+
+```go
+func (s *Scheduler) triggerTask(ctx context.Context, task *Task, scheduledAt time.Time) error {
+    actualAt := time.Now()
+    latency := actualAt.Sub(scheduledAt).Seconds()
+
+    // 记录调度延迟指标
+    taskScheduleLatency.WithLabelValues(
+        task.ID.String(),
+        task.Name,
+    ).Observe(latency)
+
+    // 检查并发限制
+    if !s.concurrency.CanAcquire(ctx, task.ID.String()) {
+        s.logScheduleEvent(&ScheduleEvent{
+            EventType:    "task_skipped",
+            TaskID:       task.ID.String(),
+            TaskName:     task.Name,
+            ScheduleType: task.ScheduleConfig.Type,
+            ScheduledAt:  scheduledAt,
+            ActualAt:     actualAt,
+            Latency:      latency,
+            TriggerType:  "scheduled",
+            Result:       "skipped",
+            Reason:       "concurrency_limit_reached",
+            NodeID:       s.nodeID,
+            Timestamp:    time.Now(),
+        })
+
+        taskScheduleTriggered.WithLabelValues(
+            task.ID.String(),
+            task.Name,
+            "scheduled",
+            "skipped",
+        ).Inc()
+
+        return nil
+    }
+
+    // 创建任务实例并推送
+    instance, err := s.taskService.CreateTaskInstance(ctx, task.ID, "scheduled", nil)
+    if err != nil {
+        s.logScheduleEvent(&ScheduleEvent{
+            EventType:   "task_trigger_failed",
+            TaskID:      task.ID.String(),
+            TaskName:    task.Name,
+            ScheduledAt: scheduledAt,
+            ActualAt:    actualAt,
+            Result:      "failed",
+            Reason:      err.Error(),
+        })
+        return err
+    }
+
+    if err := s.msgBroker.PublishTask(ctx, instance, task); err != nil {
+        return err
+    }
+
+    // 记录成功事件
+    s.logScheduleEvent(&ScheduleEvent{
+        EventType:   "task_triggered",
+        TaskID:      task.ID.String(),
+        TaskName:    task.Name,
+        ScheduledAt: scheduledAt,
+        ActualAt:    actualAt,
+        Latency:     latency,
+        InstanceID:  instance.InstanceID,
+        Result:      "success",
+    })
+
+    taskScheduleTriggered.WithLabelValues(
+        task.ID.String(),
+        task.Name,
+        "scheduled",
+        "success",
+    ).Inc()
+
+    return nil
+}
+```
+
+**3. 健康检查接口**
+
+```go
+// HealthStatus 健康状态
+type HealthStatus struct {
+    Status           string                      `json:"status"`  // healthy, degraded, unhealthy
+    NodeID           string                      `json:"node_id"`
+    IsLeader         bool                        `json:"is_leader"`
+    State            string                      `json:"state"`
+    TasksRegistered  int                         `json:"tasks_registered"`
+    CronEntriesActive int                        `json:"cron_entries_active"`
+    LastScheduleAt   *time.Time                  `json:"last_schedule_at,omitempty"`
+    Uptime           int64                       `json:"uptime_seconds"`
+    Dependencies     map[string]DependencyHealth `json:"dependencies"`
+    Timestamp        time.Time                   `json:"timestamp"`
+}
+
+type DependencyHealth struct {
+    Name    string `json:"name"`
+    Status  string `json:"status"`  // healthy, unhealthy
+    Message string `json:"message,omitempty"`
+}
+
+// HealthCheckHandler HTTP健康检查处理器
+func (s *Scheduler) HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
+    ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+    defer cancel()
+
+    status := s.getHealthStatus(ctx)
+
+    // 设置HTTP状态码
+    statusCode := http.StatusOK
+    if status.Status == "unhealthy" {
+        statusCode = http.StatusServiceUnavailable
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(statusCode)
+    json.NewEncoder(w).Encode(status)
+}
+
+// getHealthStatus 获取健康状态
+func (s *Scheduler) getHealthStatus(ctx context.Context) *HealthStatus {
+    status := &HealthStatus{
+        NodeID:            s.nodeID,
+        IsLeader:          s.isLeader.Load(),
+        State:             s.getState().String(),
+        TasksRegistered:   len(s.taskPolicies),
+        CronEntriesActive: len(s.cronEngine.Entries()),
+        Uptime:            int64(time.Since(s.startTime).Seconds()),
+        Dependencies:      make(map[string]DependencyHealth),
+        Timestamp:         time.Now(),
+    }
+
+    // 检查依赖组件健康状态
+    allHealthy := true
+
+    // 检查数据库
+    if err := s.taskService.HealthCheck(ctx); err != nil {
+        status.Dependencies["database"] = DependencyHealth{
+            Name:    "PostgreSQL",
+            Status:  "unhealthy",
+            Message: err.Error(),
+        }
+        allHealthy = false
+    } else {
+        status.Dependencies["database"] = DependencyHealth{
+            Name:   "PostgreSQL",
+            Status: "healthy",
+        }
+    }
+
+    // 检查Redis
+    if err := s.concurrency.HealthCheck(ctx); err != nil {
+        status.Dependencies["redis"] = DependencyHealth{
+            Name:    "Redis",
+            Status:  "unhealthy",
+            Message: err.Error(),
+        }
+        allHealthy = false
+    } else {
+        status.Dependencies["redis"] = DependencyHealth{
+            Name:   "Redis",
+            Status: "healthy",
+        }
+    }
+
+    // 检查消息队列
+    if err := s.msgBroker.HealthCheck(ctx); err != nil {
+        status.Dependencies["message_broker"] = DependencyHealth{
+            Name:    "RabbitMQ",
+            Status:  "unhealthy",
+            Message: err.Error(),
+        }
+        allHealthy = false
+    } else {
+        status.Dependencies["message_broker"] = DependencyHealth{
+            Name:   "RabbitMQ",
+            Status: "healthy",
+        }
+    }
+
+    // 确定整体健康状态
+    if allHealthy {
+        status.Status = "healthy"
+    } else {
+        status.Status = "unhealthy"
+    }
+
+    return status
+}
+
+// ReadinessCheckHandler K8s就绪检查
+func (s *Scheduler) ReadinessCheckHandler(w http.ResponseWriter, r *http.Request) {
+    if s.getState() != StateRunning {
+        w.WriteHeader(http.StatusServiceUnavailable)
+        w.Write([]byte("scheduler not ready"))
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("ready"))
+}
+
+// LivenessCheckHandler K8s存活检查
+func (s *Scheduler) LivenessCheckHandler(w http.ResponseWriter, r *http.Request) {
+    if s.getState() == StateError {
+        w.WriteHeader(http.StatusServiceUnavailable)
+        w.Write([]byte("scheduler in error state"))
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("alive"))
+}
+```
+
+**4. 监控告警规则（Prometheus）**
+
+```yaml
+groups:
+  - name: datafusion_scheduler_alerts
+    interval: 30s
+    rules:
+      # 调度器状态告警
+      - alert: SchedulerDown
+        expr: datafusion_scheduler_status == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "调度器已停止"
+          description: "节点 {{ $labels.node_id }} 的调度器已停止超过5分钟"
+
+      # 调度延迟告警
+      - alert: HighScheduleLatency
+        expr: histogram_quantile(0.99, rate(datafusion_scheduler_task_schedule_latency_seconds_bucket[5m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "调度延迟过高"
+          description: "P99调度延迟超过10秒"
+
+      # Misfire告警
+      - alert: HighMisfireRate
+        expr: rate(datafusion_scheduler_task_misfired_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Misfire率过高"
+          description: "任务 {{ $labels.task_name }} 的Misfire率超过阈值"
+
+      # 并发控制告警
+      - alert: ConcurrencyLimitReached
+        expr: datafusion_concurrency_global_tokens_used / datafusion_concurrency_global_tokens_limit > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "全局并发接近上限"
+          description: "全局令牌使用率超过90%"
+
+      # 队列积压告警
+      - alert: QueueBacklog
+        expr: datafusion_scheduler_queue_depth > 1000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "队列积压严重"
+          description: "队列 {{ $labels.queue_name }} 深度超过1000"
+```
+
+**5. Grafana仪表板示例**
+
+关键面板包括：
+- **调度器状态**：显示当前Leader、节点状态、运行时长
+- **任务触发率**：按成功/失败/跳过分类的任务触发趋势
+- **调度延迟分布**：P50/P95/P99延迟趋势图
+- **并发使用情况**：全局和任务级令牌使用率
+- **队列深度**：各优先级队列的消息积压情况
+- **Misfire统计**：Misfire任务数量和原因分布
+
+##### 3.2.2.8. 核心接口定义
+
+为了确保调度器模块的可测试性和可扩展性，定义以下核心接口。
+
+**1. Scheduler接口（核心调度器接口）**
+
+```go
+package scheduler
+
+import (
+    "context"
+    "time"
+)
+
+// Scheduler 调度器核心接口
+type Scheduler interface {
+    // Start 启动调度器
+    Start(ctx context.Context) error
+
+    // Stop 停止调度器（优雅关闭）
+    Stop(ctx context.Context) error
+
+    // Pause 暂停调度器（停止触发新任务，但不退出进程）
+    Pause(ctx context.Context) error
+
+    // Resume 恢复调度器
+    Resume(ctx context.Context) error
+
+    // RegisterTask 注册任务到调度器
+    RegisterTask(task *Task) error
+
+    // UnregisterTask 从调度器移除任务
+    UnregisterTask(taskID string) error
+
+    // UpdateTaskSchedule 更新任务调度配置
+    UpdateTaskSchedule(taskID string, schedule *ScheduleConfig) error
+
+    // TriggerNow 立即触发任务（手动触发）
+    TriggerNow(taskID string) error
+
+    // GetStatus 获取调度器状态
+    GetStatus() (*SchedulerStatus, error)
+
+    // GetNextScheduleTime 获取指定任务的下次调度时间
+    GetNextScheduleTime(taskID string) (time.Time, error)
+}
+
+// SchedulerStatus 调度器状态
+type SchedulerStatus struct {
+    State              SchedulerState `json:"state"`
+    NodeID             string         `json:"node_id"`
+    IsLeader           bool           `json:"is_leader"`
+    RegisteredTasks    int            `json:"registered_tasks"`
+    ActiveCronEntries  int            `json:"active_cron_entries"`
+    LastScheduleAt     *time.Time     `json:"last_schedule_at,omitempty"`
+    Uptime             time.Duration  `json:"uptime"`
+}
+```
+
+**2. SchedulePolicy接口（调度策略接口）**
+
+```go
+// SchedulePolicy 调度策略接口
+type SchedulePolicy interface {
+    // Type 返回策略类型
+    Type() string
+
+    // Validate 验证策略配置是否有效
+    Validate() error
+
+    // NextExecutionTime 计算下次执行时间
+    NextExecutionTime(lastExecution *time.Time) (next time.Time, hasNext bool, err error)
+
+    // ShouldExecuteNow 判断当前时间是否应该执行
+    ShouldExecuteNow(now time.Time, lastExecution *time.Time) bool
+
+    // Description 返回策略的人类可读描述
+    Description() string
+}
+
+// SchedulePolicyFactory 策略工厂接口
+type SchedulePolicyFactory interface {
+    // Create 根据配置创建策略实例
+    Create(config map[string]interface{}) (SchedulePolicy, error)
+
+    // SupportedType 返回工厂支持的策略类型
+    SupportedType() string
+}
+```
+
+**3. ConcurrencyController接口（并发控制接口）**
+
+```go
+// ConcurrencyController 并发控制接口
+type ConcurrencyController interface {
+    // AcquireToken 获取执行令牌
+    AcquireToken(ctx context.Context, taskID string, workerID string, timeout time.Duration) (*Token, error)
+
+    // ReleaseToken 释放令牌
+    ReleaseToken(ctx context.Context, token *Token) error
+
+    // RenewToken 续期令牌
+    RenewToken(ctx context.Context, token *Token) error
+
+    // CanAcquire 检查是否可以获取令牌（不实际获取）
+    CanAcquire(ctx context.Context, taskID string) bool
+
+    // SetGlobalLimit 设置全局并发限制
+    SetGlobalLimit(limit int) error
+
+    // SetTaskLimit 设置任务级并发限制
+    SetTaskLimit(taskID string, limit int) error
+
+    // GetTokenUsage 获取当前令牌使用情况
+    GetTokenUsage(ctx context.Context) (*TokenUsage, error)
+
+    // HealthCheck 健康检查
+    HealthCheck(ctx context.Context) error
+}
+
+// TokenUsage 令牌使用情况
+type TokenUsage struct {
+    GlobalUsed  int                       `json:"global_used"`
+    GlobalLimit int                       `json:"global_limit"`
+    TaskUsage   map[string]TaskTokenUsage `json:"task_usage"`
+}
+
+type TaskTokenUsage struct {
+    Used  int `json:"used"`
+    Limit int `json:"limit"`
+}
+```
+
+**4. MessageBroker接口（消息队列抽象）**
+
+```go
+// MessageBroker 消息队列抽象接口
+type MessageBroker interface {
+    // PublishTask 发布任务到队列
+    PublishTask(ctx context.Context, instance *TaskInstance, task *Task) error
+
+    // GetQueueDepth 获取队列深度
+    GetQueueDepth(queueName string) (int, error)
+
+    // HealthCheck 健康检查
+    HealthCheck(ctx context.Context) error
+
+    // Close 关闭连接
+    Close() error
+}
+```
+
+**5. ScheduleEventListener接口（调度事件监听器）**
+
+```go
+// ScheduleEventListener 调度事件监听器接口
+type ScheduleEventListener interface {
+    // OnBeforeSchedule 任务调度前回调
+    OnBeforeSchedule(event *ScheduleEvent) error
+
+    // OnAfterSchedule 任务调度后回调
+    OnAfterSchedule(event *ScheduleEvent) error
+
+    // OnScheduleError 任务调度失败回调
+    OnScheduleError(event *ScheduleEvent, err error)
+
+    // OnTaskSkipped 任务跳过回调（Misfire或并发限制）
+    OnTaskSkipped(event *ScheduleEvent, reason string)
+}
+```
+
+**6. 接口使用示例**
+
+```go
+// 主程序中组装调度器
+func main() {
+    // 创建依赖组件
+    db := initDatabase()
+    redis := initRedis()
+    etcd := initEtcd()
+
+    // 创建服务
+    taskService := service.NewTaskService(db)
+    concurrencyController := scheduler.NewConcurrencyController(redis, 100, 30*time.Minute)
+    messageBroker := scheduler.NewRabbitMQBroker(rabbitMQConfig)
+
+    // 创建调度器
+    baseScheduler := scheduler.NewScheduler(
+        taskService,
+        concurrencyController,
+        messageBroker,
+    )
+
+    // 包装为高可用调度器
+    haScheduler, err := scheduler.NewHAScheduler(
+        baseScheduler,
+        etcdEndpoints,
+        nodeID,
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 注册事件监听器（可选）
+    auditListener := NewAuditEventListener()
+    metricsListener := NewMetricsEventListener()
+    baseScheduler.AddEventListener(auditListener)
+    baseScheduler.AddEventListener(metricsListener)
+
+    // 启动调度器
+    ctx := context.Background()
+    if err := haScheduler.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
+
+    // 注册HTTP健康检查端点
+    http.HandleFunc("/health", baseScheduler.HealthCheckHandler)
+    http.HandleFunc("/readiness", baseScheduler.ReadinessCheckHandler)
+    http.HandleFunc("/liveness", baseScheduler.LivenessCheckHandler)
+
+    // 启动HTTP服务器
+    go http.ListenAndServe(":8080", nil)
+
+    // 等待信号
+    <-ctx.Done()
+
+    // 优雅关闭
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    haScheduler.Stop(shutdownCtx)
+}
+```
 
 #### 3.2.3. 数据采集模块 (Collector)
 
@@ -8158,79 +11377,4712 @@ func (sl *StorageLogger) LogSlowQuery(storage string, operation string, duration
 
 #### 3.2.6. 监控告警模块 (Monitor & Alerter)
 
+##### 3.2.6.1. 模块概述
+
+监控告警模块是保障 DataFusion 系统稳定运行的核心基础设施，承担着"系统健康守护者"的角色。在分布式数据采集场景下，及时发现和处理异常至关重要——Worker 节点故障、目标网站封禁、数据质量下降等问题若不能快速响应，将直接影响业务数据的完整性和时效性。
+
+**核心价值：**
+
+*   **故障快速发现**: 通过实时监控指标，在故障影响扩大前及时发现问题
+*   **问题快速定位**: 结合指标、日志、追踪三维度数据，快速定位根因
+*   **容量规划支持**: 通过历史趋势分析，为扩容决策提供数据依据
+*   **SLA 保障**: 通过告警机制确保关键业务指标满足服务等级协议
+
+**可观测性三大支柱：**
+
+本模块基于业界最佳实践，构建了完整的可观测性体系：
+
+1.  **Metrics (指标)**: 系统运行的量化数据，回答"发生了什么"
+    - 任务成功率、执行耗时、数据量、资源使用率等
+    - 适合实时监控、趋势分析、告警触发
+
+2.  **Logs (日志)**: 系统运行的详细记录，回答"为什么发生"
+    - 任务执行日志、错误堆栈、调试信息
+    - 适合问题排查、审计追溯
+
+3.  **Traces (追踪)**: 分布式请求的完整路径，回答"哪里出了问题"
+    - API → Master → Worker → Database 的全链路追踪
+    - 适合性能分析、瓶颈定位
+
+##### 3.2.6.2. 整体架构设计
+
 ![监控告警架构图](diagrams/monitoring_alerting_architecture.png)
 
-保障系统的稳定运行和问题的及时发现。
+**架构分层：**
 
-*   **功能:** 收集系统和任务的运行指标（Metrics），如任务成功率、采集耗时、数据量、节点资源使用率等。当指标超过预设阈值时，触发告警。
-*   **实现:** 各个模块通过 Prometheus 客户端库暴露指标。Prometheus Server 定期抓取这些指标。Grafana 用于指标的可视化展示。Alertmanager 负责根据告警规则发送通知。
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      展示与告警层                              │
+│  Grafana Dashboard  │  Alertmanager  │  Kibana  │  Jaeger UI │
+└─────────────────────────────────────────────────────────────┘
+                              ↑
+┌─────────────────────────────────────────────────────────────┐
+│                      存储与查询层                              │
+│    Prometheus TSDB  │  Elasticsearch  │  Jaeger Backend      │
+└─────────────────────────────────────────────────────────────┘
+                              ↑
+┌─────────────────────────────────────────────────────────────┐
+│                      采集与传输层                              │
+│  Prometheus Exporter  │  Filebeat  │  OpenTelemetry Agent   │
+└─────────────────────────────────────────────────────────────┘
+                              ↑
+┌─────────────────────────────────────────────────────────────┐
+│                      数据生产层                                │
+│        Master 节点  │  Worker 节点  │  API 服务               │
+└─────────────────────────────────────────────────────────────┘
+```
 
-#### 3.2.7. Worker 内部流程
+**技术选型说明：**
 
-Worker 节点是数据采集的执行单元，其内部流程如下图所示：
+| 组件 | 技术选型 | 选型理由 |
+|------|---------|---------|
+| 指标采集 | Prometheus | 云原生标准，Pull模型避免数据丢失，PromQL功能强大 |
+| 指标可视化 | Grafana | 开源免费，社区活跃，支持多数据源 |
+| 告警管理 | Alertmanager | Prometheus官方组件，支持告警分组/抑制/静默 |
+| 日志采集 | Filebeat | 轻量级，资源占用低，与ELK生态无缝集成 |
+| 日志存储 | Elasticsearch | 全文搜索能力强，水平扩展性好 |
+| 日志查询 | Kibana | ELK标准组件，查询界面友好 |
+| 链路追踪 | Jaeger + OpenTelemetry | CNCF毕业项目，OpenTelemetry是统一标准 |
+
+##### 3.2.6.3. 指标监控体系
+
+**3.2.6.3.1. 分层指标设计**
+
+参考 Google SRE 最佳实践，建立四层指标体系：
+
+**业务指标层 (Business Metrics):**
+
+面向业务目标的关键指标，直接反映系统价值交付能力。
+
+| 指标名称 | Prometheus指标 | 类型 | 说明 |
+|---------|---------------|------|------|
+| 数据采集成功率 | `datafusion_task_success_rate` | Gauge | 成功任务数 / 总任务数，目标 > 95% |
+| 数据采集及时性 | `datafusion_data_freshness_seconds` | Gauge | 数据采集延迟时间，目标 < 300s |
+| 数据质量分数 | `datafusion_data_quality_score` | Gauge | 综合评分(0-100)，包含完整性/准确性/一致性 |
+| SLA 达成率 | `datafusion_sla_compliance_rate` | Gauge | 满足SLA的任务占比，目标 > 99% |
+
+**服务指标层 (Service Metrics) - RED 方法:**
+
+适用于面向用户的服务组件（API、Master），关注用户体验。
+
+*   **Rate (请求速率)**:
+    ```
+    datafusion_api_requests_total{method="GET|POST|PUT|DELETE", endpoint="/api/v1/tasks"}
+    ```
+
+*   **Errors (错误率)**:
+    ```
+    datafusion_api_errors_total{method, endpoint, status_code}
+    错误率 = rate(errors_total[5m]) / rate(requests_total[5m])
+    ```
+
+*   **Duration (响应延迟)**:
+    ```
+    datafusion_api_request_duration_seconds{method, endpoint}
+    关注 P50, P95, P99 分位数
+    ```
+
+**资源指标层 (Resource Metrics) - USE 方法:**
+
+适用于底层资源（Worker节点、数据库），关注资源健康度。
+
+*   **Utilization (使用率)**:
+    ```
+    - CPU使用率: worker_cpu_usage_percent
+    - 内存使用率: worker_memory_usage_percent
+    - 磁盘使用率: worker_disk_usage_percent
+    - 线程池使用率: worker_thread_pool_active / worker_thread_pool_size
+    ```
+
+*   **Saturation (饱和度)**:
+    ```
+    - 任务队列长度: rabbitmq_queue_messages
+    - 线程池队列长度: worker_thread_pool_queue_size
+    - 连接池等待数: db_connection_pool_waiting
+    ```
+
+*   **Errors (错误)**:
+    ```
+    - 网络错误: worker_network_errors_total
+    - 磁盘错误: worker_disk_io_errors_total
+    - OOM错误: worker_oom_kills_total
+    ```
+
+**依赖服务指标 (Dependencies Metrics):**
+
+监控外部依赖的健康状态，及时发现外部故障影响。
+
+| 依赖服务 | 关键指标 | 告警阈值 |
+|---------|---------|---------|
+| PostgreSQL | `db_connections_active`<br>`db_query_duration_seconds`<br>`db_errors_total` | 连接数 > 80%<br>P99延迟 > 1s<br>错误率 > 1% |
+| RabbitMQ | `rabbitmq_queue_messages`<br>`rabbitmq_consumer_utilization`<br>`rabbitmq_channel_errors_total` | 队列积压 > 1000<br>消费率 < 0.5<br>通道错误 > 0 |
+| Redis | `redis_connected_clients`<br>`redis_memory_usage_bytes`<br>`redis_keyspace_hits_rate` | 连接数 > 1000<br>内存 > 80%<br>命中率 < 90% |
+| 目标网站 | `target_website_reachable{url}`<br>`target_website_response_time_seconds` | 不可达持续 > 5min<br>响应时间 > 10s |
+
+**3.2.6.3.2. 指标采集实现**
+
+**Prometheus Client 集成：**
+
+各模块通过 Prometheus 官方客户端库暴露指标端点：
+
+```python
+# Python 示例 (Worker节点)
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+
+# 定义指标
+task_counter = Counter(
+    'datafusion_task_total',
+    'Total number of tasks processed',
+    ['task_type', 'status']  # 标签：任务类型、执行状态
+)
+
+task_duration = Histogram(
+    'datafusion_task_duration_seconds',
+    'Task execution duration',
+    ['task_type'],
+    buckets=[1, 5, 10, 30, 60, 120, 300, 600]  # 自定义分桶
+)
+
+worker_cpu = Gauge(
+    'datafusion_worker_cpu_usage_percent',
+    'Worker CPU usage percentage',
+    ['worker_id']
+)
+
+# 业务代码中记录指标
+def execute_task(task):
+    start_time = time.time()
+    try:
+        result = do_collection(task)
+        task_counter.labels(task_type=task.type, status='success').inc()
+        return result
+    except Exception as e:
+        task_counter.labels(task_type=task.type, status='failed').inc()
+        raise
+    finally:
+        duration = time.time() - start_time
+        task_duration.labels(task_type=task.type).observe(duration)
+
+# 启动指标暴露端点
+start_http_server(9091)  # Worker在 9091 端口暴露 /metrics
+```
+
+**指标暴露端点设计：**
+
+| 组件 | 端点地址 | 端口 | 说明 |
+|------|---------|------|------|
+| Master节点 | `http://master:9090/metrics` | 9090 | 任务调度、Worker管理指标 |
+| Worker节点 | `http://worker-{id}:9091/metrics` | 9091 | 任务执行、资源使用指标 |
+| API服务 | `http://api:8080/metrics` | 8080 | HTTP请求、认证授权指标 |
+| PostgreSQL | `http://postgres-exporter:9187/metrics` | 9187 | 通过官方exporter暴露 |
+| RabbitMQ | `http://rabbitmq:15692/metrics` | 15692 | 插件rabbitmq_prometheus |
+
+**Prometheus 采集配置：**
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s      # 采集间隔
+  evaluation_interval: 15s  # 规则评估间隔
+
+scrape_configs:
+  - job_name: 'master'
+    static_configs:
+      - targets: ['master:9090']
+
+  - job_name: 'worker'
+    # 服务发现：自动发现所有Worker节点
+    consul_sd_configs:
+      - server: 'consul:8500'
+        services: ['datafusion-worker']
+    relabel_configs:
+      - source_labels: [__meta_consul_node]
+        target_label: worker_id
+
+  - job_name: 'api'
+    static_configs:
+      - targets: ['api:8080']
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: 'rabbitmq'
+    static_configs:
+      - targets: ['rabbitmq:15692']
+```
+
+**自定义指标注册机制：**
+
+为了支持业务扩展，系统提供插件化的指标注册机制：
+
+```python
+# 指标注册器接口
+class MetricsRegistry:
+    """全局指标注册中心"""
+
+    def register_counter(self, name: str, description: str, labels: List[str]) -> Counter:
+        """注册计数器指标"""
+        pass
+
+    def register_histogram(self, name: str, description: str,
+                          labels: List[str], buckets: List[float]) -> Histogram:
+        """注册直方图指标"""
+        pass
+
+    def register_gauge(self, name: str, description: str, labels: List[str]) -> Gauge:
+        """注册仪表盘指标"""
+        pass
+
+# 插件使用示例
+class CustomCollectorPlugin:
+    def __init__(self, metrics_registry: MetricsRegistry):
+        # 插件注册自己的指标
+        self.success_count = metrics_registry.register_counter(
+            'custom_collector_success_total',
+            'Custom collector success count',
+            ['source_type']
+        )
+
+    def collect(self):
+        # 业务逻辑...
+        self.success_count.labels(source_type='api').inc()
+```
+
+**3.2.6.3.3. 时序数据存储与查询**
+
+**Prometheus 本地存储：**
+
+*   **存储引擎**: TSDB (Time Series Database)
+*   **数据保留期**: 15天（本地）
+*   **数据压缩比**: 平均 1.3 bytes/sample
+*   **查询性能**: 支持百万级时间序列的秒级查询
+
+**长期存储方案 (Thanos):**
+
+对于需要长期保存的监控数据（如容量规划、趋势分析），接入 Thanos 实现长期存储：
+
+```
+┌─────────────────────────────────────────────────┐
+│              Thanos Query                        │  ← Grafana 查询统一入口
+└─────────────────────────────────────────────────┘
+         ↓                    ↓                ↓
+┌─────────────┐     ┌─────────────┐   ┌─────────────┐
+│ Prometheus  │     │ Prometheus  │   │ Thanos Store│
+│  (近15天)    │     │  (近15天)    │   │ (历史数据)   │
+└─────────────┘     └─────────────┘   └─────────────┘
+         ↓                    ↓                ↓
+         └────────────────────┴────────────────┘
+                            ↓
+                   ┌─────────────────┐
+                   │  对象存储 (S3)   │  ← 数据永久存储
+                   │  - 2h块压缩      │
+                   │  - 降采样 5m/1h  │
+                   └─────────────────┘
+```
+
+**数据降采样策略：**
+
+| 数据年龄 | 采样间隔 | 保留时长 | 存储位置 |
+|---------|---------|---------|---------|
+| 0-15天 | 原始 15s | 15天 | Prometheus本地 |
+| 15天-3个月 | 降采样至 1分钟 | 3个月 | S3对象存储 |
+| 3个月-1年 | 降采样至 5分钟 | 1年 | S3对象存储 |
+| 1年以上 | 降采样至 1小时 | 3年 | S3归档存储 |
+
+**PromQL 查询最佳实践：**
+
+```promql
+# 1. 计算任务成功率 (过去5分钟)
+sum(rate(datafusion_task_total{status="success"}[5m]))
+/
+sum(rate(datafusion_task_total[5m]))
+
+# 2. 查询 P95 API 响应延迟
+histogram_quantile(0.95,
+  sum(rate(datafusion_api_request_duration_seconds_bucket[5m])) by (le, endpoint)
+)
+
+# 3. 预测磁盘何时用满 (基于线性回归)
+predict_linear(worker_disk_usage_percent[1h], 3600 * 24)  # 预测24小时后
+
+# 4. 告警：Worker CPU持续高于80%超过5分钟
+avg(worker_cpu_usage_percent) by (worker_id) > 80
+```
+
+##### 3.2.6.4. 告警策略设计
+
+**3.2.6.4.1. 告警分级体系**
+
+建立四级告警机制，明确不同级别的响应要求：
+
+| 级别 | 代码 | 定义 | 响应SLA | 通知方式 | 示例场景 |
+|-----|------|------|---------|---------|---------|
+| 致命 | P0 | 系统完全不可用，业务中断 | 5分钟内响应 | 电话 + 短信 + 邮件 + 钉钉(所有人) | Master宕机、数据库不可访问 |
+| 严重 | P1 | 核心功能受损，影响大量用户 | 15分钟内响应 | 短信 + 邮件 + 钉钉(值班组) | 50%以上Worker宕机、任务失败率>50% |
+| 警告 | P2 | 性能下降或局部功能异常 | 1小时内响应 | 邮件 + 钉钉(值班组) | 任务失败率20%-50%、队列积压 |
+| 提示 | P3 | 潜在风险，暂未影响业务 | 工作时间处理 | 钉钉(仅工作日) | 磁盘使用率>70%、证书即将过期 |
+
+**3.2.6.4.2. 告警规则设计**
+
+**告警规则设计原则：**
+
+1.  **基于症状而非原因**: 告警应针对用户可感知的问题（如API延迟高），而非底层原因（如CPU高）
+2.  **避免告警疲劳**: 只为需要人工介入的问题设置告警，自动恢复的问题不告警
+3.  **明确可执行性**: 每个告警都应有明确的处理手册（Runbook）
+4.  **适当的持续时间**: 使用 `for` 子句避免瞬时抖动触发告警
+
+**核心告警规则配置：**
+
+```yaml
+# prometheus_rules.yml
+groups:
+  - name: datafusion_critical_alerts
+    interval: 30s
+    rules:
+      # P0: Master节点宕机
+      - alert: MasterNodeDown
+        expr: up{job="master"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          priority: P0
+        annotations:
+          summary: "Master节点宕机"
+          description: "Master节点 {{ $labels.instance }} 已宕机超过1分钟，任务调度已停止"
+          runbook_url: "https://wiki.company.com/runbook/master-down"
+
+      # P0: 数据库完全不可用
+      - alert: DatabaseDown
+        expr: up{job="postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          priority: P0
+        annotations:
+          summary: "数据库不可访问"
+          description: "PostgreSQL数据库连接失败，所有写入操作将失败"
+          runbook_url: "https://wiki.company.com/runbook/db-down"
+
+      # P1: Worker节点大规模宕机
+      - alert: WorkerMassOffline
+        expr: |
+          (count(up{job="worker"} == 0) / count(up{job="worker"})) > 0.5
+        for: 3m
+        labels:
+          severity: critical
+          priority: P1
+        annotations:
+          summary: "50%以上Worker节点宕机"
+          description: "当前 {{ $value | humanizePercentage }} Worker节点不可用"
+
+      # P1: 任务失败率过高
+      - alert: HighTaskFailureRate
+        expr: |
+          (
+            sum(rate(datafusion_task_total{status="failed"}[10m]))
+            /
+            sum(rate(datafusion_task_total[10m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          priority: P1
+        annotations:
+          summary: "任务失败率超过50%"
+          description: "过去10分钟任务失败率为 {{ $value | humanizePercentage }}"
+
+      # P2: 任务失败率警告
+      - alert: ElevatedTaskFailureRate
+        expr: |
+          (
+            sum(rate(datafusion_task_total{status="failed"}[10m]))
+            /
+            sum(rate(datafusion_task_total[10m]))
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          priority: P2
+        annotations:
+          summary: "任务失败率超过20%"
+          description: "过去10分钟任务失败率为 {{ $value | humanizePercentage }}，请检查日志"
+
+      # P2: 队列积压严重
+      - alert: QueueBacklog
+        expr: rabbitmq_queue_messages{queue="task_queue"} > 1000
+        for: 10m
+        labels:
+          severity: warning
+          priority: P2
+        annotations:
+          summary: "任务队列积压"
+          description: "队列 {{ $labels.queue }} 当前积压 {{ $value }} 条消息"
+
+      # P2: API响应延迟过高
+      - alert: HighAPILatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(datafusion_api_request_duration_seconds_bucket[5m])) by (le, endpoint)
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          priority: P2
+        annotations:
+          summary: "API P99延迟过高"
+          description: "端点 {{ $labels.endpoint }} 的P99延迟为 {{ $value }}s"
+
+      # P3: 磁盘空间不足预警
+      - alert: DiskSpaceWarning
+        expr: worker_disk_usage_percent > 70
+        for: 30m
+        labels:
+          severity: info
+          priority: P3
+        annotations:
+          summary: "磁盘使用率超过70%"
+          description: "Worker {{ $labels.worker_id }} 磁盘使用率 {{ $value }}%"
+
+      # P3: 证书即将过期
+      - alert: CertificateExpiringSoon
+        expr: (ssl_certificate_expiry_seconds - time()) / 86400 < 30
+        for: 1h
+        labels:
+          severity: info
+          priority: P3
+        annotations:
+          summary: "SSL证书即将过期"
+          description: "域名 {{ $labels.domain }} 的证书将在 {{ $value }} 天后过期"
+```
+
+**动态阈值与异常检测：**
+
+对于具有明显周期性的指标（如每日任务量），使用静态阈值容易误报，建议采用动态阈值：
+
+```yaml
+# 基于历史数据的异常检测 (需要 Prometheus v2.x + Recording Rules)
+- record: datafusion:task_rate:predicted
+  expr: |
+    avg_over_time(
+      rate(datafusion_task_total[5m])[1d:5m] offset 1w
+    )  # 上周同一时间的平均值
+
+- alert: TaskRateAnomaly
+  expr: |
+    abs(
+      rate(datafusion_task_total[5m]) - datafusion:task_rate:predicted
+    ) / datafusion:task_rate:predicted > 0.3
+  for: 15m
+  annotations:
+    summary: "任务执行速率异常"
+    description: "当前任务速率与历史同期相比偏差超过30%"
+```
+
+**3.2.6.4.3. 告警降噪机制**
+
+**Alertmanager 配置：**
+
+```yaml
+# alertmanager.yml
+global:
+  resolve_timeout: 5m
+
+# 告警路由规则
+route:
+  receiver: 'default'
+  group_by: ['alertname', 'cluster', 'service']  # 告警分组
+  group_wait: 30s        # 首次告警等待时间，用于分组
+  group_interval: 5m     # 同组告警发送间隔
+  repeat_interval: 4h    # 重复告警间隔
+
+  routes:
+    # P0告警：立即发送所有通知
+    - match:
+        priority: P0
+      receiver: 'critical-all'
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # P1告警：发送给值班组
+    - match:
+        priority: P1
+      receiver: 'oncall-team'
+      group_wait: 30s
+      repeat_interval: 2h
+
+    # P2告警：邮件+钉钉
+    - match:
+        priority: P2
+      receiver: 'warning-team'
+      repeat_interval: 4h
+
+    # P3告警：仅工作日发送钉钉
+    - match:
+        priority: P3
+      receiver: 'info-team'
+      repeat_interval: 24h
+      # 周末和夜间静默
+      mute_time_intervals:
+        - weekends
+        - nights
+
+# 告警抑制规则
+inhibit_rules:
+  # 规则1: Master宕机时，抑制所有Worker告警（Worker依赖Master）
+  - source_match:
+      alertname: 'MasterNodeDown'
+    target_match_re:
+      alertname: 'Worker.*'
+    equal: ['cluster']
+
+  # 规则2: 数据库宕机时，抑制所有任务失败告警
+  - source_match:
+      alertname: 'DatabaseDown'
+    target_match_re:
+      alertname: '.*TaskFailed.*'
+
+  # 规则3: P0告警触发时，抑制同服务的P2/P3告警
+  - source_match:
+      priority: 'P0'
+    target_match_re:
+      priority: 'P2|P3'
+    equal: ['service']
+
+# 静默时间窗口
+mute_time_intervals:
+  - name: weekends
+    time_intervals:
+      - weekdays: ['saturday', 'sunday']
+
+  - name: nights
+    time_intervals:
+      - times:
+        - start_time: '23:00'
+          end_time: '08:00'
+
+# 通知接收器
+receivers:
+  - name: 'critical-all'
+    email_configs:
+      - to: 'oncall@company.com,management@company.com'
+        send_resolved: true
+    webhook_configs:
+      - url: 'https://sms-gateway.company.com/send'  # 短信网关
+      - url: 'https://phone-gateway.company.com/call' # 电话告警
+    dingtalk_configs:
+      - webhook_url: 'https://oapi.dingtalk.com/robot/send?access_token=xxx'
+        send_resolved: true
+
+  - name: 'oncall-team'
+    email_configs:
+      - to: 'oncall@company.com'
+    webhook_configs:
+      - url: 'https://sms-gateway.company.com/send'
+    dingtalk_configs:
+      - webhook_url: 'https://oapi.dingtalk.com/robot/send?access_token=xxx'
+
+  - name: 'warning-team'
+    email_configs:
+      - to: 'dev-team@company.com'
+    dingtalk_configs:
+      - webhook_url: 'https://oapi.dingtalk.com/robot/send?access_token=yyy'
+
+  - name: 'info-team'
+    dingtalk_configs:
+      - webhook_url: 'https://oapi.dingtalk.com/robot/send?access_token=zzz'
+```
+
+**告警聚合策略：**
+
+*   **按集群聚合**: 同一集群的相同告警合并为一条消息
+*   **按时间聚合**: 30秒内的同组告警批量发送，避免风暴
+*   **按严重程度聚合**: P0告警单独发送，P2/P3告警可延迟合并
+
+**告警风暴防护：**
+
+```python
+# 告警频率限制器（应用层实现）
+class AlertRateLimiter:
+    """防止告警风暴的速率限制器"""
+
+    def __init__(self):
+        self.alert_counts = {}  # {alert_name: [(timestamp, count)]}
+
+    def should_send_alert(self, alert_name: str, max_per_hour: int = 10) -> bool:
+        """判断是否应该发送告警"""
+        now = time.time()
+        hour_ago = now - 3600
+
+        # 清理1小时前的记录
+        if alert_name in self.alert_counts:
+            self.alert_counts[alert_name] = [
+                (ts, cnt) for ts, cnt in self.alert_counts[alert_name]
+                if ts > hour_ago
+            ]
+        else:
+            self.alert_counts[alert_name] = []
+
+        # 统计1小时内的告警次数
+        total_count = sum(cnt for ts, cnt in self.alert_counts[alert_name])
+
+        if total_count >= max_per_hour:
+            # 达到上限，发送告警抑制通知
+            self.send_suppression_notice(alert_name, total_count)
+            return False
+
+        # 记录本次告警
+        self.alert_counts[alert_name].append((now, 1))
+        return True
+```
+
+**3.2.6.4.4. 告警升级与跟踪**
+
+**告警升级机制：**
+
+```yaml
+# 告警升级规则（通过 Prometheus Recording Rules 实现）
+groups:
+  - name: alert_escalation
+    interval: 1m
+    rules:
+      # P2告警持续30分钟自动升级为P1
+      - record: alert_escalated:task_failure
+        expr: |
+          ALERTS{alertname="ElevatedTaskFailureRate", alertstate="firing"}
+          and
+          time() - ALERTS_FOR_STATE{alertname="ElevatedTaskFailureRate"} > 1800
+        labels:
+          priority: P1
+          escalated_from: P2
+```
+
+**告警跟踪系统：**
+
+将告警信息写入数据库，进行全生命周期跟踪：
+
+```sql
+-- 告警历史表（对应 3.4 数据库设计中的 alert_records）
+CREATE TABLE alert_records (
+    id UUID PRIMARY KEY,
+    alert_name VARCHAR(255) NOT NULL,
+    priority VARCHAR(10) NOT NULL,  -- P0/P1/P2/P3
+    severity VARCHAR(20) NOT NULL,  -- critical/warning/info
+
+    -- 告警内容
+    summary TEXT NOT NULL,
+    description TEXT,
+    labels JSONB,  -- Prometheus标签
+
+    -- 时间信息
+    fired_at TIMESTAMP NOT NULL,      -- 告警触发时间
+    resolved_at TIMESTAMP,            -- 告警恢复时间
+    acknowledged_at TIMESTAMP,        -- 告警确认时间
+
+    -- 处理信息
+    assigned_to VARCHAR(100),         -- 处理人
+    status VARCHAR(20) DEFAULT 'firing',  -- firing/acknowledged/resolved
+    resolution_notes TEXT,            -- 解决方案记录
+
+    -- 响应时间统计
+    time_to_acknowledge INTEGER,  -- 确认耗时（秒）
+    time_to_resolve INTEGER,      -- 解决耗时（秒）
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX idx_alert_fired_at ON alert_records(fired_at DESC);
+CREATE INDEX idx_alert_status ON alert_records(status);
+CREATE INDEX idx_alert_priority ON alert_records(priority);
+```
+
+**告警处理流程：**
+
+```
+1. 告警触发 (Prometheus)
+   → 写入 alert_records (status=firing)
+   ↓
+2. 值班人员收到通知
+   → 点击确认按钮
+   → 更新 acknowledged_at, assigned_to, status=acknowledged
+   ↓
+3. 问题排查与修复
+   → 填写 resolution_notes
+   ↓
+4. 告警恢复 (Prometheus)
+   → 更新 resolved_at, status=resolved
+   → 计算 time_to_acknowledge, time_to_resolve
+```
+
+##### 3.2.6.5. 日志系统设计
+
+**3.2.6.5.1. 日志采集链路**
+
+```
+应用程序 → 日志文件 → Filebeat → Logstash → Elasticsearch → Kibana
+                                              ↓
+                                        S3归档存储
+```
+
+**各组件职责：**
+
+*   **应用程序**: 输出结构化JSON日志到标准输出或文件
+*   **Filebeat**: 轻量级日志采集器，部署在每个节点
+*   **Logstash**: 日志过滤、解析、enrichment（添加地理位置、trace_id关联等）
+*   **Elasticsearch**: 日志索引和存储，支持全文搜索
+*   **Kibana**: 日志查询界面和可视化
+
+**3.2.6.5.2. 日志格式规范**
+
+**统一JSON格式：**
+
+```json
+{
+  "timestamp": "2025-10-24T10:30:45.123Z",   // ISO 8601格式
+  "level": "ERROR",                           // DEBUG/INFO/WARN/ERROR/FATAL
+  "logger": "datafusion.worker.collector",    // 日志记录器名称
+  "message": "Failed to collect data from target website",
+
+  // 上下文信息
+  "context": {
+    "task_id": "task-abc-123",
+    "task_run_id": "run-def-456",
+    "worker_id": "worker-001",
+    "user_id": "user-789"
+  },
+
+  // 追踪信息（关联Traces）
+  "trace_id": "5b8aa5a2d2c872e8321cf37308d69df2",
+  "span_id": "051581bf3cb55c13",
+
+  // 错误详情（仅ERROR/FATAL级别）
+  "error": {
+    "type": "ConnectionTimeoutError",
+    "message": "Connection to https://example.com timed out after 30s",
+    "stack_trace": "Traceback (most recent call last):\n  File..."
+  },
+
+  // 业务指标（可选）
+  "metrics": {
+    "duration_ms": 30250,
+    "retry_count": 3,
+    "data_size_bytes": 0
+  },
+
+  // 主机信息
+  "host": {
+    "hostname": "worker-001.datacenter-1",
+    "ip": "10.0.1.23"
+  },
+
+  // 环境信息
+  "environment": "production",
+  "version": "1.2.3"
+}
+```
+
+**日志级别使用规范：**
+
+| 级别 | 使用场景 | 示例 |
+|------|---------|------|
+| DEBUG | 详细的调试信息，仅开发/测试环境启用 | "Parsed HTML element: <div id='content'>" |
+| INFO | 关键业务流程节点 | "Task started", "Data collected successfully" |
+| WARN | 可恢复的异常情况，如重试、降级 | "Failed to connect, retrying (3/5)" |
+| ERROR | 错误情况，影响单个任务但不影响系统 | "Task execution failed: timeout" |
+| FATAL | 严重错误，可能导致服务崩溃 | "Database connection pool exhausted" |
+
+**3.2.6.5.3. 日志生命周期管理**
+
+**三层存储架构：**
+
+| 数据层级 | 存储时长 | 存储位置 | 查询性能 | 成本 |
+|---------|---------|---------|---------|------|
+| 热数据 | 7天 | Elasticsearch (SSD) | 秒级 | 高 |
+| 温数据 | 23天 | Elasticsearch (HDD) | 分钟级 | 中 |
+| 冷数据 | 1-3年 | S3对象存储 | 需恢复后查询 | 低 |
+
+**Elasticsearch ILM (Index Lifecycle Management) 配置：**
+
+```json
+{
+  "policy": "datafusion-logs-policy",
+  "phases": {
+    "hot": {
+      "min_age": "0ms",
+      "actions": {
+        "rollover": {
+          "max_size": "50GB",
+          "max_age": "1d"
+        },
+        "set_priority": {
+          "priority": 100
+        }
+      }
+    },
+    "warm": {
+      "min_age": "7d",
+      "actions": {
+        "shrink": {
+          "number_of_shards": 1
+        },
+        "forcemerge": {
+          "max_num_segments": 1
+        },
+        "set_priority": {
+          "priority": 50
+        }
+      }
+    },
+    "cold": {
+      "min_age": "30d",
+      "actions": {
+        "freeze": {},
+        "set_priority": {
+          "priority": 0
+        }
+      }
+    },
+    "delete": {
+      "min_age": "90d",
+      "actions": {
+        "delete": {}
+      }
+    }
+  }
+}
+```
+
+**S3归档策略：**
+
+```bash
+# 定时任务：每天凌晨2点归档30天前的日志到S3
+0 2 * * * /usr/local/bin/es-to-s3-archiver \
+  --index "logs-*" \
+  --older-than "30d" \
+  --s3-bucket "datafusion-logs-archive" \
+  --compress gzip \
+  --delete-after-archive
+```
+
+**3.2.6.5.4. 日志索引优化**
+
+**索引设计原则：**
+
+1.  **按天滚动索引**: `logs-2025-10-24`, `logs-2025-10-25`...
+2.  **仅对查询字段建立索引**: 减少存储成本和写入延迟
+3.  **使用index template统一配置**
+
+```json
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "refresh_interval": "30s",  // 降低刷新频率，提升写入性能
+      "index.lifecycle.name": "datafusion-logs-policy"
+    },
+    "mappings": {
+      "properties": {
+        "timestamp": { "type": "date" },
+        "level": { "type": "keyword" },
+        "logger": { "type": "keyword" },
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": { "type": "keyword", "ignore_above": 256 }
+          }
+        },
+        "context.task_id": { "type": "keyword" },
+        "context.worker_id": { "type": "keyword" },
+        "trace_id": { "type": "keyword" },
+        "error.type": { "type": "keyword" },
+        "error.message": { "type": "text" },
+        "error.stack_trace": {
+          "type": "text",
+          "index": false  // 堆栈不索引，仅存储
+        }
+      }
+    }
+  }
+}
+```
+
+**3.2.6.5.5. 日志查询最佳实践**
+
+**Kibana 常用查询示例：**
+
+```
+# 1. 查询某个任务的所有日志
+context.task_id:"task-abc-123"
+
+# 2. 查询所有错误日志
+level:ERROR OR level:FATAL
+
+# 3. 查询特定时间范围内的日志
+timestamp:[2025-10-24T00:00:00 TO 2025-10-24T23:59:59]
+
+# 4. 查询包含关键词的日志
+message:"timeout" OR error.message:"timeout"
+
+# 5. 查询特定Worker的日志
+context.worker_id:"worker-001"
+
+# 6. 组合查询：某个任务的错误日志
+context.task_id:"task-abc-123" AND level:ERROR
+
+# 7. 通过trace_id关联分布式日志
+trace_id:"5b8aa5a2d2c872e8321cf37308d69df2"
+```
+
+**日志与指标关联：**
+
+在Grafana Dashboard中，通过Data Links实现点击指标跳转到对应日志：
+
+```json
+{
+  "dataLinks": [
+    {
+      "title": "View Logs in Kibana",
+      "url": "https://kibana.company.com/app/discover#/?_g=(time:(from:'${__from}',to:'${__to}'))&_a=(query:(query_string:(query:'context.task_id:\"${__field.labels.task_id}\"')))"
+    }
+  ]
+}
+```
+
+##### 3.2.6.6. 分布式追踪
+
+**3.2.6.6.1. 引入追踪的必要性**
+
+在 DataFusion 的分布式架构中，一个用户请求可能经历以下链路：
+
+```
+API服务 → Master节点 → RabbitMQ → Worker节点 → 目标网站
+                ↓                      ↓
+           PostgreSQL              PostgreSQL/Redis
+```
+
+仅靠日志和指标难以回答以下问题：
+
+*   用户报告"任务执行慢"，但具体慢在哪个环节？
+*   数据库查询慢是Worker端的问题，还是数据库本身的问题?
+*   RabbitMQ消息延迟是生产端慢还是消费端慢？
+
+**分布式追踪**通过关联整个请求链路的所有Span，可以：
+
+*   **性能分析**: 可视化每个环节的耗时，快速定位瓶颈
+*   **依赖分析**: 绘制服务调用拓扑图，发现隐藏的依赖关系
+*   **故障定位**: 快速找到失败的具体服务和原因
+
+**3.2.6.6.2. 技术选型**
+
+*   **标准化层**: OpenTelemetry (统一的API和SDK)
+*   **传输层**: OTLP (OpenTelemetry Protocol)
+*   **存储层**: Jaeger Backend (基于Cassandra/Elasticsearch)
+*   **查询层**: Jaeger UI
+
+**架构图：**
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    应用程序层                               │
+│  API Service  │  Master  │  Worker  │  Collector Plugin  │
+│  (OpenTelemetry SDK集成)                                  │
+└──────────────────────────────────────────────────────────┘
+                         ↓ OTLP
+┌──────────────────────────────────────────────────────────┐
+│              OpenTelemetry Collector                      │
+│  - 接收Traces                                             │
+│  - Sampling (采样)                                        │
+│  - 批量发送                                                │
+└──────────────────────────────────────────────────────────┘
+                         ↓
+┌──────────────────────────────────────────────────────────┐
+│                   Jaeger Backend                          │
+│  - Collector: 接收traces                                  │
+│  - Storage: Elasticsearch存储                             │
+│  - Query: 查询服务                                         │
+└──────────────────────────────────────────────────────────┘
+                         ↓
+┌──────────────────────────────────────────────────────────┐
+│                    Jaeger UI                              │
+│  - Trace查询和可视化                                       │
+│  - 服务依赖拓扑图                                           │
+└──────────────────────────────────────────────────────────┘
+```
+
+**3.2.6.6.3. Trace上下文传播**
+
+**关键概念：**
+
+*   **Trace**: 一次完整的请求链路，由唯一的`trace_id`标识
+*   **Span**: Trace中的一个操作单元（如一次HTTP调用、一次数据库查询）
+*   **SpanContext**: 包含`trace_id`和`span_id`的上下文，需要跨服务传播
+
+**HTTP请求的上下文传播：**
+
+```python
+# API服务 → Master 的HTTP调用
+from opentelemetry import trace
+from opentelemetry.propagate import inject
+
+tracer = trace.get_tracer(__name__)
+
+with tracer.start_as_current_span("api_call_master"):
+    headers = {}
+    inject(headers)  # 自动注入 traceparent header
+
+    response = requests.post(
+        "http://master:5000/api/v1/tasks/execute",
+        json={"task_id": "task-123"},
+        headers=headers  # 传播trace上下文
+    )
+```
+
+```python
+# Master接收并继续传播
+from opentelemetry.propagate import extract
+
+@app.route('/api/v1/tasks/execute', methods=['POST'])
+def execute_task():
+    # 从HTTP Header提取trace上下文
+    context = extract(request.headers)
+
+    with tracer.start_as_current_span("master_schedule_task", context=context):
+        task_id = request.json['task_id']
+        # 业务逻辑...
+```
+
+**RabbitMQ消息的上下文传播：**
+
+```python
+# Master发送消息到RabbitMQ
+from opentelemetry.propagate import inject
+
+with tracer.start_as_current_span("publish_task_to_queue"):
+    message = {"task_id": "task-123", "config": {...}}
+    headers = {}
+    inject(headers)  # 注入trace上下文到消息header
+
+    channel.basic_publish(
+        exchange='',
+        routing_key='task_queue',
+        body=json.dumps(message),
+        properties=pika.BasicProperties(headers=headers)
+    )
+```
+
+```python
+# Worker从RabbitMQ消费消息
+from opentelemetry.propagate import extract
+
+def callback(ch, method, properties, body):
+    # 从消息header提取trace上下文
+    context = extract(properties.headers or {})
+
+    with tracer.start_as_current_span("worker_execute_task", context=context):
+        message = json.loads(body)
+        # 执行任务...
+```
+
+**数据库查询的追踪：**
+
+```python
+# 使用OpenTelemetry的自动instrumentation
+from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+
+Psycopg2Instrumentor().instrument()
+
+# 之后所有的数据库查询都会自动创建span
+with tracer.start_as_current_span("save_task_result"):
+    cursor.execute(
+        "INSERT INTO task_instances (task_id, status, result) VALUES (%s, %s, %s)",
+        (task_id, 'success', result)
+    )
+    # 自动创建子span: "db.query"
+```
+
+**3.2.6.6.4. Span 设计规范**
+
+**Span命名规范：**
+
+```
+<操作类型>_<资源名称>
+
+示例:
+- http_get_/api/v1/tasks
+- db_query_select_tasks
+- mq_publish_task_queue
+- collector_scrape_website
+- parser_extract_data
+```
+
+**Span属性 (Attributes):**
+
+```python
+with tracer.start_as_current_span("collector_scrape_website") as span:
+    # 设置span属性
+    span.set_attribute("http.method", "GET")
+    span.set_attribute("http.url", "https://example.com/data")
+    span.set_attribute("http.status_code", 200)
+    span.set_attribute("task.id", "task-123")
+    span.set_attribute("task.type", "web_rpa")
+    span.set_attribute("target.domain", "example.com")
+
+    try:
+        result = scrape(url)
+        span.set_status(StatusCode.OK)
+    except Exception as e:
+        span.set_status(StatusCode.ERROR, str(e))
+        span.record_exception(e)  # 记录异常信息
+        raise
+```
+
+**采样策略：**
+
+为避免追踪数据爆炸，需要合理采样：
+
+```python
+# OpenTelemetry Collector配置
+processors:
+  probabilistic_sampler:
+    sampling_percentage: 10  # 采样10%的traces
+
+  tail_sampling:
+    policies:
+      # 策略1: 所有错误的trace 100%采样
+      - name: error-policy
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+
+      # 策略2: 慢请求 100%采样 (耗时>5s)
+      - name: slow-trace-policy
+        type: latency
+        latency: {threshold_ms: 5000}
+
+      # 策略3: 正常请求 1%采样
+      - name: normal-policy
+        type: probabilistic
+        probabilistic: {sampling_percentage: 1}
+```
+
+**3.2.6.6.5. Trace与Logs/Metrics关联**
+
+**在日志中注入trace_id:**
+
+```python
+import logging
+from opentelemetry import trace
+
+# 自定义日志formatter
+class TraceFormatter(logging.Formatter):
+    def format(self, record):
+        span = trace.get_current_span()
+        if span.is_recording():
+            record.trace_id = format(span.get_span_context().trace_id, '032x')
+            record.span_id = format(span.get_span_context().span_id, '016x')
+        else:
+            record.trace_id = '0' * 32
+            record.span_id = '0' * 16
+        return super().format(record)
+
+# 配置logger
+formatter = TraceFormatter(
+    '{"timestamp":"%(asctime)s","level":"%(levelname)s",'
+    '"trace_id":"%(trace_id)s","span_id":"%(span_id)s",'
+    '"message":"%(message)s"}'
+)
+```
+
+**在Grafana中实现跳转：**
+
+从指标跳转到Trace：
+
+```json
+{
+  "dataLinks": [
+    {
+      "title": "View Trace in Jaeger",
+      "url": "https://jaeger.company.com/trace/${__field.labels.trace_id}"
+    }
+  ]
+}
+```
+
+从Trace跳转到日志：
+
+在Jaeger UI中配置Logs Tab，点击Span可自动跳转到Kibana查询对应的日志。
+
+##### 3.2.6.7. 可视化与分析
+
+**3.2.6.7.1. Grafana Dashboard 设计**
+
+**Dashboard 1: 系统概览 (System Overview)**
+
+*   **用途**: 管理层和运维人员快速了解系统整体健康状态
+*   **核心指标**:
+    - 任务执行成功率（24小时）
+    - 活跃Worker数量
+    - API请求QPS
+    - 数据采集量（条/小时）
+    - 当前告警数量（按严重程度分组）
+
+*   **Panel设计**:
+    ```
+    ┌──────────────┬──────────────┬──────────────┐
+    │ 任务成功率     │ Worker数量    │ API QPS      │
+    │ 95.2%        │ 12/15        │ 450 req/s    │
+    │ Stat Panel   │ Stat Panel   │ Stat Panel   │
+    └──────────────┴──────────────┴──────────────┘
+    ┌──────────────────────────────────────────────┐
+    │ 任务执行趋势（过去24小时）                      │
+    │ Graph Panel: 成功/失败任务数时间序列            │
+    └──────────────────────────────────────────────┘
+    ┌──────────────────────────────────────────────┐
+    │ 活跃告警                                       │
+    │ Table Panel: 告警名称、级别、持续时间            │
+    └──────────────────────────────────────────────┘
+    ```
+
+**Dashboard 2: 任务执行监控 (Task Execution Monitoring)**
+
+*   **用途**: 数据分析师和算法工程师监控数据采集任务
+*   **核心指标**:
+    - 各任务类型的执行次数和成功率
+    - 任务执行耗时分布（P50/P95/P99）
+    - 任务失败原因分类（超时/解析失败/网络错误）
+    - 数据采集量趋势
+
+*   **PromQL查询示例**:
+    ```promql
+    # 任务成功率（按任务类型）
+    sum(rate(datafusion_task_total{status="success"}[5m])) by (task_type)
+    /
+    sum(rate(datafusion_task_total[5m])) by (task_type)
+
+    # 任务P95耗时
+    histogram_quantile(0.95,
+      sum(rate(datafusion_task_duration_seconds_bucket[5m])) by (le, task_type)
+    )
+    ```
+
+**Dashboard 3: Worker 资源监控 (Worker Resource Monitoring)**
+
+*   **用途**: 运维人员监控Worker节点资源使用情况
+*   **核心指标**:
+    - CPU使用率（按Worker分组）
+    - 内存使用率
+    - 磁盘IO
+    - 网络带宽
+    - 线程池使用率
+
+*   **Panel设计**:
+    ```
+    ┌──────────────────────────────────────────────┐
+    │ Worker CPU使用率 Heatmap                      │
+    │ 横轴:时间 纵轴:worker_id 颜色:CPU百分比         │
+    └──────────────────────────────────────────────┘
+    ┌──────────────────────────────────────────────┐
+    │ Worker内存使用趋势                             │
+    │ Multi-line Graph: 每个Worker一条线              │
+    └──────────────────────────────────────────────┘
+    ```
+
+**Dashboard 4: 告警分析 (Alert Analysis)**
+
+*   **用途**: 评估告警质量，优化告警规则
+*   **核心指标**:
+    - 告警触发频率（按告警名称）
+    - 平均响应时间 (Time To Acknowledge)
+    - 平均解决时间 (Time To Resolve)
+    - 告警准确率（误报率）
+
+*   **数据源**: 从 PostgreSQL 的 `alert_records` 表查询
+
+**3.2.6.7.2. Grafana 告警集成**
+
+除了Prometheus Alertmanager，Grafana也支持配置告警：
+
+```json
+{
+  "alert": {
+    "name": "任务成功率过低（Grafana）",
+    "conditions": [
+      {
+        "evaluator": {
+          "params": [0.9],
+          "type": "lt"  // 小于90%
+        },
+        "query": {
+          "model": {
+            "expr": "sum(rate(datafusion_task_total{status=\"success\"}[5m])) / sum(rate(datafusion_task_total[5m]))"
+          }
+        },
+        "type": "query"
+      }
+    ],
+    "frequency": "1m",
+    "handler": 1,
+    "notifications": [
+      {"uid": "dingtalk-channel"}
+    ]
+  }
+}
+```
+
+##### 3.2.6.8. 监控系统高可用设计
+
+**3.2.6.8.1. "谁来监控监控系统?"**
+
+监控系统本身也可能故障，必须设计独立的健康检查机制。
+
+**Prometheus 高可用架构：**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Thanos Query                          │  ← Grafana统一查询
+│            (提供全局查询视图和去重)                         │
+└─────────────────────────────────────────────────────────┘
+              ↓                ↓                ↓
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ Prometheus-1     │ │ Prometheus-2     │ │ Thanos Store     │
+│ (主数据中心)      │ │ (灾备数据中心)    │ │ (历史数据查询)    │
+│ + Thanos Sidecar │ │ + Thanos Sidecar │ │                  │
+└──────────────────┘ └──────────────────┘ └──────────────────┘
+        ↓                      ↓                     ↓
+    ┌────────────────────────────────────────────────┘
+    ↓
+ S3对象存储 (长期存储)
+```
+
+**关键设计点：**
+
+1.  **双活Prometheus**: 两个Prometheus实例采集相同的指标，互为备份
+2.  **Thanos Query去重**: 自动去除重复数据，对用户透明
+3.  **独立存储**: 即使Prometheus故障，历史数据仍可通过Thanos Store查询
+
+**Alertmanager 高可用（Gossip协议）：**
+
+```yaml
+# Alertmanager-1 配置
+alertmanager:
+  cluster:
+    listen-address: "0.0.0.0:9094"
+    peers:
+      - "alertmanager-2:9094"
+      - "alertmanager-3:9094"
+```
+
+多个Alertmanager实例通过Gossip协议同步告警状态，确保：
+
+*   告警去重：同一告警只发送一次通知
+*   故障转移：单个实例宕机不影响告警发送
+
+**3.2.6.8.2. 监控系统的监控指标**
+
+**Prometheus 自监控：**
+
+```promql
+# Prometheus本地存储使用量
+prometheus_tsdb_storage_blocks_bytes / 1024 / 1024 / 1024  # GB
+
+# 告警规则评估失败次数
+rate(prometheus_rule_evaluation_failures_total[5m])
+
+# 采集目标健康度
+up{job="prometheus"}
+
+# 采集延迟
+prometheus_target_scrape_duration_seconds
+```
+
+**Alertmanager 自监控：**
+
+```promql
+# 告警发送失败次数
+rate(alertmanager_notifications_failed_total[5m])
+
+# 告警队列长度
+alertmanager_notification_queue_length
+```
+
+**Elasticsearch 自监控：**
+
+```bash
+# 集群健康状态
+curl -X GET "localhost:9200/_cluster/health"
+
+# 索引统计
+curl -X GET "localhost:9200/_cat/indices?v"
+```
+
+**3.2.6.8.3. 独立健康检查机制**
+
+**Watchdog 告警：**
+
+配置一个持续触发的告警，若该告警停止，说明Prometheus或Alertmanager故障：
+
+```yaml
+# Prometheus规则
+- alert: Watchdog
+  expr: vector(1)
+  labels:
+    severity: none
+  annotations:
+    summary: "Watchdog心跳告警（持续触发）"
+    description: "若此告警停止，说明Prometheus或Alertmanager故障"
+```
+
+**外部监控服务：**
+
+使用第三方SaaS服务（如UptimeRobot、Pingdom）定期探测：
+
+*   Prometheus `/metrics` 端点
+*   Grafana 登录页面
+*   Alertmanager `/-/healthy` 端点
+
+一旦探测失败，立即通过独立通道（短信/电话）通知运维团队。
+
+**Blackbox Exporter 黑盒探测：**
+
+```yaml
+# Prometheus配置
+- job_name: 'blackbox-prometheus'
+  metrics_path: /probe
+  params:
+    module: [http_2xx]
+  static_configs:
+    - targets:
+      - http://prometheus-1:9090/-/healthy
+      - http://prometheus-2:9090/-/healthy
+  relabel_configs:
+    - source_labels: [__address__]
+      target_label: __param_target
+    - target_label: __address__
+      replacement: blackbox-exporter:9115
+```
+
+##### 3.2.6.9. 监控开发规范
+
+**3.2.6.9.1. 指标命名规范**
+
+**统一前缀：** 所有业务指标使用 `datafusion_` 前缀
+
+**命名格式：** `<namespace>_<subsystem>_<name>_<unit>`
+
+*   `namespace`: 系统名称，如 `datafusion`
+*   `subsystem`: 子系统，如 `task`, `worker`, `api`
+*   `name`: 指标名称，如 `total`, `duration`, `usage`
+*   `unit`: 单位，如 `seconds`, `bytes`, `percent`
+
+**示例：**
+
+```
+✅ 正确:
+datafusion_task_total
+datafusion_task_duration_seconds
+datafusion_worker_memory_bytes
+datafusion_api_requests_total
+
+❌ 错误:
+task_count  (缺少namespace)
+datafusion_task_time  (应使用标准单位seconds)
+datafusion_task_duration_ms  (Prometheus标准单位是秒,不是毫秒)
+```
+
+**3.2.6.9.2. 标签设计原则**
+
+**避免高基数标签：**
+
+高基数（High Cardinality）标签会导致时间序列爆炸，严重影响Prometheus性能。
+
+```
+❌ 错误示例:
+datafusion_task_total{user_id="12345"}  # user_id可能有数百万个值
+datafusion_task_total{task_run_id="run-abc-123"}  # 每次执行都是新值
+
+✅ 正确做法:
+# 使用trace_id在日志中关联,而不是作为指标标签
+datafusion_task_total{task_type="web_rpa", status="success"}
+```
+
+**标签数量限制：**
+
+单个指标的标签数量建议 ≤ 10个，标签值的基数建议：
+
+*   高频指标（每秒更新）: 标签基数 < 100
+*   中频指标（每分钟更新）: 标签基数 < 1000
+*   低频指标（每小时更新）: 标签基数 < 10000
+
+**标签命名规范：**
+
+```
+# 标签名使用snake_case
+datafusion_task_total{task_type="web_rpa", data_source="api"}
+
+# 标签值使用小写
+✅ status="success"
+❌ status="Success"
+```
+
+**3.2.6.9.3. 代码埋点示例**
+
+**Counter（计数器）使用场景：**
+
+用于只增不减的累计指标，如请求总数、任务总数、错误总数。
+
+```python
+from prometheus_client import Counter
+
+# 定义指标
+http_requests_total = Counter(
+    'datafusion_api_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status_code']
+)
+
+# 使用
+@app.route('/api/v1/tasks', methods=['GET'])
+def list_tasks():
+    try:
+        result = get_tasks()
+        http_requests_total.labels(method='GET', endpoint='/api/v1/tasks', status_code='200').inc()
+        return result
+    except Exception as e:
+        http_requests_total.labels(method='GET', endpoint='/api/v1/tasks', status_code='500').inc()
+        raise
+```
+
+**Histogram（直方图）使用场景：**
+
+用于测量分布情况，如响应时间、数据大小。会自动生成 `_sum`、`_count`、`_bucket` 指标。
+
+```python
+from prometheus_client import Histogram
+
+# 定义指标
+task_duration = Histogram(
+    'datafusion_task_duration_seconds',
+    'Task execution duration',
+    ['task_type'],
+    buckets=[1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600]  # 自定义分桶
+)
+
+# 使用方式1: context manager
+@task_duration.labels(task_type='web_rpa').time()
+def execute_task():
+    # 业务逻辑
+    pass
+
+# 使用方式2: 手动记录
+start_time = time.time()
+try:
+    execute_task()
+finally:
+    duration = time.time() - start_time
+    task_duration.labels(task_type='web_rpa').observe(duration)
+```
+
+**Gauge（仪表盘）使用场景：**
+
+用于可增可减的瞬时值，如队列长度、在线用户数、资源使用率。
+
+```python
+from prometheus_client import Gauge
+
+# 定义指标
+queue_length = Gauge(
+    'datafusion_queue_length',
+    'Current queue length',
+    ['queue_name']
+)
+
+worker_cpu = Gauge(
+    'datafusion_worker_cpu_percent',
+    'Worker CPU usage percentage',
+    ['worker_id']
+)
+
+# 使用方式1: 直接设置
+queue_length.labels(queue_name='task_queue').set(150)
+
+# 使用方式2: inc/dec
+queue_length.labels(queue_name='task_queue').inc()  # +1
+queue_length.labels(queue_name='task_queue').dec()  # -1
+
+# 使用方式3: 周期性更新
+import psutil
+
+def update_cpu_metrics():
+    cpu_percent = psutil.cpu_percent(interval=1)
+    worker_cpu.labels(worker_id='worker-001').set(cpu_percent)
+
+# 定时任务每15秒更新一次
+schedule.every(15).seconds.do(update_cpu_metrics)
+```
+
+**Summary（摘要）使用场景：**
+
+类似Histogram，但直接计算分位数（客户端计算）。
+
+```python
+from prometheus_client import Summary
+
+request_latency = Summary(
+    'datafusion_api_latency_seconds',
+    'API request latency',
+    ['endpoint']
+)
+
+@request_latency.labels(endpoint='/api/v1/tasks').time()
+def handle_request():
+    pass
+```
+
+**3.2.6.9.4. 告警规则开发流程**
+
+**新功能上线检查清单：**
+
+- [ ] 定义关键业务指标
+- [ ] 实现指标采集（代码埋点）
+- [ ] 编写告警规则（Prometheus Rules）
+- [ ] 配置告警通知（Alertmanager Receivers）
+- [ ] 编写Runbook（故障处理手册）
+- [ ] 创建Grafana Dashboard
+- [ ] 进行告警测试（故障注入）
+
+**告警规则版本控制：**
+
+```bash
+# 告警规则存储在Git仓库
+datafusion-monitoring/
+├── prometheus/
+│   ├── rules/
+│   │   ├── task_alerts.yml
+│   │   ├── worker_alerts.yml
+│   │   ├── database_alerts.yml
+│   │   └── api_alerts.yml
+│   └── prometheus.yml
+├── alertmanager/
+│   └── alertmanager.yml
+└── grafana/
+    └── dashboards/
+        ├── system_overview.json
+        └── task_monitoring.json
+```
+
+**告警规则代码审查要点：**
+
+1.  **是否有明确的 `for` 子句？** 避免瞬时抖动
+2.  **阈值是否合理？** 基于历史数据分析，而非拍脑袋
+3.  **是否有完整的 annotations？** 包括 summary, description, runbook_url
+4.  **是否设置了正确的 severity 和 priority？**
+5.  **是否考虑了告警抑制规则？** 避免告警风暴
+
+**月度告警复盘：**
+
+每月回顾告警数据，持续优化：
+
+```sql
+-- 查询过去30天的告警统计
+SELECT
+    alert_name,
+    priority,
+    COUNT(*) as fire_count,
+    AVG(time_to_acknowledge) as avg_ack_time,
+    AVG(time_to_resolve) as avg_resolve_time,
+    SUM(CASE WHEN resolution_notes LIKE '%误报%' THEN 1 ELSE 0 END) as false_positive_count
+FROM alert_records
+WHERE fired_at > NOW() - INTERVAL '30 days'
+GROUP BY alert_name, priority
+ORDER BY fire_count DESC;
+```
+
+**优化方向：**
+
+*   触发频率过高（>10次/天）→ 调整阈值或增加持续时间
+*   平均响应时间过长 → 优化通知渠道或调整值班策略
+*   误报率过高（>20%）→ 重新评估告警必要性或调整阈值
+
+#### 3.2.7. Worker 执行引擎
+
+##### 3.2.7.1. 模块概述
+
+Worker 节点是 DataFusion 系统的**分布式任务执行引擎**，承担着系统最核心的数据采集工作。在分布式架构中，Worker 是实际与目标网站、数据库、API 交互的执行单元，其设计质量直接决定了系统的吞吐能力、稳定性和可扩展性。
+
+**核心价值：**
+
+*   **高性能任务执行**: 通过协程池、资源池化等技术实现单节点数千并发任务处理能力
+*   **弹性伸缩能力**: 支持动态增减节点，根据任务负载自动扩缩容
+*   **故障隔离**: 单个 Worker 故障不影响其他节点，任务自动转移到健康节点
+*   **资源高效利用**: 精细化的资源管理和任务隔离，最大化单节点处理能力
+
+**在系统中的定位：**
+
+```
+┌────────────────┐      ┌──────────────────────────────────────┐
+│  Master 节点    │      │            Worker 节点集群              │
+│                │      │                                        │
+│  - 任务调度     │──────│  Worker-1  Worker-2  ...  Worker-N    │
+│  - Worker管理   │  ↑   │                                        │
+│  - 负载均衡     │  │   │  每个 Worker 独立执行任务，互不干扰      │
+└────────────────┘  │   └──────────────────────────────────────┘
+                    │                    ↓
+                    │         ┌──────────────────────┐
+                    │         │  目标数据源            │
+                    └─────────│  - 网站               │
+                    状态上报   │  - 数据库             │
+                              │  - API               │
+                              └──────────────────────┘
+```
+
+Worker 节点通过消息队列(RabbitMQ)从 Master 接收任务，执行完成后将结果写入存储系统，并通过心跳机制向 Master 上报状态。
+
+##### 3.2.7.2. 整体架构设计
+
+**Worker 内部组件架构：**
 
 ![Worker内部流程图](diagrams/worker_flow.png)
 
+Worker 节点内部采用分层架构，各层职责清晰：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      控制平面 (Control Plane)                │
+│  - 生命周期管理器(Lifecycle Manager)                          │
+│  - 健康检查器(Health Checker)                                │
+│  - 指标采集器(Metrics Collector)                             │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                      调度平面 (Scheduling Plane)              │
+│  - 任务接收器(Task Receiver): 从 RabbitMQ 拉取任务           │
+│  - 任务分发器(Task Dispatcher): 分发任务到工作协程            │
+│  - 并发控制器(Concurrency Controller): 限流与令牌管理        │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                      执行平面 (Execution Plane)               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ 协程池 Pool-1 │  │ 协程池 Pool-2 │  │ 协程池 Pool-N │     │
+│  │              │  │              │  │              │      │
+│  │ Worker-1     │  │ Worker-1     │  │ Worker-1     │      │
+│  │ Worker-2     │  │ Worker-2     │  │ Worker-2     │      │
+│  │ ...          │  │ ...          │  │ ...          │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+│                                                             │
+│  每个协程执行：                                                │
+│  1. 调用采集器插件 (Collector Plugin)                         │
+│  2. 调用处理器插件 (Processor Plugin)                         │
+│  3. 调用存储器插件 (Storage Plugin)                           │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                      资源平面 (Resource Plane)                │
+│  - 浏览器池 (Browser Pool): RPA 采集使用                      │
+│  - 连接池 (Connection Pool): 数据库采集使用                   │
+│  - HTTP 客户端池 (HTTP Client Pool): API 采集使用             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**技术选型说明：**
+
+| 组件 | 技术选型 | 选型理由 |
+|------|---------|---------|
+| 编程语言 | **Go** | 高性能、原生并发支持、内存占用低、跨平台 |
+| 消息消费 | **amqp (RabbitMQ官方库)** | 可靠的消息确认机制、支持优先级队列 |
+| 并发模型 | **Goroutine + Channel** | 轻量级协程，单节点可支持数万并发任务 |
+| 插件通信 | **gRPC / Stdin/Stdout** | gRPC用于常驻进程插件，Stdin/Stdout用于脚本式插件 |
+| 资源隔离 | **cgroups (可选)** | 防止单个任务消耗过多资源影响其他任务 |
+| 配置管理 | **Viper** | 支持多格式配置文件、环境变量、远程配置中心 |
+
+##### 3.2.7.3. 核心执行流程
+
+Worker 节点的任务执行流程可分为三个阶段：**接收 → 执行 → 上报**。
+
+**流程图：**
+
+```
+┌─────────────┐
+│  RabbitMQ   │
+│ Task Queue  │
+└──────┬──────┘
+       │ 1. 拉取任务 (Consume)
+       ↓
+┌──────────────────────────────────────────────────────────┐
+│  Task Receiver                                           │
+│  - 从队列拉取任务消息                                      │
+│  - 反序列化任务 JSON                                       │
+│  - 验证任务配置合法性                                      │
+└──────┬───────────────────────────────────────────────────┘
+       │ 2. 并发控制检查
+       ↓
+┌──────────────────────────────────────────────────────────┐
+│  Concurrency Controller                                  │
+│  - 检查全局并发限制 (Redis 令牌桶)                         │
+│  - 检查任务级并发限制                                      │
+│  - 获取执行许可                                           │
+└──────┬───────────────────────────────────────────────────┘
+       │ 3. 分发到工作协程
+       ↓
+┌──────────────────────────────────────────────────────────┐
+│  Task Dispatcher                                         │
+│  - 根据任务类型选择协程池                                  │
+│  - 将任务投递到 task channel                              │
+└──────┬───────────────────────────────────────────────────┘
+       │ 4. 协程执行
+       ↓
+┌──────────────────────────────────────────────────────────┐
+│  Worker Goroutine                                        │
+│                                                          │
+│  1. 初始化上下文 (Context with Timeout)                   │
+│  2. 加载任务配置                                          │
+│  3. [数据采集阶段]                                        │
+│     - 调用 Collector Plugin                              │
+│     - 获取原始数据 (HTML/JSON/CSV等)                      │
+│  4. [数据处理阶段]                                        │
+│     - 调用 Processor Plugin                              │
+│     - 解析、清洗、转换数据                                 │
+│  5. [数据存储阶段]                                        │
+│     - 调用 Storage Plugin                                │
+│     - 写入数据库/文件系统                                  │
+│  6. 记录执行日志和指标                                     │
+└──────┬───────────────────────────────────────────────────┘
+       │ 5. 结果上报
+       ↓
+┌──────────────────────────────────────────────────────────┐
+│  Result Reporter                                         │
+│  - 更新 task_instances 表状态 (SUCCESS/FAILED)                 │
+│  - 写入 task_logs 表                                      │
+│  - ACK 消息队列 (确认消费成功)                             │
+│  - 释放并发令牌                                           │
+└──────────────────────────────────────────────────────────┘
+```
+
+**关键代码实现：**
+
+```go
+// Worker 核心任务执行逻辑
+func (w *Worker) executeTask(ctx context.Context, task *Task) error {
+    // 1. 创建任务执行上下文，设置超时
+    taskCtx, cancel := context.WithTimeout(ctx, task.Timeout)
+    defer cancel()
+
+    // 2. 记录任务开始时间，用于统计耗时
+    startTime := time.Now()
+
+    // 3. 创建任务执行记录
+    taskRun := &TaskRun{
+        TaskID:    task.ID,
+        WorkerID:  w.id,
+        Status:    StatusRunning,
+        StartTime: startTime,
+    }
+    if err := w.db.Create(taskRun).Error; err != nil {
+        return fmt.Errorf("failed to create task run: %w", err)
+    }
+
+    // 4. 数据采集阶段
+    rawData, err := w.collectData(taskCtx, task)
+    if err != nil {
+        return w.handleTaskFailure(taskRun, err, "collection_failed")
+    }
+
+    // 5. 数据处理阶段
+    processedData, err := w.processData(taskCtx, task, rawData)
+    if err != nil {
+        return w.handleTaskFailure(taskRun, err, "processing_failed")
+    }
+
+    // 6. 数据存储阶段
+    if err := w.storeData(taskCtx, task, processedData); err != nil {
+        return w.handleTaskFailure(taskRun, err, "storage_failed")
+    }
+
+    // 7. 标记任务成功
+    taskRun.Status = StatusSuccess
+    taskRun.EndTime = time.Now()
+    taskRun.Duration = taskRun.EndTime.Sub(taskRun.StartTime).Seconds()
+    taskRun.DataCount = len(processedData)
+
+    if err := w.db.Save(taskRun).Error; err != nil {
+        w.logger.Error("failed to update task run", "error", err)
+    }
+
+    // 8. 记录监控指标
+    w.metrics.taskCounter.WithLabelValues(task.Type, "success").Inc()
+    w.metrics.taskDuration.WithLabelValues(task.Type).Observe(taskRun.Duration)
+    w.metrics.dataCount.WithLabelValues(task.Type).Add(float64(taskRun.DataCount))
+
+    return nil
+}
+```
+
+**任务执行的三阶段详解：**
+
+**阶段1: 数据采集 (Collection)**
+
+```go
+func (w *Worker) collectData(ctx context.Context, task *Task) (*RawData, error) {
+    // 根据任务类型选择采集器
+    collector, err := w.pluginManager.GetCollector(task.CollectionMethod)
+    if err != nil {
+        return nil, fmt.Errorf("collector not found: %w", err)
+    }
+
+    // 调用插件执行采集
+    rawData, err := collector.Collect(ctx, task)
+    if err != nil {
+        return nil, err
+    }
+
+    // 验证采集结果
+    if err := w.validateRawData(rawData); err != nil {
+        return nil, fmt.Errorf("invalid raw data: %w", err)
+    }
+
+    return rawData, nil
+}
+```
+
+支持的采集器类型：
+- **RPA 采集器**: 使用浏览器自动化(Playwright)，用于动态网页
+- **HTTP 采集器**: 使用 HTTP 客户端，用于静态页面和 API
+- **数据库采集器**: 直接查询数据库，用于数据库数据源
+
+**阶段2: 数据处理 (Processing)**
+
+```go
+func (w *Worker) processData(ctx context.Context, task *Task, rawData *RawData) ([]map[string]interface{}, error) {
+    // 获取处理器链 (支持多个处理器顺序执行)
+    processors := w.pluginManager.GetProcessors(task.ProcessorChain)
+
+    var data []map[string]interface{}
+    var err error
+
+    // 依次执行每个处理器
+    for _, processor := range processors {
+        data, err = processor.Process(ctx, rawData)
+        if err != nil {
+            return nil, fmt.Errorf("processor %s failed: %w", processor.Name(), err)
+        }
+        // 将当前处理结果作为下一个处理器的输入
+        rawData = &RawData{Data: data}
+    }
+
+    return data, nil
+}
+```
+
+支持的处理器类型：
+- **HTML 解析器**: 使用 CSS Selector / XPath 提取数据
+- **JSON 解析器**: 使用 JSONPath 提取数据
+- **正则表达式处理器**: 使用正则表达式提取/替换
+- **数据清洗器**: 去重、格式化、类型转换
+- **数据验证器**: 校验数据完整性和准确性
+
+**阶段3: 数据存储 (Storage)**
+
+```go
+func (w *Worker) storeData(ctx context.Context, task *Task, data []map[string]interface{}) error {
+    // 根据任务配置选择存储器
+    storage, err := w.pluginManager.GetStorage(task.StorageType)
+    if err != nil {
+        return fmt.Errorf("storage not found: %w", err)
+    }
+
+    // 批量写入数据
+    if err := storage.Store(ctx, task.TargetTable, data); err != nil {
+        return err
+    }
+
+    return nil
+}
+```
+
+支持的存储器类型：
+- **PostgreSQL 存储器**: 写入 PostgreSQL 数据库
+- **MySQL 存储器**: 写入 MySQL 数据库
+- **MongoDB 存储器**: 写入 MongoDB
+- **文件存储器**: 写入 CSV/JSON 文件
+
+##### 3.2.7.4. 生命周期管理
+
+Worker 节点具有完整的生命周期管理机制，确保可控的启动、运行和停止。
+
+**状态机设计：**
+
+```go
+type WorkerState int
+
+const (
+    StateInitializing WorkerState = iota  // 初始化中
+    StateRegistering                      // 注册中 (向Master注册)
+    StateIdle                             // 空闲 (已注册，等待任务)
+    StateRunning                          // 运行中 (正在执行任务)
+    StateShuttingDown                     // 关闭中
+    StateStopped                          // 已停止
+    StateError                            // 错误状态
+)
+```
+
+**启动流程 (Start)：**
+
+```go
+func (w *Worker) Start(ctx context.Context) error {
+    w.logger.Info("worker starting...", "worker_id", w.id)
+
+    // 1. 加载配置
+    if err := w.loadConfig(); err != nil {
+        return fmt.Errorf("failed to load config: %w", err)
+    }
+
+    // 2. 初始化依赖组件
+    if err := w.initComponents(ctx); err != nil {
+        return fmt.Errorf("failed to init components: %w", err)
+    }
+
+    // 3. 向 Master 注册 (写入 workers 表)
+    if err := w.registerToMaster(ctx); err != nil {
+        return fmt.Errorf("failed to register to master: %w", err)
+    }
+
+    // 4. 启动资源池 (浏览器池、连接池等)
+    if err := w.startResourcePools(ctx); err != nil {
+        return fmt.Errorf("failed to start resource pools: %w", err)
+    }
+
+    // 5. 启动协程池
+    w.startWorkerPool(ctx)
+
+    // 6. 启动任务消费者
+    w.wg.Add(1)
+    go w.consumeTasks(ctx)
+
+    // 7. 启动心跳协程
+    w.wg.Add(1)
+    go w.heartbeat(ctx)
+
+    // 8. 启动健康检查
+    w.wg.Add(1)
+    go w.healthCheck(ctx)
+
+    // 9. 启动指标暴露端点
+    go w.serveMetrics()
+
+    w.setState(StateIdle)
+    w.logger.Info("worker started successfully")
+    return nil
+}
+```
+
+**心跳机制 (Heartbeat)：**
+
+Worker 定期向 Master 上报心跳，Master 通过心跳判断 Worker 是否存活。
+
+```go
+func (w *Worker) heartbeat(ctx context.Context) {
+    defer w.wg.Done()
+
+    ticker := time.NewTicker(30 * time.Second)  // 每30秒一次心跳
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            // 更新 workers 表的 last_heartbeat_at 字段
+            heartbeat := &WorkerHeartbeat{
+                WorkerID:      w.id,
+                Status:        w.getState(),
+                CPUUsage:      w.metrics.getCPUUsage(),
+                MemoryUsage:   w.metrics.getMemoryUsage(),
+                ActiveTasks:   w.getActiveTaskCount(),
+                LastHeartbeat: time.Now(),
+            }
+
+            if err := w.db.Table("workers").
+                Where("id = ?", w.id).
+                Updates(heartbeat).Error; err != nil {
+                w.logger.Error("heartbeat failed", "error", err)
+            }
+        }
+    }
+}
+```
+
+**健康检查 (Health Check)：**
+
+```go
+func (w *Worker) healthCheck(ctx context.Context) {
+    defer w.wg.Done()
+
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            // 检查各组件健康状态
+            checks := []struct {
+                name string
+                check func() error
+            }{
+                {"database", w.checkDatabaseConnection},
+                {"rabbitmq", w.checkMessageQueueConnection},
+                {"redis", w.checkRedisConnection},
+                {"browser_pool", w.checkBrowserPool},
+            }
+
+            allHealthy := true
+            for _, c := range checks {
+                if err := c.check(); err != nil {
+                    w.logger.Error("health check failed", "component", c.name, "error", err)
+                    allHealthy = false
+                }
+            }
+
+            if !allHealthy && w.getState() != StateError {
+                w.setState(StateError)
+                // 可选: 主动停止 Worker，避免执行失败的任务
+            }
+        }
+    }
+}
+```
+
+**优雅停止流程 (Shutdown)：**
+
+```go
+func (w *Worker) Shutdown(ctx context.Context) error {
+    w.logger.Info("worker shutting down...")
+    w.setState(StateShuttingDown)
+
+    // 1. 停止接收新任务
+    w.stopConsuming()
+
+    // 2. 等待正在执行的任务完成 (带超时机制)
+    shutdownTimeout := 5 * time.Minute
+    done := make(chan struct{})
+    go func() {
+        w.wg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        w.logger.Info("all tasks completed gracefully")
+    case <-time.After(shutdownTimeout):
+        w.logger.Warn("shutdown timeout, forcing shutdown")
+    }
+
+    // 3. 关闭资源池
+    w.closeResourcePools()
+
+    // 4. 关闭数据库连接、消息队列连接
+    w.closeConnections()
+
+    // 5. 从 Master 注销
+    w.unregisterFromMaster(ctx)
+
+    w.setState(StateStopped)
+    w.logger.Info("worker stopped successfully")
+    return nil
+}
+```
+
+##### 3.2.7.5. 任务隔离与资源管理
+
+为了防止单个任务消耗过多资源影响其他任务，Worker 实现了多层次的隔离和限制机制。
+
+**1. 协程池隔离**
+
+使用有界协程池限制并发任务数，避免协程数量无限增长导致 OOM：
+
+```go
+type WorkerPool struct {
+    workers    int                    // 协程数量
+    taskChan   chan *Task             // 任务通道
+    wg         sync.WaitGroup
+    ctx        context.Context
+    cancel     context.CancelFunc
+}
+
+func NewWorkerPool(workers int) *WorkerPool {
+    ctx, cancel := context.WithCancel(context.Background())
+    return &WorkerPool{
+        workers:  workers,
+        taskChan: make(chan *Task, workers*2),  // 缓冲区为协程数2倍
+        ctx:      ctx,
+        cancel:   cancel,
+    }
+}
+
+func (p *WorkerPool) Start() {
+    for i := 0; i < p.workers; i++ {
+        p.wg.Add(1)
+        go p.worker(i)
+    }
+}
+
+func (p *WorkerPool) worker(id int) {
+    defer p.wg.Done()
+
+    for {
+        select {
+        case <-p.ctx.Done():
+            return
+        case task := <-p.taskChan:
+            // 执行任务
+            executeTask(p.ctx, task)
+        }
+    }
+}
+```
+
+**配置建议：**
+- **CPU密集型任务** (如数据处理): 协程数 = CPU核心数 * 2
+- **IO密集型任务** (如网络采集): 协程数 = CPU核心数 * 10~20
+- **混合型任务**: 根据实际负载动态调整，建议从 CPU核心数 * 4 开始
+
+**2. 资源限制**
+
+通过 Context 超时控制单个任务的执行时间：
+
+```go
+func (w *Worker) executeTaskWithTimeout(task *Task) error {
+    // 设置任务超时时间
+    timeout := task.Timeout
+    if timeout == 0 {
+        timeout = 5 * time.Minute  // 默认超时
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), timeout)
+    defer cancel()
+
+    // 使用带超时的上下文执行任务
+    resultChan := make(chan error, 1)
+    go func() {
+        resultChan <- w.executeTask(ctx, task)
+    }()
+
+    select {
+    case err := <-resultChan:
+        return err
+    case <-ctx.Done():
+        return fmt.Errorf("task execution timeout after %v", timeout)
+    }
+}
+```
+
+**3. 内存限制 (可选)**
+
+对于需要严格资源隔离的场景，可以使用 cgroups 限制单个任务的内存使用：
+
+```go
+// 使用 Docker 容器运行任务，限制内存和 CPU
+func (w *Worker) executeTaskInContainer(task *Task) error {
+    cli, _ := client.NewClientWithOpts(client.FromEnv)
+
+    // 创建容器，限制资源
+    resp, err := cli.ContainerCreate(ctx, &container.Config{
+        Image: "datafusion-task-runner:latest",
+        Cmd:   []string{"run-task", task.ID},
+    }, &container.HostConfig{
+        Resources: container.Resources{
+            Memory:   512 * 1024 * 1024,  // 512MB
+            NanoCPUs: 1000000000,          // 1 CPU
+        },
+    }, nil, nil, "")
+
+    // 启动容器并等待执行完成
+    // ...
+}
+```
+
+**4. 并发令牌管理**
+
+通过 Redis 实现分布式令牌桶，限制全局并发数：
+
+```go
+type ConcurrencyController struct {
+    redis       *redis.Client
+    globalLimit int
+}
+
+func (c *ConcurrencyController) AcquireToken(ctx context.Context, taskID string) (bool, error) {
+    // 使用 Lua 脚本保证原子性
+    script := `
+        local current = redis.call('GET', KEYS[1])
+        if current == false then
+            current = 0
+        end
+        if tonumber(current) < tonumber(ARGV[1]) then
+            redis.call('INCR', KEYS[1])
+            return 1
+        else
+            return 0
+        end
+    `
+
+    result, err := c.redis.Eval(ctx, script, []string{"global_concurrency"}, c.globalLimit).Int()
+    return result == 1, err
+}
+
+func (c *ConcurrencyController) ReleaseToken(ctx context.Context, taskID string) error {
+    return c.redis.Decr(ctx, "global_concurrency").Err()
+}
+```
+
+##### 3.2.7.6. 可靠性保障
+
+**1. 故障恢复机制**
+
+Worker 节点重启后，需要处理重启前未完成的任务：
+
+```go
+func (w *Worker) recoverFromCrash(ctx context.Context) error {
+    // 查询数据库中状态为 RUNNING 的任务 (worker_id = 当前worker)
+    var runningTasks []TaskRun
+    err := w.db.Where("worker_id = ? AND status = ?", w.id, StatusRunning).
+        Find(&runningTasks).Error
+    if err != nil {
+        return err
+    }
+
+    w.logger.Info("recovering crashed tasks", "count", len(runningTasks))
+
+    for _, taskRun := range runningTasks {
+        // 将任务标记为失败，并重新入队
+        taskRun.Status = StatusFailed
+        taskRun.Error = "worker crashed during execution"
+        taskRun.EndTime = time.Now()
+
+        if err := w.db.Save(&taskRun).Error; err != nil {
+            w.logger.Error("failed to update crashed task", "task_run_id", taskRun.ID, "error", err)
+        }
+
+        // 重新发布任务到队列 (根据重试策略)
+        if taskRun.RetryCount < taskRun.MaxRetries {
+            w.republishTask(ctx, taskRun.TaskID)
+        }
+    }
+
+    return nil
+}
+```
+
+**2. 任务超时处理**
+
+通过 Context 超时机制，确保任务不会无限期执行：
+
+```go
+func (w *Worker) executeTask(ctx context.Context, task *Task) error {
+    // 创建带超时的 Context
+    taskCtx, cancel := context.WithTimeout(ctx, task.Timeout)
+    defer cancel()
+
+    // 创建错误通道
+    errChan := make(chan error, 1)
+
+    // 在新协程中执行任务
+    go func() {
+        errChan <- w.doExecuteTask(taskCtx, task)
+    }()
+
+    // 等待任务完成或超时
+    select {
+    case err := <-errChan:
+        return err
+    case <-taskCtx.Done():
+        // 超时处理
+        w.logger.Warn("task execution timeout", "task_id", task.ID, "timeout", task.Timeout)
+
+        // 清理资源 (关闭浏览器、中断数据库查询等)
+        w.cleanupTask(task)
+
+        return fmt.Errorf("task timeout after %v", task.Timeout)
+    }
+}
+```
+
+**3. 异常处理策略**
+
+采用分层错误处理机制，区分不同类型的错误：
+
+```go
+// 错误分类
+type ErrorCategory string
+
+const (
+    ErrorCategoryTransient   ErrorCategory = "transient"   // 瞬时错误，可重试
+    ErrorCategoryPermanent   ErrorCategory = "permanent"   // 永久错误，不可重试
+    ErrorCategoryRateLimited ErrorCategory = "rate_limited" // 限流错误，延迟重试
+)
+
+func (w *Worker) handleTaskError(task *Task, err error) ErrorCategory {
+    switch {
+    // 网络错误 - 瞬时错误
+    case errors.Is(err, syscall.ECONNREFUSED),
+         errors.Is(err, syscall.ETIMEDOUT),
+         strings.Contains(err.Error(), "timeout"):
+        return ErrorCategoryTransient
+
+    // HTTP 429 - 限流
+    case strings.Contains(err.Error(), "429"),
+         strings.Contains(err.Error(), "rate limit"):
+        return ErrorCategoryRateLimited
+
+    // 配置错误、数据源不存在 - 永久错误
+    case strings.Contains(err.Error(), "not found"),
+         strings.Contains(err.Error(), "invalid config"):
+        return ErrorCategoryPermanent
+
+    default:
+        // 默认视为瞬时错误
+        return ErrorCategoryTransient
+    }
+}
+
+func (w *Worker) retryTask(task *Task, err error) error {
+    category := w.handleTaskError(task, err)
+
+    switch category {
+    case ErrorCategoryTransient:
+        // 指数退避重试: 1s, 2s, 4s, 8s, 16s
+        delay := time.Duration(math.Pow(2, float64(task.RetryCount))) * time.Second
+        w.scheduleRetry(task, delay)
+
+    case ErrorCategoryRateLimited:
+        // 延迟较长时间后重试 (如 1 分钟)
+        w.scheduleRetry(task, 1*time.Minute)
+
+    case ErrorCategoryPermanent:
+        // 不重试，直接标记失败
+        w.markTaskFailed(task, err)
+    }
+
+    return nil
+}
+```
+
+**4. Panic 恢复**
+
+防止单个任务 panic 导致整个 Worker 进程崩溃：
+
+```go
+func (w *Worker) executeTaskSafely(ctx context.Context, task *Task) (err error) {
+    // 捕获 panic
+    defer func() {
+        if r := recover(); r != nil {
+            // 记录堆栈信息
+            stack := debug.Stack()
+            w.logger.Error("task panic",
+                "task_id", task.ID,
+                "panic", r,
+                "stack", string(stack))
+
+            err = fmt.Errorf("task panic: %v", r)
+
+            // 上报到监控系统
+            w.metrics.panicCounter.WithLabelValues(task.Type).Inc()
+        }
+    }()
+
+    // 执行任务
+    return w.executeTask(ctx, task)
+}
+```
+
+##### 3.2.7.7. 性能优化
+
+**1. 资源池化**
+
+通过资源池复用，减少资源创建和销毁的开销。
+
+**浏览器池 (Browser Pool)：**
+
+```go
+type BrowserPool struct {
+    pool    chan playwright.Browser
+    maxSize int
+}
+
+func NewBrowserPool(maxSize int) (*BrowserPool, error) {
+    pool := &BrowserPool{
+        pool:    make(chan playwright.Browser, maxSize),
+        maxSize: maxSize,
+    }
+
+    // 预创建浏览器实例
+    for i := 0; i < maxSize; i++ {
+        browser, err := playwright.Chromium.Launch()
+        if err != nil {
+            return nil, err
+        }
+        pool.pool <- browser
+    }
+
+    return pool, nil
+}
+
+func (p *BrowserPool) Acquire(ctx context.Context) (playwright.Browser, error) {
+    select {
+    case browser := <-p.pool:
+        return browser, nil
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    }
+}
+
+func (p *BrowserPool) Release(browser playwright.Browser) {
+    select {
+    case p.pool <- browser:
+    default:
+        // 池已满，关闭浏览器
+        browser.Close()
+    }
+}
+```
+
+**数据库连接池：**
+
+```go
+// GORM 自动管理连接池，只需配置参数
+db.DB().SetMaxOpenConns(100)         // 最大打开连接数
+db.DB().SetMaxIdleConns(10)          // 最大空闲连接数
+db.DB().SetConnMaxLifetime(time.Hour) // 连接最大生命周期
+```
+
+**2. 批量处理**
+
+对于大量小任务，使用批量处理提升吞吐量：
+
+```go
+type BatchProcessor struct {
+    batchSize int
+    buffer    []*Task
+    mu        sync.Mutex
+}
+
+func (b *BatchProcessor) Add(task *Task) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    b.buffer = append(b.buffer, task)
+
+    // 达到批量大小，执行批处理
+    if len(b.buffer) >= b.batchSize {
+        b.flush()
+    }
+}
+
+func (b *BatchProcessor) flush() {
+    if len(b.buffer) == 0 {
+        return
+    }
+
+    // 批量执行任务
+    tasks := b.buffer
+    b.buffer = nil
+
+    go b.executeBatch(tasks)
+}
+
+func (b *BatchProcessor) executeBatch(tasks []*Task) {
+    // 批量数据采集
+    rawDataList := b.batchCollect(tasks)
+
+    // 批量数据处理
+    processedDataList := b.batchProcess(rawDataList)
+
+    // 批量数据存储 (使用一个事务)
+    b.batchStore(processedDataList)
+}
+```
+
+**3. 缓存策略**
+
+对于重复的数据采集请求，使用缓存避免重复工作：
+
+```go
+type CacheManager struct {
+    redis  *redis.Client
+    ttl    time.Duration
+}
+
+func (c *CacheManager) Get(ctx context.Context, key string) ([]byte, error) {
+    return c.redis.Get(ctx, key).Bytes()
+}
+
+func (c *CacheManager) Set(ctx context.Context, key string, value []byte) error {
+    return c.redis.Set(ctx, key, value, c.ttl).Err()
+}
+
+// 在任务执行前检查缓存
+func (w *Worker) executeTaskWithCache(ctx context.Context, task *Task) error {
+    // 生成缓存键 (基于任务配置的哈希)
+    cacheKey := task.GetCacheKey()
+
+    // 尝试从缓存获取
+    if cached, err := w.cache.Get(ctx, cacheKey); err == nil {
+        w.logger.Info("task result found in cache", "task_id", task.ID)
+        return w.storeCachedResult(task, cached)
+    }
+
+    // 缓存未命中，执行任务
+    if err := w.executeTask(ctx, task); err != nil {
+        return err
+    }
+
+    // 将结果写入缓存
+    result := w.getTaskResult(task)
+    w.cache.Set(ctx, cacheKey, result)
+
+    return nil
+}
+```
+
+**4. 异步写入**
+
+使用异步写入减少任务执行耗时：
+
+```go
+type AsyncWriter struct {
+    dataChan chan *WriteRequest
+    workers  int
+}
+
+type WriteRequest struct {
+    Table string
+    Data  []map[string]interface{}
+}
+
+func NewAsyncWriter(workers int) *AsyncWriter {
+    w := &AsyncWriter{
+        dataChan: make(chan *WriteRequest, 1000),
+        workers:  workers,
+    }
+
+    // 启动写入协程
+    for i := 0; i < workers; i++ {
+        go w.writeWorker()
+    }
+
+    return w
+}
+
+func (w *AsyncWriter) Write(req *WriteRequest) {
+    w.dataChan <- req
+}
+
+func (w *AsyncWriter) writeWorker() {
+    for req := range w.dataChan {
+        // 批量写入数据库
+        db.Table(req.Table).CreateInBatches(req.Data, 100)
+    }
+}
+```
+
+##### 3.2.7.8. 监控与可观测性
+
+Worker 节点需要暴露丰富的监控指标，便于运维人员了解运行状态。
+
+**1. Prometheus 指标暴露**
+
+```go
+// 定义指标
+var (
+    // 任务计数器
+    taskCounter = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "datafusion_worker_task_total",
+            Help: "Total number of tasks processed by worker",
+        },
+        []string{"task_type", "status"},
+    )
+
+    // 任务执行时长
+    taskDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "datafusion_worker_task_duration_seconds",
+            Help:    "Task execution duration in seconds",
+            Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600},
+        },
+        []string{"task_type"},
+    )
+
+    // 活跃任务数
+    activeTasks = prometheus.NewGauge(
+        prometheus.GaugeOpts{
+            Name: "datafusion_worker_active_tasks",
+            Help: "Number of currently active tasks",
+        },
+    )
+
+    // 资源使用率
+    cpuUsage = prometheus.NewGauge(
+        prometheus.GaugeOpts{
+            Name: "datafusion_worker_cpu_usage_percent",
+            Help: "Worker CPU usage percentage",
+        },
+    )
+
+    memoryUsage = prometheus.NewGauge(
+        prometheus.GaugeOpts{
+            Name: "datafusion_worker_memory_usage_bytes",
+            Help: "Worker memory usage in bytes",
+        },
+    )
+
+    // 浏览器池指标
+    browserPoolSize = prometheus.NewGauge(
+        prometheus.GaugeOpts{
+            Name: "datafusion_worker_browser_pool_size",
+            Help: "Number of browsers in the pool",
+        },
+    )
+)
+
+// 注册指标
+func init() {
+    prometheus.MustRegister(taskCounter)
+    prometheus.MustRegister(taskDuration)
+    prometheus.MustRegister(activeTasks)
+    prometheus.MustRegister(cpuUsage)
+    prometheus.MustRegister(memoryUsage)
+    prometheus.MustRegister(browserPoolSize)
+}
+
+// 启动指标暴露端点
+func (w *Worker) serveMetrics() {
+    http.Handle("/metrics", promhttp.Handler())
+    http.ListenAndServe(":9091", nil)
+}
+```
+
+**2. 结构化日志**
+
+使用结构化日志便于日志查询和分析：
+
+```go
+// 使用 zap 作为日志库
+logger, _ := zap.NewProduction()
+
+// 记录任务开始
+logger.Info("task started",
+    zap.String("task_id", task.ID),
+    zap.String("task_type", task.Type),
+    zap.String("worker_id", w.id),
+    zap.Time("start_time", time.Now()),
+)
+
+// 记录任务成功
+logger.Info("task succeeded",
+    zap.String("task_id", task.ID),
+    zap.Duration("duration", duration),
+    zap.Int("data_count", dataCount),
+)
+
+// 记录任务失败
+logger.Error("task failed",
+    zap.String("task_id", task.ID),
+    zap.Error(err),
+    zap.String("error_category", category),
+    zap.Int("retry_count", retryCount),
+)
+```
+
+**日志输出格式 (JSON)：**
+
+```json
+{
+  "level": "info",
+  "ts": "2025-11-24T10:30:00.123Z",
+  "msg": "task started",
+  "task_id": "task_123",
+  "task_type": "rpa",
+  "worker_id": "worker_001",
+  "start_time": "2025-11-24T10:30:00.123Z"
+}
+```
+
+**3. 分布式追踪**
+
+集成 OpenTelemetry 实现全链路追踪：
+
+```go
+import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/trace"
+)
+
+func (w *Worker) executeTaskWithTracing(ctx context.Context, task *Task) error {
+    // 创建 Span
+    tracer := otel.Tracer("worker")
+    ctx, span := tracer.Start(ctx, "execute_task",
+        trace.WithAttributes(
+            attribute.String("task.id", task.ID),
+            attribute.String("task.type", task.Type),
+            attribute.String("worker.id", w.id),
+        ),
+    )
+    defer span.End()
+
+    // 数据采集阶段
+    ctx, collectSpan := tracer.Start(ctx, "collect_data")
+    rawData, err := w.collectData(ctx, task)
+    collectSpan.End()
+    if err != nil {
+        span.RecordError(err)
+        return err
+    }
+
+    // 数据处理阶段
+    ctx, processSpan := tracer.Start(ctx, "process_data")
+    processedData, err := w.processData(ctx, task, rawData)
+    processSpan.End()
+    if err != nil {
+        span.RecordError(err)
+        return err
+    }
+
+    // 数据存储阶段
+    ctx, storeSpan := tracer.Start(ctx, "store_data")
+    err = w.storeData(ctx, task, processedData)
+    storeSpan.End()
+    if err != nil {
+        span.RecordError(err)
+        return err
+    }
+
+    span.SetStatus(codes.Ok, "task executed successfully")
+    return nil
+}
+```
+
+通过 Jaeger UI 可以看到完整的任务执行链路：
+
+```
+API Request → Master Scheduler → Worker Task Execution
+                                      ├─ Collect Data (5.2s)
+                                      ├─ Process Data (0.3s)
+                                      └─ Store Data (0.1s)
+                                      Total: 5.6s
+```
+
+**4. 关键指标监控**
+
+Worker 节点需要重点关注以下指标：
+
+| 指标类别 | 指标名称 | 说明 | 告警阈值 |
+|---------|---------|------|---------|
+| **任务执行** | `task_success_rate` | 任务成功率 | < 95% |
+| | `task_duration_p99` | 任务执行耗时 P99 | > 5min |
+| | `active_tasks` | 当前活跃任务数 | > 协程池大小*0.9 |
+| **资源使用** | `cpu_usage_percent` | CPU 使用率 | > 80% |
+| | `memory_usage_bytes` | 内存使用量 | > 80% |
+| | `goroutine_count` | 协程数量 | > 10000 |
+| **依赖服务** | `browser_pool_available` | 可用浏览器数 | < 2 |
+| | `db_connection_errors` | 数据库连接错误数 | > 0 |
+| | `mq_connection_status` | 消息队列连接状态 | 断开 |
+
 #### 3.2.8. 插件架构
 
-为了实现系统的可扩展性，**DataFusion** 采用了插件化架构设计。核心功能模块（采集器、解析器、存储器）均通过插件接口进行扩展：
+插件架构是 **DataFusion** 系统实现可扩展性的核心设计。通过插件化机制,系统能够在不修改核心代码的前提下,灵活扩展数据采集源、处理逻辑和存储目标,满足不同业务场景的定制化需求。
 
-![插件架构图](diagrams/plugin_architecture.png)
+##### 3.2.8.1. 总体架构设计
 
-插件系统的设计使得开发者可以方便地扩展新的数据源类型、解析规则和存储目标，而无需修改核心代码。
+**模块定位与价值**
+
+插件系统是 DataFusion 的扩展性基础设施,通过标准化的插件接口和生命周期管理,实现了以下核心价值:
+
+1. **松耦合扩展**:插件与核心系统通过接口隔离,避免强依赖
+2. **多语言支持**:支持 Go、Python、Node.js 等多种语言开发插件
+3. **热插拔能力**:支持运行时动态加载/卸载插件,无需重启 Worker
+4. **安全隔离**:插件运行在独立进程,崩溃不影响 Worker 稳定性
+5. **统一管理**:集中式注册、配置、监控和版本管理
+
+**插件系统总体架构**
+
+![插件系统架构图](diagrams/plugin_system_architecture.png)
+
+插件系统采用分层架构设计,主要包括三层:
+
+1. **插件管理层 (Plugin Management Layer)**
+   - **Plugin Manager**:负责插件的注册、生命周期管理、配置管理和健康监控
+   - **Plugin Loader**:负责插件的发现、加载、版本管理和依赖解析
+   - **Communication Hub**:负责 Worker 与插件之间的通信路由(gRPC/Stdin/Stdout)
+
+2. **插件层 (Plugin Layer)**
+   - **采集器插件 (Collector Plugins)**:RPA Collector、API Collector、Database Collector 等
+   - **处理器插件 (Processor Plugins)**:HTML Parser、JSON Parser、Data Cleaner、Data Transformer 等
+   - **存储器插件 (Storage Plugins)**:PostgreSQL Storage、MongoDB Storage、File Storage 等
+
+3. **插件运行环境 (Plugin Runtime)**
+   - **Process Isolator**:通过 cgroups 实现资源隔离和限制
+   - **Security Controller**:权限检查和代码签名验证
+
+**设计原则**
+
+1. **接口统一**:所有插件实现统一的 `Plugin` 接口,保证一致性
+2. **松耦合**:插件与核心系统通过 gRPC/Stdin 通信,可独立开发、部署
+3. **热插拔**:支持运行时加载/卸载插件,无需重启 Worker
+4. **语言无关**:支持多语言编写插件,通过标准通信协议交互
+5. **安全隔离**:插件运行在独立进程,通过 cgroups 限制资源使用
+
+**技术选型**
+
+| 技术点 | 选型 | 理由 |
+|-------|------|------|
+| 插件通信协议 | gRPC | 高性能、跨语言、类型安全、支持流式传输 |
+| 备用通信方式 | Stdin/Stdout | 轻量级、适合脚本插件、开发简单 |
+| 插件加载方式 | Go plugin + 独立进程 | Go plugin 用于 Go 插件,独立进程支持多语言 |
+| 配置验证 | JSON Schema | 标准化、生态成熟、支持复杂验证规则 |
+| 资源隔离 | cgroups v2 | Linux 内核原生支持,可靠稳定 |
+| 插件发现 | 文件系统扫描 + 配置注册 | 简单可靠、支持热加载 |
+| 元数据存储 | PostgreSQL + Redis | 持久化存储 + 缓存加速 |
+
+##### 3.2.8.2. 插件接口设计
+
+插件系统定义了统一的插件接口,所有插件必须实现 `Plugin` 接口,同时根据插件类型实现对应的专用接口(`CollectorPlugin`、`ProcessorPlugin`、`StoragePlugin`)。接口设计遵循 Go 语言的组合模式,通过接口嵌入实现功能扩展。三大插件类型各有专门的数据结构定义:采集器插件输出 `RawData`,处理器插件输入 `RawData` 输出 `ProcessedData`,存储器插件接收 `ProcessedData` 并写入目标存储。这种设计确保了数据在不同插件间流转的类型安全性。
+
+##### 3.2.8.3. 插件生命周期管理
+
+插件生命周期管理器 (`LifecycleManager`) 负责管理插件从注册到卸载的完整生命周期。插件状态包括:未注册 (Unregistered)、已注册 (Registered)、加载中 (Loading)、已加载 (Loaded)、初始化中 (Initializing)、运行中 (Running)、暂停 (Paused)、停止中 (Stopping)、已停止 (Stopped)、失败 (Failed)、卸载中 (Unloading)、已卸载 (Unloaded)。
+
+![插件生命周期状态图](diagrams/plugin_lifecycle.png)
+
+生命周期管理器提供了 `LoadPlugin`、`InitializePlugin`、`StopPlugin`、`UnloadPlugin` 等方法控制插件状态转换,并通过健康检查协程定期检测插件健康状态。当插件连续失败超过3次时,自动标记为 Failed 状态。插件停止时支持优雅关闭 (10秒超时),超时后强制终止进程。
+
+##### 3.2.8.4. 插件通信机制
+
+插件与 Worker 之间支持两种通信方式:**gRPC 通信**和 **Stdin/Stdout 通信**。
+
+![插件通信序列图](diagrams/plugin_communication.png)
+
+**gRPC 通信**用于长驻进程插件,具有高性能、支持并发、强类型安全等优点,适合高频调用场景。gRPC 插件通过 Protobuf 定义服务接口,包括 `Execute`、`HealthCheck`、`Shutdown` 三个 RPC 方法。Worker 通过 `GRPCPluginClient` 与插件建立持久连接,避免重复启动开销。
+
+**Stdin/Stdout 通信**用于脚本式插件,通过标准输入输出传递 JSON 数据,支持任意语言开发(Python/Node.js/Shell),开发复杂度低,适合低频调用和快速原型开发。每次调用启动独立进程,执行完毕后进程退出,资源按需占用。
+
+两种通信方式的选择取决于插件调用频率、性能要求和开发语言限制。系统提供了统一的 `PluginClient` 接口,屏蔽通信方式差异,Worker 无需关心插件具体采用哪种通信方式。
+
+##### 3.2.8.5. 三大插件类型详细设计
+
+**1. 采集器插件 (Collector Plugin)**
+
+采集器插件负责从外部数据源采集原始数据,系统内置了 RPA Collector、API Collector、Database Collector 三类插件(详见 3.2.3节)。开发者可基于 `CollectorPlugin` 接口开发自定义采集器,实现 `Collect` 方法执行数据采集逻辑,返回 `RawData` 结构。
+
+**2. 处理器插件 (Processor Plugin)**
+
+处理器插件负责将原始数据转换为结构化数据,系统内置了 HTML Parser、JSON Parser、Data Cleaner、Data Transformer 等插件(详见 3.2.4节)。处理器插件支持链式调用,通过 `ProcessorChain` 将多个处理器串联,实现复杂的数据处理流程。
+
+**3. 存储器插件 (Storage Plugin)**
+
+存储器插件负责将处理后的数据写入目标存储系统,系统内置了 PostgreSQL Storage、MongoDB Storage、File Storage 等插件(详见 3.2.5节)。存储器插件支持单条写入 (`Write`)、批量写入 (`WriteBatch`)和事务操作 (`BeginTransaction`),确保数据写入的可靠性和原子性。
+
+##### 3.2.8.6. 插件注册与发现
+
+插件注册中心 (`PluginRegistry`) 负责管理所有插件的元数据和运行时实例,采用三层存储架构:内存(map)、缓存(Redis)、持久化(PostgreSQL)。
+
+![插件注册类图](diagrams/plugin_registry.png)
+
+每个插件必须提供 `plugin.yaml` 元数据文件,声明插件的基本信息、依赖关系、运行时配置和配置 Schema。插件注册流程包括:验证元数据 → 检查依赖 → 持久化到数据库 → 更新内存和缓存。插件注销前会检查是否被其他插件依赖,防止破坏依赖关系。
+
+插件发现服务 (`DiscoveryService`) 支持自动扫描指定目录,加载 `plugin.yaml` 文件并自动注册到 Registry。系统启动时执行一次全量扫描,运行时通过 `fsnotify` 监听文件变化,支持热加载新插件。
+
+##### 3.2.8.7. 插件配置管理
+
+配置管理器 (`ConfigManager`) 负责插件配置的加载、验证和热更新。配置采用三层存储:Redis 缓存、PostgreSQL 持久化、内存。配置验证基于 JSON Schema,确保配置符合插件定义的 Schema 规范。
+
+配置热更新通过 Redis Pub/Sub 实现:配置更新时发布通知,所有 Worker 订阅配置变更事件,收到通知后重新加载配置。这种机制确保了配置变更能够实时生效,无需重启服务。
+
+插件配置支持环境变量引用(如 `${POSTGRES_PASSWORD}`),增强了配置的灵活性和安全性,敏感信息可通过环境变量注入,避免明文存储。
+
+##### 3.2.8.8. 插件安全与隔离
+
+插件安全通过多层次机制保障:
+
+**1. 进程隔离**:每个插件运行在独立进程中,通过进程边界实现隔离,插件崩溃不影响 Worker 稳定性。
+
+**2. 资源限制**:通过 Linux cgroups v2 限制插件的 CPU、内存使用,防止资源耗尽。`ResourceLimiter` 负责创建 cgroup、设置资源限额并将插件进程加入cgroup。
+
+**3. 权限控制**:通过白名单机制限制插件的文件、网络、数据库访问权限,`SecurityController` 在插件执行前检查权限,拒绝未授权操作。
+
+**4. 代码签名**:生产环境可启用 RSA 签名验证,确保插件未被篡改。`SignatureValidator` 在加载插件前验证数字签名,防止恶意插件注入。
+
+**安全机制总结**
+
+| 安全机制 | 实现方式 | 防护目标 |
+|---------|---------|---------|
+| **进程隔离** | 独立进程 | 插件崩溃不影响 Worker |
+| **资源限制** | cgroups (CPU/Memory) | 防止资源耗尽 |
+| **权限控制** | 白名单机制 | 限制文件/网络/数据库访问 |
+| **代码签名** | RSA 签名验证 | 防止插件篡改 |
+| **超时控制** | Context 超时 | 防止插件卡死 |
+| **错误隔离** | 错误捕获与重试 | 单个插件失败不影响其他插件 |
+
+---
+
+通过以上设计,DataFusion 的插件架构实现了**高扩展性、高安全性、高可靠性**的目标,为系统提供了灵活的扩展能力,同时确保了核心系统的稳定性和安全性。
 
 ### 3.3. 核心类设计
 
-系统的核心业务逻辑通过以下类和接口进行建模：
+系统的核心业务逻辑通过以下类和接口进行建模。本节从架构师视角，采用**按模块划分、模块内按层次组织**的方式，重点阐述系统的接口设计和抽象层次，体现依赖倒置、接口隔离等SOLID原则。
 
 ![类图](diagrams/class_diagram.png)
 
 类图展示了系统的主要领域模型，包括任务管理域、数据源域、采集器域、处理器域、存储器域和调度域。各个类之间通过清晰的接口和依赖关系进行协作，体现了面向对象设计的封装、继承和多态原则。
 
+#### 3.3.1. 任务管理模块类设计
+
+任务管理模块负责任务的生命周期管理，采用三层设计：接口层定义契约，抽象类层提供通用实现，具体实现类层处理业务逻辑。
+
+##### 3.3.1.1. 核心接口层
+
+任务管理模块定义了以下核心接口，遵循接口隔离原则，将职责划分为细粒度接口：
+
+```go
+// ITask 任务实体接口，定义任务的基本属性和行为
+type ITask interface {
+    GetID() string
+    GetName() string
+    GetType() TaskType
+    GetConfig() *TaskConfig
+    GetStatus() TaskStatus
+    Validate(ctx context.Context) error
+}
+
+// ITaskManager 任务管理器接口，负责任务的CRUD操作
+type ITaskManager interface {
+    CreateTask(ctx context.Context, task ITask) error
+    UpdateTask(ctx context.Context, taskID string, updates map[string]interface{}) error
+    DeleteTask(ctx context.Context, taskID string) error
+    GetTask(ctx context.Context, taskID string) (ITask, error)
+    ListTasks(ctx context.Context, filter TaskFilter) ([]ITask, error)
+}
+
+// ITaskExecutor 任务执行器接口，负责任务的执行逻辑
+type ITaskExecutor interface {
+    Execute(ctx context.Context, task ITask) (*ExecutionResult, error)
+    Cancel(ctx context.Context, taskID string) error
+    GetExecutionStatus(ctx context.Context, executionID string) (*ExecutionStatus, error)
+}
+
+// ITaskInstanceManager 任务实例管理接口，管理任务的运行实例
+type ITaskInstanceManager interface {
+    CreateInstance(ctx context.Context, taskID string) (*TaskInstance, error)
+    UpdateInstanceStatus(ctx context.Context, instanceID string, status TaskStatus) error
+    GetInstance(ctx context.Context, instanceID string) (*TaskInstance, error)
+    ListInstances(ctx context.Context, taskID string, limit int) ([]*TaskInstance, error)
+}
+```
+
+**接口方法说明：**
+
+| 接口 | 核心方法 | 职责描述 |
+|------|---------|---------|
+| `ITask` | `Validate()` | 验证任务配置的有效性，确保任务可执行 |
+| `ITaskManager` | `CreateTask()`, `ListTasks()` | 任务元数据管理，支持过滤和分页查询 |
+| `ITaskExecutor` | `Execute()`, `Cancel()` | 任务执行控制，支持异步执行和取消操作 |
+| `ITaskInstanceManager` | `CreateInstance()` | 为每次任务执行创建独立实例，实现运行隔离 |
+
+**接口组合示例：**
+
+```go
+// TaskService 通过组合多个接口提供完整的任务管理能力
+type TaskService struct {
+    manager   ITaskManager
+    executor  ITaskExecutor
+    instances ITaskInstanceManager
+}
+
+func (s *TaskService) ExecuteTask(ctx context.Context, taskID string) error {
+    // 获取任务定义
+    task, err := s.manager.GetTask(ctx, taskID)
+    if err != nil {
+        return err
+    }
+
+    // 创建执行实例
+    instance, err := s.instances.CreateInstance(ctx, taskID)
+    if err != nil {
+        return err
+    }
+
+    // 执行任务
+    _, err = s.executor.Execute(ctx, task)
+    return err
+}
+```
+
+##### 3.3.1.2. 抽象类层
+
+`BaseTask` 抽象类提供任务的通用实现，减少重复代码：
+
+```go
+// BaseTask 任务基类，实现ITask接口的通用逻辑
+type BaseTask struct {
+    ID          string
+    Name        string
+    Type        TaskType
+    Config      *TaskConfig
+    Status      TaskStatus
+    CreatedAt   time.Time
+    UpdatedAt   time.Time
+    mu          sync.RWMutex
+}
+
+// GetID 获取任务ID（线程安全）
+func (t *BaseTask) GetID() string {
+    t.mu.RLock()
+    defer t.mu.RUnlock()
+    return t.ID
+}
+
+// GetStatus 获取任务状态（线程安全）
+func (t *BaseTask) GetStatus() TaskStatus {
+    t.mu.RLock()
+    defer t.mu.RUnlock()
+    return t.Status
+}
+
+// Validate 默认验证实现，子类可覆盖
+func (t *BaseTask) Validate(ctx context.Context) error {
+    if t.ID == "" {
+        return errors.New("task ID is required")
+    }
+    if t.Config == nil {
+        return errors.New("task config is required")
+    }
+    return nil
+}
+```
+
+##### 3.3.1.3. 实现类层
+
+核心实现类包括 `TaskManager`（任务管理器）和 `TaskInstance`（任务实例）：
+
+```go
+// TaskManager 任务管理器实现
+type TaskManager struct {
+    db          *sql.DB
+    cache       ICache
+    validator   IValidator
+    eventBus    IEventBus
+}
+
+// CreateTask 创建任务，包含事务处理和事件发布
+func (m *TaskManager) CreateTask(ctx context.Context, task ITask) error {
+    // 验证任务
+    if err := task.Validate(ctx); err != nil {
+        return fmt.Errorf("task validation failed: %w", err)
+    }
+
+    // 持久化到数据库
+    tx, err := m.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
+
+    // 插入任务记录
+    _, err = tx.ExecContext(ctx, "INSERT INTO tasks (...) VALUES (...)")
+    if err != nil {
+        return err
+    }
+
+    if err := tx.Commit(); err != nil {
+        return err
+    }
+
+    // 发布任务创建事件
+    m.eventBus.Publish("task.created", task)
+    return nil
+}
+
+// TaskInstance 任务实例，记录每次执行的状态
+type TaskInstance struct {
+    ID              string
+    TaskID          string
+    Status          TaskStatus
+    StartTime       time.Time
+    EndTime         *time.Time
+    ExecutionLog    string
+    RetryCount      int
+    ErrorMessage    string
+}
+```
+
+#### 3.3.2. 调度引擎模块类设计
+
+调度引擎负责任务的定时触发和优先级调度，采用分层接口设计支持多种调度策略。
+
+##### 3.3.2.1. 核心接口层
+
+```go
+// IScheduler 调度器核心接口
+type IScheduler interface {
+    Start(ctx context.Context) error
+    Stop(ctx context.Context) error
+    Schedule(ctx context.Context, task ITask, trigger ITrigger) error
+    Unschedule(ctx context.Context, taskID string) error
+    Pause(ctx context.Context, taskID string) error
+    Resume(ctx context.Context, taskID string) error
+}
+
+// ITrigger 触发器接口，定义任务触发时机
+type ITrigger interface {
+    GetNextFireTime(ctx context.Context, lastFireTime time.Time) (time.Time, error)
+    GetCronExpression() string
+    Validate() error
+}
+
+// ITaskQueue 任务队列接口，支持优先级调度
+type ITaskQueue interface {
+    Enqueue(ctx context.Context, task *QueuedTask) error
+    Dequeue(ctx context.Context) (*QueuedTask, error)
+    Peek(ctx context.Context) (*QueuedTask, error)
+    Size(ctx context.Context) (int, error)
+    Remove(ctx context.Context, taskID string) error
+}
+
+// IConcurrencyController 并发控制器接口
+type IConcurrencyController interface {
+    AcquireSlot(ctx context.Context, taskID string) (bool, error)
+    ReleaseSlot(ctx context.Context, taskID string) error
+    GetCurrentLoad(ctx context.Context) (int, int, error) // 返回 (当前并发数, 最大并发数)
+    SetMaxConcurrency(maxConcurrency int) error
+}
+```
+
+**接口设计说明：**
+
+| 接口 | 设计目的 | 扩展性 |
+|------|---------|--------|
+| `ITrigger` | 抽象触发时机，支持Cron、固定间隔、手动触发等多种策略 | 新增触发策略只需实现此接口 |
+| `ITaskQueue` | 抽象队列实现，可使用内存队列、Redis队列、消息队列等 | 支持不同的队列后端 |
+| `IConcurrencyController` | 并发控制抽象，支持本地限流、分布式限流等 | 支持多种限流策略 |
+
+##### 3.3.2.2. 抽象类层
+
+```go
+// BaseTrigger 触发器基类
+type BaseTrigger struct {
+    CronExpression string
+    Timezone       *time.Location
+    mu             sync.RWMutex
+}
+
+// GetCronExpression 获取Cron表达式
+func (t *BaseTrigger) GetCronExpression() string {
+    t.mu.RLock()
+    defer t.mu.RUnlock()
+    return t.CronExpression
+}
+
+// Validate 验证Cron表达式
+func (t *BaseTrigger) Validate() error {
+    _, err := cron.ParseStandard(t.CronExpression)
+    return err
+}
+```
+
+##### 3.3.2.3. 实现类层
+
+```go
+// CronScheduler Cron调度器实现
+type CronScheduler struct {
+    cron        *cron.Cron
+    taskQueue   ITaskQueue
+    executor    ITaskExecutor
+    concurrency IConcurrencyController
+    tasks       map[string]*ScheduledTask
+    mu          sync.RWMutex
+}
+
+// Schedule 调度任务
+func (s *CronScheduler) Schedule(ctx context.Context, task ITask, trigger ITrigger) error {
+    if err := trigger.Validate(); err != nil {
+        return fmt.Errorf("invalid trigger: %w", err)
+    }
+
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    // 添加到Cron调度器
+    entryID, err := s.cron.AddFunc(trigger.GetCronExpression(), func() {
+        // 检查并发限制
+        acquired, _ := s.concurrency.AcquireSlot(ctx, task.GetID())
+        if !acquired {
+            log.Warnf("task %s skipped due to concurrency limit", task.GetID())
+            return
+        }
+        defer s.concurrency.ReleaseSlot(ctx, task.GetID())
+
+        // 入队任务
+        s.taskQueue.Enqueue(ctx, &QueuedTask{
+            Task:     task,
+            Priority: task.GetConfig().Priority,
+        })
+    })
+
+    if err != nil {
+        return err
+    }
+
+    s.tasks[task.GetID()] = &ScheduledTask{
+        Task:    task,
+        Trigger: trigger,
+        EntryID: entryID,
+    }
+    return nil
+}
+
+// PriorityQueue 优先级队列实现（基于堆）
+type PriorityQueue struct {
+    heap     *minHeap
+    mu       sync.Mutex
+    notEmpty *sync.Cond
+}
+
+// Enqueue 入队任务，按优先级排序
+func (q *PriorityQueue) Enqueue(ctx context.Context, task *QueuedTask) error {
+    q.mu.Lock()
+    defer q.mu.Unlock()
+
+    heap.Push(q.heap, task)
+    q.notEmpty.Signal() // 通知等待的消费者
+    return nil
+}
+
+// Dequeue 出队任务，阻塞等待直到有任务可用
+func (q *PriorityQueue) Dequeue(ctx context.Context) (*QueuedTask, error) {
+    q.mu.Lock()
+    defer q.mu.Unlock()
+
+    for q.heap.Len() == 0 {
+        q.notEmpty.Wait() // 等待新任务入队
+    }
+
+    task := heap.Pop(q.heap).(*QueuedTask)
+    return task, nil
+}
+```
+
+#### 3.3.3. 数据采集模块类设计
+
+数据采集模块通过插件化设计支持多种数据源，采用工厂模式创建不同类型的采集器。
+
+##### 3.3.3.1. 核心接口层
+
+```go
+// ICollector 采集器核心接口
+type ICollector interface {
+    Collect(ctx context.Context, config *CollectorConfig) (*CollectionResult, error)
+    Validate(ctx context.Context, config *CollectorConfig) error
+    GetSupportedSourceType() SourceType
+    Close() error
+}
+
+// IParser 数据解析器接口
+type IParser interface {
+    Parse(ctx context.Context, rawData []byte, schema *Schema) ([]map[string]interface{}, error)
+    GetSupportedFormat() DataFormat
+}
+
+// IAntiDetection 反爬虫检测接口（用于RPA采集器）
+type IAntiDetection interface {
+    RandomizeUserAgent() string
+    AddRandomDelay(min, max time.Duration) time.Duration
+    RotateProxy(ctx context.Context) (*Proxy, error)
+    SimulateHumanBehavior(ctx context.Context, page *rod.Page) error
+}
+
+// ICollectorFactory 采集器工厂接口
+type ICollectorFactory interface {
+    CreateCollector(sourceType SourceType) (ICollector, error)
+    RegisterCollector(sourceType SourceType, creator CollectorCreator) error
+}
+```
+
+**接口职责说明：**
+
+| 接口 | 核心职责 | 应用场景 |
+|------|---------|---------|
+| `ICollector` | 统一的数据采集抽象，定义采集流程 | 支持Web RPA、API、数据库等多种数据源 |
+| `IParser` | 数据解析抽象，将原始数据转换为结构化数据 | 支持JSON、XML、HTML、CSV等格式 |
+| `IAntiDetection` | 反爬虫策略抽象 | 仅用于RPA采集器，实现User-Agent轮换、代理IP等 |
+| `ICollectorFactory` | 采集器创建抽象，实现工厂模式 | 动态创建不同类型的采集器实例 |
+
+##### 3.3.3.2. 抽象类层
+
+```go
+// BaseCollector 采集器基类，提供通用逻辑
+type BaseCollector struct {
+    SourceType  SourceType
+    Metrics     *CollectorMetrics
+    Logger      *log.Logger
+    mu          sync.Mutex
+}
+
+// Validate 基础验证逻辑
+func (c *BaseCollector) Validate(ctx context.Context, config *CollectorConfig) error {
+    if config == nil {
+        return errors.New("collector config is required")
+    }
+    if config.SourceID == "" {
+        return errors.New("source ID is required")
+    }
+    return nil
+}
+
+// GetSupportedSourceType 返回支持的数据源类型
+func (c *BaseCollector) GetSupportedSourceType() SourceType {
+    return c.SourceType
+}
+
+// RecordMetrics 记录采集指标（通用方法）
+func (c *BaseCollector) RecordMetrics(duration time.Duration, recordCount int, err error) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    c.Metrics.TotalCollections++
+    c.Metrics.TotalRecords += recordCount
+    c.Metrics.TotalDuration += duration
+
+    if err != nil {
+        c.Metrics.TotalErrors++
+    }
+}
+```
+
+##### 3.3.3.3. 实现类层
+
+```go
+// RPACollector RPA网页采集器实现
+type RPACollector struct {
+    BaseCollector
+    browser        *rod.Browser
+    browserPool    *BrowserPool
+    antiDetection  IAntiDetection
+    parser         IParser
+}
+
+// Collect 执行RPA采集
+func (c *RPACollector) Collect(ctx context.Context, config *CollectorConfig) (*CollectionResult, error) {
+    startTime := time.Now()
+
+    // 从浏览器池获取浏览器实例
+    browser, err := c.browserPool.Acquire(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to acquire browser: %w", err)
+    }
+    defer c.browserPool.Release(browser)
+
+    // 打开页面
+    page := browser.MustPage(config.URL)
+    defer page.Close()
+
+    // 应用反检测策略
+    if err := c.antiDetection.SimulateHumanBehavior(ctx, page); err != nil {
+        return nil, err
+    }
+
+    // 等待页面加载
+    page.MustWaitLoad()
+
+    // 提取数据
+    html := page.MustHTML()
+    records, err := c.parser.Parse(ctx, []byte(html), config.Schema)
+    if err != nil {
+        return nil, err
+    }
+
+    // 记录指标
+    c.RecordMetrics(time.Since(startTime), len(records), nil)
+
+    return &CollectionResult{
+        Records:   records,
+        Count:     len(records),
+        Timestamp: time.Now(),
+    }, nil
+}
+
+// CollectorFactory 采集器工厂实现
+type CollectorFactory struct {
+    creators map[SourceType]CollectorCreator
+    mu       sync.RWMutex
+}
+
+// CreateCollector 根据数据源类型创建采集器
+func (f *CollectorFactory) CreateCollector(sourceType SourceType) (ICollector, error) {
+    f.mu.RLock()
+    creator, exists := f.creators[sourceType]
+    f.mu.RUnlock()
+
+    if !exists {
+        return nil, fmt.Errorf("unsupported source type: %s", sourceType)
+    }
+
+    return creator(), nil
+}
+```
+
+#### 3.3.4. 数据处理模块类设计
+
+数据处理模块采用责任链模式实现数据清洗、验证和转换的流水线处理。
+
+##### 3.3.4.1. 核心接口层
+
+```go
+// IProcessor 数据处理器核心接口
+type IProcessor interface {
+    Process(ctx context.Context, data []map[string]interface{}) (*ProcessResult, error)
+    GetName() string
+}
+
+// IValidator 数据验证器接口
+type IValidator interface {
+    Validate(ctx context.Context, record map[string]interface{}, schema *Schema) (*ValidationResult, error)
+    GetValidationRules() []*ValidationRule
+}
+
+// IPipeline 处理管道接口，实现责任链模式
+type IPipeline interface {
+    AddProcessor(processor IProcessor) IPipeline
+    Execute(ctx context.Context, data []map[string]interface{}) (*ProcessResult, error)
+    Clear() IPipeline
+}
+
+// ICleaningRule 清洗规则接口
+type ICleaningRule interface {
+    Apply(ctx context.Context, value interface{}) (interface{}, error)
+    GetRuleType() RuleType
+}
+```
+
+**接口组合示例（责任链模式）：**
+
+```go
+// Pipeline 处理管道实现
+type Pipeline struct {
+    processors []IProcessor
+    mu         sync.RWMutex
+}
+
+// AddProcessor 添加处理器到管道
+func (p *Pipeline) AddProcessor(processor IProcessor) IPipeline {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    p.processors = append(p.processors, processor)
+    return p
+}
+
+// Execute 执行管道处理
+func (p *Pipeline) Execute(ctx context.Context, data []map[string]interface{}) (*ProcessResult, error) {
+    p.mu.RLock()
+    processors := make([]IProcessor, len(p.processors))
+    copy(processors, p.processors)
+    p.mu.RUnlock()
+
+    currentData := data
+    for _, processor := range processors {
+        result, err := processor.Process(ctx, currentData)
+        if err != nil {
+            return nil, fmt.Errorf("processor %s failed: %w", processor.GetName(), err)
+        }
+        currentData = result.Data
+    }
+
+    return &ProcessResult{Data: currentData}, nil
+}
+```
+
+##### 3.3.4.2. 抽象类层
+
+```go
+// BaseProcessor 处理器基类
+type BaseProcessor struct {
+    Name    string
+    Metrics *ProcessorMetrics
+    Logger  *log.Logger
+}
+
+// GetName 获取处理器名称
+func (p *BaseProcessor) GetName() string {
+    return p.Name
+}
+```
+
+##### 3.3.4.3. 实现类层
+
+```go
+// DataCleaningProcessor 数据清洗处理器
+type DataCleaningProcessor struct {
+    BaseProcessor
+    rules []ICleaningRule
+}
+
+// Process 执行数据清洗
+func (p *DataCleaningProcessor) Process(ctx context.Context, data []map[string]interface{}) (*ProcessResult, error) {
+    cleanedData := make([]map[string]interface{}, 0, len(data))
+
+    for _, record := range data {
+        cleanedRecord := make(map[string]interface{})
+        for key, value := range record {
+            cleanedValue := value
+
+            // 应用清洗规则
+            for _, rule := range p.rules {
+                var err error
+                cleanedValue, err = rule.Apply(ctx, cleanedValue)
+                if err != nil {
+                    return nil, err
+                }
+            }
+
+            cleanedRecord[key] = cleanedValue
+        }
+        cleanedData = append(cleanedData, cleanedRecord)
+    }
+
+    return &ProcessResult{Data: cleanedData}, nil
+}
+```
+
+#### 3.3.5. 数据存储模块类设计
+
+数据存储模块通过策略模式支持多种存储后端，采用连接池优化性能。
+
+##### 3.3.5.1. 核心接口层
+
+```go
+// IStorage 存储器核心接口
+type IStorage interface {
+    Write(ctx context.Context, data []map[string]interface{}, schema *Schema) error
+    Read(ctx context.Context, query *Query) ([]map[string]interface{}, error)
+    Update(ctx context.Context, filter map[string]interface{}, updates map[string]interface{}) error
+    Delete(ctx context.Context, filter map[string]interface{}) error
+    GetStorageType() StorageType
+    Close() error
+}
+
+// IConnectionPool 连接池接口
+type IConnectionPool interface {
+    Acquire(ctx context.Context) (interface{}, error)
+    Release(conn interface{}) error
+    GetStats() *PoolStats
+    Close() error
+}
+
+// ITransaction 事务接口
+type ITransaction interface {
+    Begin(ctx context.Context) error
+    Commit(ctx context.Context) error
+    Rollback(ctx context.Context) error
+    Execute(ctx context.Context, fn func(tx ITransaction) error) error
+}
+```
+
+##### 3.3.5.2. 抽象类层
+
+```go
+// BaseStorage 存储器基类
+type BaseStorage struct {
+    StorageType StorageType
+    Config      *StorageConfig
+    Pool        IConnectionPool
+    Metrics     *StorageMetrics
+    mu          sync.Mutex
+}
+
+// GetStorageType 获取存储类型
+func (s *BaseStorage) GetStorageType() StorageType {
+    return s.StorageType
+}
+
+// RecordMetrics 记录存储指标
+func (s *BaseStorage) RecordMetrics(operation string, duration time.Duration, err error) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    s.Metrics.TotalOperations++
+    if err != nil {
+        s.Metrics.TotalErrors++
+    }
+}
+```
+
+##### 3.3.5.3. 实现类层
+
+```go
+// PostgreSQLStorage PostgreSQL存储器实现
+type PostgreSQLStorage struct {
+    BaseStorage
+    db *sql.DB
+}
+
+// Write 批量写入数据
+func (s *PostgreSQLStorage) Write(ctx context.Context, data []map[string]interface{}, schema *Schema) error {
+    startTime := time.Now()
+
+    // 从连接池获取连接
+    conn, err := s.Pool.Acquire(ctx)
+    if err != nil {
+        return err
+    }
+    defer s.Pool.Release(conn)
+
+    // 构建批量插入SQL
+    sqlStmt := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
+        schema.TableName,
+        strings.Join(schema.FieldNames(), ","),
+        s.buildPlaceholders(len(data), len(schema.Fields)))
+
+    // 准备参数
+    args := s.flattenData(data, schema)
+
+    // 执行批量插入
+    _, err = s.db.ExecContext(ctx, sqlStmt, args...)
+
+    s.RecordMetrics("write", time.Since(startTime), err)
+    return err
+}
+```
+
+#### 3.3.6. Worker执行引擎类设计
+
+Worker执行引擎负责分布式任务执行和资源管理。
+
+##### 3.3.6.1. 核心接口层
+
+```go
+// IWorker Worker节点接口
+type IWorker interface {
+    Start(ctx context.Context) error
+    Stop(ctx context.Context) error
+    ExecuteTask(ctx context.Context, task ITask) (*ExecutionResult, error)
+    GetStatus() WorkerStatus
+    Heartbeat(ctx context.Context) error
+}
+
+// IResourceManager 资源管理器接口
+type IResourceManager interface {
+    AllocateResources(ctx context.Context, requirements *ResourceRequirements) (*ResourceAllocation, error)
+    ReleaseResources(ctx context.Context, allocationID string) error
+    GetAvailableResources(ctx context.Context) (*ResourceInfo, error)
+}
+
+// IExecutionContext 执行上下文接口
+type IExecutionContext interface {
+    GetTaskID() string
+    GetWorkerID() string
+    GetResources() *ResourceAllocation
+    SetVariable(key string, value interface{})
+    GetVariable(key string) (interface{}, bool)
+}
+```
+
+##### 3.3.6.2. 抽象类层
+
+```go
+// BaseWorker Worker基类
+type BaseWorker struct {
+    ID              string
+    Status          WorkerStatus
+    resourceManager IResourceManager
+    mu              sync.RWMutex
+}
+
+// GetStatus 获取Worker状态
+func (w *BaseWorker) GetStatus() WorkerStatus {
+    w.mu.RLock()
+    defer w.mu.RUnlock()
+    return w.Status
+}
+```
+
+##### 3.3.6.3. 实现类层
+
+```go
+// WorkerNode Worker节点实现
+type WorkerNode struct {
+    BaseWorker
+    taskQueue   ITaskQueue
+    executor    ITaskExecutor
+    healthCheck IHealthChecker
+    stopCh      chan struct{}
+}
+
+// Start 启动Worker节点
+func (w *WorkerNode) Start(ctx context.Context) error {
+    w.mu.Lock()
+    w.Status = WorkerStatusRunning
+    w.mu.Unlock()
+
+    // 启动心跳
+    go w.heartbeatLoop(ctx)
+
+    // 启动任务消费循环
+    go w.taskConsumerLoop(ctx)
+
+    return nil
+}
+
+// taskConsumerLoop 任务消费循环
+func (w *WorkerNode) taskConsumerLoop(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-w.stopCh:
+            return
+        default:
+            // 从队列获取任务
+            queuedTask, err := w.taskQueue.Dequeue(ctx)
+            if err != nil {
+                continue
+            }
+
+            // 执行任务
+            w.ExecuteTask(ctx, queuedTask.Task)
+        }
+    }
+}
+```
+
+#### 3.3.7. 插件系统类设计
+
+插件系统提供统一的插件接口和生命周期管理，解决TODO中提到的插件规范问题。
+
+##### 3.3.7.1. 核心接口层
+
+```go
+// IPlugin 插件核心接口
+type IPlugin interface {
+    GetName() string
+    GetVersion() string
+    GetType() PluginType
+    Initialize(ctx context.Context, config map[string]interface{}) error
+    Shutdown(ctx context.Context) error
+}
+
+// IPluginLoader 插件加载器接口
+type IPluginLoader interface {
+    Load(ctx context.Context, pluginPath string) (IPlugin, error)
+    Unload(ctx context.Context, pluginName string) error
+    Reload(ctx context.Context, pluginName string) error
+}
+
+// IPluginLifecycle 插件生命周期管理接口
+type IPluginLifecycle interface {
+    OnLoad(ctx context.Context) error
+    OnStart(ctx context.Context) error
+    OnStop(ctx context.Context) error
+    OnUnload(ctx context.Context) error
+    GetState() PluginState
+}
+
+// IPluginRegistry 插件注册表接口
+type IPluginRegistry interface {
+    Register(plugin IPlugin) error
+    Unregister(pluginName string) error
+    Get(pluginName string) (IPlugin, error)
+    List() []IPlugin
+}
+```
+
+**插件类型定义：**
+
+```go
+// PluginType 插件类型枚举
+type PluginType string
+
+const (
+    PluginTypeCollector PluginType = "collector" // 采集器插件
+    PluginTypeParser    PluginType = "parser"    // 解析器插件
+    PluginTypeStorage   PluginType = "storage"   // 存储器插件
+    PluginTypeProcessor PluginType = "processor" // 处理器插件
+)
+
+// PluginState 插件状态
+type PluginState int
+
+const (
+    PluginStateUnloaded PluginState = iota
+    PluginStateLoaded
+    PluginStateRunning
+    PluginStateStopped
+    PluginStateError
+)
+```
+
+##### 3.3.7.2. 抽象类层
+
+```go
+// BasePlugin 插件基类，实现通用逻辑
+type BasePlugin struct {
+    Name    string
+    Version string
+    Type    PluginType
+    State   PluginState
+    Config  map[string]interface{}
+    mu      sync.RWMutex
+}
+
+// GetName 获取插件名称
+func (p *BasePlugin) GetName() string {
+    return p.Name
+}
+
+// GetVersion 获取插件版本
+func (p *BasePlugin) GetVersion() string {
+    return p.Version
+}
+
+// GetType 获取插件类型
+func (p *BasePlugin) GetType() PluginType {
+    return p.Type
+}
+
+// GetState 获取插件状态（线程安全）
+func (p *BasePlugin) GetState() PluginState {
+    p.mu.RLock()
+    defer p.mu.RUnlock()
+    return p.State
+}
+```
+
+##### 3.3.7.3. 实现类层
+
+```go
+// PluginRegistry 插件注册表实现
+type PluginRegistry struct {
+    plugins map[string]IPlugin
+    mu      sync.RWMutex
+}
+
+// Register 注册插件
+func (r *PluginRegistry) Register(plugin IPlugin) error {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+
+    name := plugin.GetName()
+    if _, exists := r.plugins[name]; exists {
+        return fmt.Errorf("plugin %s already registered", name)
+    }
+
+    r.plugins[name] = plugin
+    return nil
+}
+
+// PluginLoader 插件加载器实现（支持Go Plugin或gRPC插件）
+type PluginLoader struct {
+    registry IPluginRegistry
+    pluginDir string
+    mu        sync.RWMutex
+}
+
+// Load 加载插件（使用Go plugin包）
+func (l *PluginLoader) Load(ctx context.Context, pluginPath string) (IPlugin, error) {
+    // 加载.so文件
+    p, err := plugin.Open(pluginPath)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open plugin: %w", err)
+    }
+
+    // 查找NewPlugin符号
+    symPlugin, err := p.Lookup("NewPlugin")
+    if err != nil {
+        return nil, fmt.Errorf("plugin does not export NewPlugin: %w", err)
+    }
+
+    // 类型断言
+    newPlugin, ok := symPlugin.(func() IPlugin)
+    if !ok {
+        return nil, errors.New("invalid plugin signature")
+    }
+
+    // 创建插件实例
+    pluginInstance := newPlugin()
+
+    // 注册到注册表
+    if err := l.registry.Register(pluginInstance); err != nil {
+        return nil, err
+    }
+
+    return pluginInstance, nil
+}
+```
+
+#### 3.3.8. 接口设计原则与类关系总结
+
+本节从架构师视角总结系统的接口设计原则和整体类依赖关系。
+
+##### 3.3.8.1. 依赖倒置原则应用
+
+系统遵循依赖倒置原则（DIP），所有高层模块依赖抽象接口而非具体实现：
+
+| 模块 | 依赖的抽象接口 | 优势 |
+|------|---------------|------|
+| TaskService | ITaskManager, ITaskExecutor, ITaskInstanceManager | 可灵活替换任务管理器实现（内存、数据库、分布式） |
+| CronScheduler | ITaskQueue, ITaskExecutor, IConcurrencyController | 调度器不关心队列和执行器的具体实现 |
+| WorkerNode | ITaskQueue, ITaskExecutor, IResourceManager | Worker可独立部署，通过接口与其他组件通信 |
+| Pipeline | IProcessor | 处理器可动态组合，支持热插拔 |
+
+**依赖注入示例（使用Wire框架）：**
+
+```go
+// wire.go
+//go:build wireinject
+
+func InitializeTaskService(
+    db *sql.DB,
+    cache ICache,
+    eventBus IEventBus,
+) (*TaskService, error) {
+    wire.Build(
+        NewTaskManager,
+        NewTaskExecutor,
+        NewTaskInstanceManager,
+        NewTaskService,
+    )
+    return nil, nil
+}
+```
+
+##### 3.3.8.2. 接口隔离原则应用
+
+系统通过接口隔离原则（ISP）将大接口拆分为多个职责单一的小接口，通过Go接口组合实现复杂功能：
+
+**示例：拆分大接口**
+
+```go
+// ❌ 违反ISP：大而全的接口
+type ITaskService interface {
+    CreateTask(...)
+    UpdateTask(...)
+    DeleteTask(...)
+    ExecuteTask(...)
+    CancelTask(...)
+    GetTaskStatus(...)
+    ListTasks(...)
+}
+
+// ✅ 符合ISP：职责单一的小接口
+type ITaskManager interface {
+    CreateTask(...)
+    UpdateTask(...)
+    DeleteTask(...)
+    GetTask(...)
+    ListTasks(...)
+}
+
+type ITaskExecutor interface {
+    Execute(...)
+    Cancel(...)
+    GetExecutionStatus(...)
+}
+
+// 通过组合使用
+type TaskService struct {
+    manager  ITaskManager
+    executor ITaskExecutor
+}
+```
+
+##### 3.3.8.3. 系统核心类依赖关系图
+
+整体类依赖关系遵循分层架构，从上到下依次为：API层 → 服务层 → 领域层 → 基础设施层。
+
+```
+┌─────────────────────────────────────────────────┐
+│              API Layer (HTTP/gRPC)              │
+│  TaskHandler, SchedulerHandler, DataHandler     │
+└────────────────────┬────────────────────────────┘
+                     │ 依赖
+┌────────────────────▼────────────────────────────┐
+│              Service Layer                      │
+│  TaskService, SchedulerService, DataService     │
+│  (组合多个接口，实现业务编排)                     │
+└────────────────────┬────────────────────────────┘
+                     │ 依赖
+┌────────────────────▼────────────────────────────┐
+│              Domain Layer                       │
+│  ITaskManager, IScheduler, ICollector,          │
+│  IProcessor, IStorage (接口定义)                 │
+└────────────────────┬────────────────────────────┘
+                     │ 依赖
+┌────────────────────▼────────────────────────────┐
+│         Infrastructure Layer                    │
+│  PostgreSQLStorage, MongoDBStorage,             │
+│  RPACollector, APICollector (具体实现)           │
+└─────────────────────────────────────────────────┘
+```
+
+**核心设计模式总结：**
+
+1. **工厂模式**：`CollectorFactory`、`StorageFactory` 用于创建不同类型的采集器和存储器
+2. **策略模式**：`ITrigger` 接口支持多种调度策略（Cron、固定间隔、手动触发）
+3. **责任链模式**：`Pipeline` 实现数据处理的流水线
+4. **观察者模式**：`EventBus` 实现任务状态变更的事件通知
+5. **对象池模式**：`ConnectionPool`、`BrowserPool` 优化资源复用
+6. **单例模式**：`PluginRegistry` 全局唯一的插件注册表
+
+通过以上接口设计和设计模式应用，DataFusion系统实现了高内聚低耦合的架构，具备良好的可扩展性、可测试性和可维护性。
+
 ### 3.4. 数据库设计
 
-系统的核心业务数据将存储在 PostgreSQL 数据库中。以下是 E-R 设计：
+DataFusion系统的核心业务数据存储在PostgreSQL数据库中。本节从架构师视角阐述数据库的技术选型、架构设计、性能优化策略以及高可用保障措施。
+
+#### 3.4.1. 数据库架构设计
+
+##### 3.4.1.1. 技术选型
+
+**为什么选择PostgreSQL？**
+
+PostgreSQL是DataFusion系统的核心数据存储引擎，相比其他主流数据库具有以下优势：
+
+1. **JSONB支持**：任务配置、数据源连接参数、解析规则等业务数据具有高度的灵活性和扩展性需求，需要Schema-less存储。PostgreSQL的JSONB类型提供了高效的JSON存储和查询能力，支持索引和丰富的操作符，性能远超MySQL的JSON类型。
+
+2. **ACID事务保证**：相比MongoDB等NoSQL数据库，PostgreSQL提供完整的ACID事务支持，确保任务调度、状态更新、数据写入等关键业务流程的数据一致性。
+
+3. **复杂查询能力**：系统需要支持多表关联查询（如任务执行历史的多维度分析、数据血缘追溯），PostgreSQL的查询优化器和丰富的SQL特性（窗口函数、CTE、子查询）能够高效处理复杂分析查询。
+
+4. **扩展生态**：
+   - `pg_partman`：自动化分区表管理，支持task_logs等大数据量表的按时间分区
+   - `pg_cron`：内置定时任务，支持数据归档、统计信息更新等维护任务
+   - `pgAudit`：安全审计扩展，满足企业合规要求
+   - `pg_stat_statements`：SQL性能分析工具
+
+5. **全文搜索**：内置全文搜索功能，支持任务日志、数据源描述等文本字段的高效检索。
+
+**技术对比总结：**
+
+| 特性 | PostgreSQL | MySQL | MongoDB |
+|------|-----------|-------|---------|
+| JSONB性能 | 优秀（原生支持+GIN索引） | 一般（JSON类型性能较差） | 优秀（原生文档存储） |
+| ACID事务 | 完整支持 | 支持（InnoDB） | 有限支持（需Replica Set） |
+| 复杂查询 | 强大（窗口函数、CTE） | 较好 | 弱（聚合管道） |
+| 数据完整性 | 强（CHECK约束、触发器） | 中等 | 弱（应用层保证） |
+| 分区表 | 原生支持（声明式分区） | 支持 | 分片（Sharding） |
+| 扩展性 | 扩展丰富 | 扩展有限 | 扩展丰富 |
+
+**版本选择：PostgreSQL 14.x**
+
+- 声明式分区表性能优化（支持分区裁剪、并行查询）
+- JSONB下标操作性能提升
+- 并行查询能力增强
+- 逻辑复制功能成熟
+
+##### 3.4.1.2. 部署架构
+
+**总体架构：主从复制 + 读写分离 + 连接池**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     应用层 (Go Services)                  │
+└────────────┬────────────────────────────┬────────────────┘
+             │                            │
+             │ 写请求                      │ 读请求
+             ▼                            ▼
+      ┌──────────┐                 ┌──────────┐
+      │ HAProxy  │                 │ HAProxy  │
+      │ (VIP-W)  │                 │ (VIP-R)  │
+      └─────┬────┘                 └────┬─────┘
+            │                           │
+            │                      ┌────┴─────┐
+            ▼                      ▼          ▼
+   ┌─────────────┐        ┌──────────┐  ┌──────────┐
+   │ PgBouncer   │        │PgBouncer │  │PgBouncer │
+   │ (Write Pool)│        │(Read Pool│  │(Read Pool│
+   └──────┬──────┘        └────┬─────┘  └────┬─────┘
+          │                    │             │
+          ▼                    ▼             ▼
+   ┌──────────────┐     ┌──────────┐  ┌──────────┐
+   │ PostgreSQL   │────>│PostgreSQL│  │PostgreSQL│
+   │ Primary      │────>│ Standby1 │  │ Standby2 │
+   │ (Master)     │     │ (Replica)│  │ (Replica)│
+   └──────┬───────┘     └──────────┘  └──────────┘
+          │
+          │ WAL归档
+          ▼
+   ┌──────────────┐
+   │  S3/MinIO    │
+   │ (备份存储)    │
+   └──────────────┘
+
+高可用组件：
+┌────────────────────────────────────┐
+│     Patroni + etcd Cluster         │
+│ (自动故障检测与主从切换)              │
+└────────────────────────────────────┘
+```
+
+**核心组件说明：**
+
+1. **HAProxy（负载均衡）**
+   - 提供虚拟IP，应用层无需感知主从切换
+   - 写VIP指向Primary节点
+   - 读VIP负载均衡到多个Standby节点（轮询策略）
+   - 健康检查：每5秒探测PostgreSQL可用性
+
+2. **PgBouncer（连接池）**
+   - 连接池模式：Transaction模式（每个事务独立连接）
+   - 最大连接数：200（应用端） → 50（数据库端）
+   - 减少数据库连接开销，提升并发能力
+   - 连接复用率：约4:1
+
+3. **Patroni + etcd（高可用）**
+   - Patroni：PostgreSQL HA解决方案，自动管理主从复制和故障切换
+   - etcd：分布式配置存储，保存集群状态和Leader信息
+   - 故障检测：心跳间隔5秒，3次失败则触发切换
+   - 自动切换时间：RTO < 30秒
+
+4. **流复制（Streaming Replication）**
+   - 异步复制：Primary写入成功即返回，Standby异步同步
+   - 复制延迟：正常情况 < 100ms
+   - WAL保留：Primary保留24小时的WAL文件，防止网络中断导致Standby落后过多
+
+##### 3.4.1.3. 关键配置参数
+
+**PostgreSQL核心配置（基于32GB物理内存）：**
+
+```ini
+# ========== 内存配置 ==========
+# 共享缓冲区：用于缓存数据页
+# 推荐值：物理内存的25%，避免与OS页缓存竞争
+shared_buffers = 8GB
+
+# 有效缓存大小：告知优化器可用的缓存大小（含OS缓存）
+# 推荐值：物理内存的75%
+effective_cache_size = 24GB
+
+# 工作内存：每个查询操作（排序、哈希）的内存上限
+# 推荐值：总内存 / max_connections / 4
+# (32GB / 200 / 4) = 40MB，为安全起见设为16MB
+work_mem = 16MB
+
+# 维护工作内存：VACUUM、CREATE INDEX等维护操作使用
+# 推荐值：1-2GB
+maintenance_work_mem = 2GB
+
+# ========== WAL配置（写性能优化）==========
+# WAL缓冲区：WAL写入的内存缓冲
+# 推荐值：16MB（适合高并发写入）
+wal_buffers = 16MB
+
+# WAL级别：logical（支持逻辑复制和PITR）
+wal_level = logical
+
+# 检查点完成目标：将检查点I/O分散到整个检查点间隔
+# 0.9表示将I/O分散到90%的时间，减少I/O峰值
+checkpoint_completion_target = 0.9
+
+# WAL最大大小：触发检查点的WAL大小阈值
+max_wal_size = 4GB
+min_wal_size = 1GB
+
+# ========== 查询优化器配置 ==========
+# 随机页访问成本：SSD使用较低值（HDD默认4.0）
+# 影响优化器选择索引扫描vs顺序扫描的决策
+random_page_cost = 1.1
+
+# 有效I/O并发数：SSD可支持更高并发I/O
+effective_io_concurrency = 200
+
+# 并行查询配置
+max_parallel_workers_per_gather = 4  # 每个查询最多4个并行Worker
+max_parallel_workers = 8             # 系统总并行Worker数
+max_worker_processes = 8             # 后台Worker进程总数
+
+# ========== 连接配置 ==========
+# 最大连接数：通过PgBouncer连接池，数据库端连接数可控制在较低值
+max_connections = 200
+
+# 超级用户保留连接：为DBA保留紧急连接
+superuser_reserved_connections = 3
+
+# ========== 日志配置 ==========
+# 日志记录慢查询（超过1秒）
+log_min_duration_statement = 1000
+
+# 记录检查点统计信息
+log_checkpoints = on
+
+# 记录连接和断开
+log_connections = on
+log_disconnections = on
+
+# ========== 复制配置 ==========
+# 最大WAL发送进程数（每个Standby一个）
+max_wal_senders = 5
+
+# WAL保留大小：防止Standby落后过多导致无法恢复
+wal_keep_size = 1GB
+
+# 复制槽：确保WAL不会被过早删除
+# Patroni会自动创建复制槽
+```
+
+**关键参数设计理由：**
+
+1. **shared_buffers = 8GB**：PostgreSQL与操作系统都有页缓存，设置过大会导致双重缓存，降低效率。25%是经验值。
+
+2. **work_mem = 16MB**：设置过大会导致内存耗尽（200个连接 × 16MB = 3.2GB仅用于work_mem），设置过小会导致磁盘排序。需根据实际查询调整。
+
+3. **random_page_cost = 1.1**：SSD的随机访问接近顺序访问（默认值4.0针对HDD），降低此值让优化器更倾向于使用索引。
+
+4. **max_connections = 200**：通过PgBouncer连接池，应用端可建立200个连接，但数据库端实际连接数控制在50左右，减少上下文切换开销。
+
+#### 3.4.2. 数据模型设计
+
+##### 3.4.2.1. E-R模型概览
+
+**整体E-R图：**
 
 ![E-R图](diagrams/er_diagram.png)
 
-**核心实体:**
+**核心领域划分：**
+
+DataFusion的数据模型按业务域划分为4个核心领域：
+
+1. **用户与权限管理域**
+   - 职责：用户认证、授权、第三方身份集成
+   - 核心表：`users`, `oauth_providers`, `api_keys`
+   - 设计原则：支持多认证源（本地、OAuth、LDAP）、RBAC+细粒度权限
+
+2. **数据源管理域**
+   - 职责：管理各类数据源连接配置（数据库、API、网页）
+   - 核心表：`datasources`
+   - 设计原则：Schema-less配置（JSONB）、敏感信息加密
+
+3. **任务管理域（系统核心）**
+   - 职责：任务定义、调度、执行、日志记录
+   - 核心表：`tasks`, `task_schedules`, `task_instances`, `task_logs`, `task_execution_history`
+   - 设计原则：任务配置可版本化、执行历史可追溯、日志按时间分区
+
+4. **系统运维域**
+   - 职责：Worker节点管理、系统监控告警
+   - 核心表：`workers`, `alert_rules`, `alert_records`
+   - 设计原则：实时心跳检测、规则驱动告警
+
+**表间关系说明：**
+
+```
+users (1) ──< (N) tasks              # 用户创建任务
+users (1) ──< (N) datasources        # 用户创建数据源
+users (1) ──< (N) api_keys           # 用户创建API密钥
+
+datasources (1) ──< (N) tasks        # 数据源被任务引用
+
+tasks (1) ──< (N) task_schedules     # 任务配置多个调度计划
+tasks (1) ──< (N) task_instances     # 任务生成多个执行实例
+tasks (1) ──< (N) alert_rules        # 任务配置告警规则
+
+task_instances (1) ──< (N) task_logs # 执行实例产生日志
+task_instances (N) ──> (1) workers   # 实例在Worker上执行
+
+alert_rules (1) ──< (N) alert_records # 规则触发告警记录
+```
+
+**数据流说明：**
+
+1. **任务创建流程**：
+   ```
+   用户 → 创建datasource → 创建task → 配置task_schedules
+   ```
+
+2. **任务执行流程**：
+   ```
+   调度器 → 读取task_schedules → 创建task_instance
+   → Worker领取task_instance → 执行并写task_logs
+   → 更新task_instance状态 → 触发alert_rules（如失败）
+   → 创建alert_record
+   ```
+
+3. **历史数据归档流程**：
+   ```
+   task_instances（完成30天后） → 归档到task_execution_history
+   task_logs（按日分区） → 保留30天 → 导出到S3/MinIO → 删除分区
+   ```
+
+##### 3.4.2.2. 核心表设计
+
+本节选取3个最具代表性的表进行详细设计说明（users、task_instances、task_logs），展示DDL、索引策略和设计决策。**其他表的完整DDL和详细设计见3.2节各模块对应章节。**
+
+###### 3.4.2.2.1. users表设计
 
 *   **`users`:** 用户表，存储用户信息和角色。支持本地用户和第三方OAuth/LDAP用户。
+    - `id`: UUID主键，避免ID枚举攻击，支持分布式部署
     - `auth_source`: 认证来源标识，取值如 'local'(本地)、'oauth_企业统一认证平台'(OAuth)、'ldap_公司LDAP'(LDAP)
     - `role`: 用户角色，支持5种角色：admin(系统管理员)、data_analyst(数据分析师)、algorithm_engineer(算法工程师)、business_operator(业务运营，第三方用户默认)、developer(开发工程师)
-    - `permissions`: JSONB格式的权限配置，用于细粒度权限控制
-    - `password_hash`: 密码哈希，仅本地用户需要，第三方用户可为NULL
+    - `permissions`: JSONB格式的权限配置，用于细粒度权限控制，补充role的权限不足
+    - `password_hash`: 密码哈希（使用bcrypt），仅本地用户需要，第三方用户可为NULL
     - `last_login_at`: 最后登录时间，用于会话管理和安全审计
+    - **索引设计**：username和email使用部分索引（WHERE status != 'disabled'），减少索引大小
+    - **约束设计**：`chk_local_user_password`确保本地用户必须有密码，第三方用户不能有密码
+    - **详细DDL见3.2.8.1节**
 
-*   **`oauth_providers`:** OAuth提供商配置表，存储企业SSO和LDAP配置信息。
-    - `provider_type`: 提供商类型，支持 'custom'(企业自建OAuth)、'wework'(企业微信)、'dingtalk'(钉钉)、'ldap'(LDAP目录服务)
-    - `client_id/client_secret`: OAuth应用凭证
-    - `authorization_url/token_url/user_info_url`: OAuth协议端点
-    - `scopes`: OAuth授权范围，如 "openid profile email"
-    - `enabled`: 是否启用该提供商
+###### 3.4.2.2.2. task_instances表设计
 
-*   **`data_sources`:** 数据源表，管理数据库、API 等连接信息。
+*   **`task_instances`:** 任务执行实例表，记录每次任务执行的状态和统计信息。
+    - `instance_id`: 唯一实例标识，格式`task-{taskID前8位}-{时间戳}`，支持幂等性检查和日志追踪
+    - `status`: 执行状态，状态机：pending → running → success/failed/timeout/cancelled
+    - `trigger_type`: 触发类型（scheduled调度、manual手动、api接口、dependency依赖）
+    - `duration_ms`: 执行时长（毫秒），通过触发器自动计算
+    - `records_fetched/stored/failed`: 数据量统计，用于质量监控和告警
+    - `worker_id`: 执行节点ID，支持负载均衡和故障追踪
+    - **索引设计**：
+      - `idx_task_instances_task_id`：复合索引(task_id, created_at DESC)，支持查询某任务的最近执行
+      - `idx_task_instances_worker_id`：部分索引(WHERE status = 'running')，仅索引运行中的实例
+    - **并发控制**：使用SELECT FOR UPDATE SKIP LOCKED防止多个调度器同时调度
+    - **详细DDL见3.2.1.1节**
 
-*   **`tasks`:** 核心任务表，存储任务的定义和元数据。
+###### 3.4.2.2.3. task_logs表设计（分区表）
 
-*   **`task_schedules`:** 任务调度配置表。
+*   **`task_logs`:** 任务执行日志表（按日分区），存储任务执行过程中的详细日志。
+    - `id`: BIGSERIAL主键（而非UUID），顺序插入性能更好，适合高频写入场景
+    - `level`: 日志级别（DEBUG、INFO、WARN、ERROR）
+    - `message`: 日志消息
+    - `context`: JSONB格式的日志上下文，如HTTP请求信息、错误堆栈
+    - `created_at`: 日志创建时间（分区键）
+    - **分区策略**：按日分区（RANGE），每日一个分区，保留30天
+    - **分区管理**：使用pg_partman扩展自动创建未来7天分区，自动删除30天前旧分区
+    - **索引设计**：
+      - `idx_task_logs_instance_id`：支持查询某次执行的所有日志
+      - `idx_task_logs_level`：支持按级别查询（如查询所有ERROR日志）
+    - **设计理由**：
+      - BIGSERIAL vs UUID：日志表写入频率极高（预计5000条/秒），BIGSERIAL顺序插入避免B树分裂
+      - 按日分区：查询局部性强（通常查询最近几天），分区裁剪性能提升10-100倍，快速删除旧数据
 
-*   **`task_runs`:** 任务执行历史记录表。
+##### 3.4.2.3. 其他核心表概要
 
-*   **`task_logs`:** 任务执行的详细日志。
+其他表的完整DDL和详细设计见3.2节对应章节，此处仅列出关键信息：
 
-*   **`api_keys`:** API密钥表，用于外部系统通过API Key方式调用。
-    - `key_value`: API密钥字符串（64位随机字符）
-    - `permissions`: JSONB格式的API权限配置
-    - `expires_at`: 密钥过期时间
-    - `last_used_at`: 最后使用时间，用于审计
+| 表名 | 用途 | 关键字段 | 详细设计章节 |
+|------|------|---------|-------------|
+| `oauth_providers` | OAuth/LDAP提供商配置 | provider_type, client_id, authorization_url | 3.2.8.1节 |
+| `api_keys` | API密钥管理 | key_value, permissions, expires_at | 3.2.8.2节 |
+| `datasources` | 数据源连接配置 | source_type, connection_config(JSONB) | 3.2.2.1节 |
+| `tasks` | 任务定义和配置 | collection_config, parsing_rules, cleaning_rules, version | 3.2.1.1节 |
+| `task_schedules` | 任务调度配置 | cron_expr, next_run_time, enabled | 3.2.1.2节 |
+| `task_execution_history` | 任务执行历史归档（按月分区） | task_id, execution_date, status, duration_ms | 3.2.1.5节 |
+| `workers` | Worker节点信息 | worker_id, status, last_heartbeat_at, capacity | 3.2.7.1节 |
+| `alert_rules` | 告警规则配置 | rule_type, trigger_condition(JSONB), enabled | 3.2.6.1节 |
+| `alert_records` | 告警记录 | rule_id, severity, triggered_at, resolved_at | 3.2.6.2节 |
 
-*   **`workers`:** Worker节点表，记录Worker节点的状态和负载信息。
+**命名统一说明：**
 
-*   **`alert_rules`:** 告警规则表，配置系统告警规则。
+- 任务执行实例统一使用`task_instances`（而非`task_instances`）
+- 数据源表统一使用`datasources`（而非`data_sources`）
+- 所有表名使用小写+下划线（snake_case）
+- 所有时间字段使用`_at`后缀（如`created_at`、`updated_at`）
 
-*   **`alert_records`:** 告警记录表，记录触发的告警事件。
+#### 3.4.3. 性能优化设计
 
+##### 3.4.3.1. 索引设计策略
+
+**索引设计六大原则：**
+
+1. **高频查询字段优先**：为WHERE、JOIN、ORDER BY条件中的字段创建索引
+2. **外键必须索引**：外键字段（如`task_id`、`datasource_id`）必须创建索引，优化JOIN性能
+3. **复合索引优化多字段查询**：如`(task_id, created_at DESC)`支持按任务ID查询并按时间排序
+4. **部分索引减少索引大小**：如`WHERE deleted_at IS NULL`仅索引未删除记录，减少索引大小20-30%
+5. **JSONB字段使用GIN索引**：支持包含查询（`@>`）和路径查询
+6. **覆盖索引（Index-Only Scan）**：将查询所需字段全部包含在索引中，避免回表
+
+**典型索引模式：**
+
+- **单列索引**：`CREATE INDEX idx_tasks_status ON tasks(status)`
+- **复合索引**：`CREATE INDEX idx_task_instances_task_id ON task_instances(task_id, created_at DESC)`
+- **部分索引**：`CREATE INDEX idx_tasks_status ON tasks(status) WHERE deleted_at IS NULL`
+- **GIN索引**：`CREATE INDEX idx_users_permissions ON users USING GIN(permissions)`（支持JSONB包含查询）
+- **表达式索引**：`CREATE INDEX idx_tasks_config_url ON tasks((collection_config->>'url'))`
+
+详细索引设计见3.2节各模块的索引章节。
+
+##### 3.4.3.2. 分区表设计
+
+**分区表策略：**
+
+| 表名 | 分区键 | 分区策略 | 分区间隔 | 保留期 | 自动清理 |
+|------|--------|---------|---------|--------|---------|
+| `task_logs` | created_at | RANGE | 按日 | 30天 | pg_partman |
+| `task_execution_history` | execution_date | RANGE | 按月 | 12个月 | pg_partman |
+
+**分区表性能优势：**
+
+1. **分区裁剪（Partition Pruning）**：查询时仅扫描相关分区，性能提升10-100倍
+2. **并行查询**：PostgreSQL可并行扫描多个分区
+3. **快速删除旧数据**：`DROP TABLE`毫秒级删除整个分区，远优于DELETE操作
+4. **VACUUM/ANALYZE局部化**：仅对活跃分区进行维护，减少开销
+
+**分区管理自动化（使用pg_partman扩展）**：
+
+- 自动创建未来分区（task_logs提前7天，task_execution_history提前2个月）
+- 自动删除过期分区（task_logs保留30天，task_execution_history保留12个月）
+- 定时任务：每天凌晨1点执行分区维护
+
+##### 3.4.3.3. 容量规划
+
+**数据量级预估（按3年计算）：**
+
+| 表名 | 日增长量 | 3年增长量 | 平均行大小 | 3年存储空间（含索引） |
+|------|---------|----------|----------|---------------------|
+| `users` | 10 | 10,950 | 1 KB | 20 MB |
+| `tasks` | 20 | 21,900 | 5 KB | 200 MB |
+| `task_instances` | 5,000 | 5,475,000 | 2 KB | 20 GB |
+| `task_logs` | 500,000 | - | 500 B | 按分区保留30天 ≈ 15 GB |
+| `datasources` | 5 | 5,475 | 3 KB | 30 MB |
+
+**总计：**
+- 热数据（近30天）：约40 GB
+- 3年总数据量（含历史归档）：约50 GB
+- 建议磁盘配置：SSD 200 GB（支持5年增长 + 50%余量）
+
+**扩展策略：**
+
+| 阶段 | 时间范围 | 数据量 | 扩展策略 |
+|------|---------|--------|---------|
+| 短期 | 1-2年 | < 50 GB | 垂直扩展（升级CPU/内存/磁盘） |
+| 中期 | 2-3年 | 50-200 GB | 读写分离 + 增加只读副本（2→4个Standby） |
+| 长期 | 3年+ | > 200 GB | 考虑Sharding（按租户ID或时间范围分片） |
+
+#### 3.4.4. 高可用与容灾
+
+##### 3.4.4.1. 高可用架构
+
+**架构：1主 + 2从 + 异步流复制 + Patroni自动故障切换**
+
+- **Primary节点**：处理所有写操作和部分读操作
+- **Standby1/2节点**：异步流复制，处理读操作
+- **Patroni + etcd**：自动故障检测和主从切换
+
+**故障切换流程：**
+
+1. **故障检测**：etcd检测到Primary节点心跳超时（3次 × 10秒 = 30秒）
+2. **Leader选举**：Standby节点竞争成为新Leader
+3. **Promote操作**：新Leader执行`pg_ctl promote`提升为Primary
+4. **更新路由**：HAProxy健康检查失败，自动将写VIP指向新Primary
+5. **重建旧Primary**：旧Primary恢复后，作为Standby节点重新加入集群
+
+**RTO/RPO目标：**
+
+- **RTO（恢复时间目标）**：< 30秒（Patroni自动切换时间）
+- **RPO（恢复点目标）**：< 1分钟（异步复制的最大延迟）
+
+##### 3.4.4.2. 备份与恢复策略
+
+**三层备份策略：**
+
+| 备份类型 | 频率 | 保留期 | 工具 | 存储位置 | RPO |
+|---------|------|--------|------|----------|-----|
+| WAL归档 | 实时 | 7天 | WAL-G | S3/MinIO | < 1分钟 |
+| 全量备份 | 每周日 2:00 | 4周 | pg_basebackup | S3/MinIO | < 1周 |
+| 逻辑备份 | 每天 3:00 | 7天 | pg_dump | 本地+S3 | < 1天 |
+
+**备份验证：**
+- 每月执行一次完整恢复演练（恢复到测试环境）
+- 验证恢复后的数据完整性（行数统计、关键业务数据抽查）
+- 记录恢复时间，确保满足RTO要求
+
+**恢复场景：**
+
+1. **时间点恢复（PITR）**：通过WAL归档恢复到指定时间点（如误删除数据前5分钟）
+2. **完整恢复**：使用最近的全量备份 + WAL归档恢复到最新状态
+3. **单表恢复**：使用pg_dump逻辑备份恢复单个表
+
+#### 3.4.5. 数据一致性保证
+
+##### 3.4.5.1. 事务设计
+
+**典型事务边界：**
+
+1. **创建任务事务**：INSERT tasks + INSERT task_schedules（确保任务和调度配置原子性）
+2. **任务调度事务**：SELECT FOR UPDATE SKIP LOCKED + INSERT task_instances + UPDATE task_schedules（防止并发调度）
+3. **批量数据写入**：分批提交（每1000行），避免长事务锁表
+
+**事务隔离级别选择：**
+- **Read Committed**（默认）：适用于绝大多数场景，避免脏读
+- **Repeatable Read**：需要事务内多次读取一致性时使用（如统计报表生成）
+
+##### 3.4.5.2. 约束与触发器
+
+**外键约束策略：**
+
+```sql
+-- 用户删除时，created_by设为NULL（保留任务，但创建者信息丢失）
+ALTER TABLE tasks ADD CONSTRAINT fk_tasks_created_by
+FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+
+-- 任务删除时，禁止删除（必须先删除task_instances）
+ALTER TABLE task_instances ADD CONSTRAINT fk_task_instances_task_id
+FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE RESTRICT;
+```
+
+**核心触发器：**
+- 自动更新`updated_at`字段
+- 自动计算`duration_ms`字段（基于start_time和end_time）
+
+详细约束和触发器设计见3.2节各模块DDL。
+
+##### 3.4.5.3. 并发控制
+
+- **乐观锁**：version字段防止并发更新冲突（用户编辑任务配置时）
+- **悲观锁**：SELECT FOR UPDATE SKIP LOCKED防止并发调度（调度器领取任务时）
+- **分布式锁**：Redis实现跨Worker的任务执行锁（防止同一任务被多个Worker同时执行）
+
+#### 3.4.6. 运维要点
+
+##### 3.4.6.1. 关键监控指标
+
+| 类别 | 指标 | 告警阈值 | 说明 |
+|------|------|---------|------|
+| 性能 | QPS | - | 每秒查询数 |
+| 性能 | 平均查询时间 | > 100ms | 超过阈值需优化 |
+| 性能 | 慢查询数量 | > 100/hour | Top慢查询 |
+| 容量 | 数据库大小 | > 80% | 磁盘使用率 |
+| 容量 | 连接数 | > 180 | max_connections=200 |
+| 可用性 | 复制延迟 | > 10s | 主从延迟 |
+| 可用性 | 死锁数 | > 0 | 应用逻辑问题 |
+
+##### 3.4.6.2. 日常维护检查清单
+
+**每日检查：**
+- 检查复制延迟（< 1秒）
+- 检查磁盘使用率（< 85%）
+- 检查慢查询日志
+- 检查备份任务执行状态
+
+**每周检查：**
+- 执行VACUUM ANALYZE（自动vacuum通常足够，手动执行大表）
+- 检查索引膨胀率（> 50%需要REINDEX）
+- Review慢查询Top 10
+
+**每月检查：**
+- 执行完整备份验证（恢复到测试环境）
+- Review表分区状态（删除旧分区、创建新分区）
+- Review索引使用率（删除未使用索引）
+- 容量规划Review（预测未来3个月增长）
+
+**VACUUM策略：**
+
+- 自动VACUUM配置：`autovacuum = on`，表10%行被修改时触发VACUUM
+- 手动VACUUM：对大表（task_instances、task_logs分区）定期执行VACUUM ANALYZE
+- VACUUM FULL：仅在索引膨胀严重时执行（需锁表，建议低峰期）
+
+---
+
+**本节总结：**
+
+3.4节从架构师视角阐述了DataFusion数据库设计的核心要点：技术选型（PostgreSQL vs MySQL/MongoDB）、架构设计（主从复制+读写分离）、数据模型（4个业务域、11张核心表）、性能优化（索引、分区、容量规划）、高可用（Patroni自动切换、三层备份）、数据一致性（事务、约束、并发控制）、运维要点（监控指标、维护检查清单）。完整的DDL定义和详细设计见3.2节对应章节，两者保持一致性。
 ### 3.5. 安全设计
 
 #### 3.5.1. 认证与授权
@@ -9588,7 +17440,7 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
       "paused": 6,
       "running": 3
     },
-    "task_runs": {
+    "task_instances": {
       "today": {
         "total": 156,
         "success": 148,
@@ -9712,10 +17564,10 @@ X-API-Key: df_prod_1a2b3c4d5e6f7g8h9i0j...
 datafusion_tasks_total{status="active"} 42
 datafusion_tasks_total{status="paused"} 6
 
-# HELP datafusion_task_runs_total Total number of task runs
-# TYPE datafusion_task_runs_total counter
-datafusion_task_runs_total{status="success"} 1234
-datafusion_task_runs_total{status="failed"} 56
+# HELP datafusion_task_instances_total Total number of task runs
+# TYPE datafusion_task_instances_total counter
+datafusion_task_instances_total{status="success"} 1234
+datafusion_task_instances_total{status="failed"} 56
 
 # HELP datafusion_task_run_duration_seconds Task run duration
 # TYPE datafusion_task_run_duration_seconds histogram

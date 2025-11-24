@@ -1,0 +1,283 @@
+@startuml plugin_registry
+!theme plain
+skinparam classAttributeIconSize 0
+skinparam class {
+    BackgroundColor<<interface>> #E8F5E9
+    BackgroundColor<<core>> #E3F2FD
+    BackgroundColor<<plugin>> #FFF3E0
+    BorderColor #2C3E50
+    ArrowColor #2C3E50
+}
+
+title 插件注册与管理类图
+
+' 核心接口
+interface Plugin <<interface>> {
+    + Name() string
+    + Version() string
+    + Type() PluginType
+    + Init(config Config) error
+    + Execute(ctx Context, input any) (any, error)
+    + HealthCheck() error
+    + Shutdown() error
+}
+
+enum PluginType {
+    Collector
+    Processor
+    Storage
+}
+
+enum PluginState {
+    Unregistered
+    Registered
+    Loading
+    Loaded
+    Initializing
+    Running
+    Paused
+    Stopping
+    Stopped
+    Failed
+    Unloading
+    Unloaded
+}
+
+' 插件元数据
+class PluginMetadata <<core>> {
+    + ID string
+    + Name string
+    + Version string
+    + Type PluginType
+    + Author string
+    + Description string
+    + Dependencies []Dependency
+    + ConfigSchema JSONSchema
+    + Capabilities []string
+    + Entrypoint string
+    + Runtime Runtime
+    + CreatedAt time.Time
+    + UpdatedAt time.Time
+    --
+    + Validate() error
+}
+
+class Dependency {
+    + Name string
+    + Version string
+    + Optional bool
+}
+
+class Runtime {
+    + Type RuntimeType
+    + Command string
+    + Args []string
+    + Env map[string]string
+}
+
+enum RuntimeType {
+    GoBinary
+    Python
+    NodeJS
+    Shell
+}
+
+' 插件实例
+class PluginInstance <<core>> {
+    - metadata PluginMetadata
+    - state PluginState
+    - config Config
+    - process *os.Process
+    - client PluginClient
+    - healthStatus HealthStatus
+    - lastHeartbeat time.Time
+    - errorCount int
+    - startedAt time.Time
+    --
+    + GetMetadata() PluginMetadata
+    + GetState() PluginState
+    + SetState(state PluginState)
+    + GetConfig() Config
+    + UpdateConfig(config Config) error
+    + GetClient() PluginClient
+    + RecordError(err error)
+    + ResetErrorCount()
+}
+
+class HealthStatus {
+    + Healthy bool
+    + LastCheckTime time.Time
+    + Message string
+}
+
+' 插件注册中心
+class PluginRegistry <<core>> {
+    - plugins map[string]*PluginInstance
+    - metadata map[string]*PluginMetadata
+    - mu sync.RWMutex
+    - db *sql.DB
+    - cache *redis.Client
+    --
+    + Register(metadata PluginMetadata) error
+    + Unregister(pluginID string) error
+    + GetPlugin(pluginID string) (*PluginInstance, error)
+    + ListPlugins(filter Filter) []*PluginInstance
+    + UpdateMetadata(pluginID string, metadata PluginMetadata) error
+    + SearchPlugins(query string) []*PluginMetadata
+}
+
+class Filter {
+    + Type PluginType
+    + State PluginState
+    + NamePattern string
+}
+
+' 插件加载器
+class PluginLoader <<core>> {
+    - registry *PluginRegistry
+    - discoveryService *DiscoveryService
+    - versionManager *VersionManager
+    - dependencyResolver *DependencyResolver
+    --
+    + LoadPlugin(pluginID string) error
+    + UnloadPlugin(pluginID string) error
+    + ReloadPlugin(pluginID string) error
+    + LoadFromPath(path string) error
+    + ValidatePlugin(metadata PluginMetadata) error
+}
+
+class DiscoveryService <<core>> {
+    - scanPaths []string
+    - watcher *fsnotify.Watcher
+    --
+    + DiscoverPlugins() []*PluginMetadata
+    + ScanDirectory(path string) []*PluginMetadata
+    + WatchChanges(callback func(PluginMetadata))
+}
+
+class VersionManager <<core>> {
+    - registry *PluginRegistry
+    --
+    + GetLatestVersion(pluginName string) (string, error)
+    + CompareVersions(v1, v2 string) int
+    + IsCompatible(required, actual string) bool
+}
+
+class DependencyResolver <<core>> {
+    - registry *PluginRegistry
+    --
+    + ResolveDependencies(metadata PluginMetadata) ([]string, error)
+    + CheckDependencies(pluginID string) error
+    + GetDependencyGraph(pluginID string) Graph
+}
+
+' 插件通信客户端
+interface PluginClient <<interface>> {
+    + Connect() error
+    + Execute(ctx Context, input any) (any, error)
+    + HealthCheck() error
+    + Disconnect() error
+}
+
+class GRPCPluginClient <<plugin>> {
+    - conn *grpc.ClientConn
+    - stub PluginServiceClient
+    - address string
+    --
+    + Connect() error
+    + Execute(ctx Context, input any) (any, error)
+    + HealthCheck() error
+    + Disconnect() error
+}
+
+class StdinStdoutPluginClient <<plugin>> {
+    - cmd *exec.Cmd
+    - stdin io.WriteCloser
+    - stdout io.ReadCloser
+    - stderr io.ReadCloser
+    --
+    + Connect() error
+    + Execute(ctx Context, input any) (any, error)
+    + HealthCheck() error
+    + Disconnect() error
+}
+
+' 配置管理
+class Config {
+    + PluginID string
+    + Parameters map[string]any
+    + Timeout time.Duration
+    + RetryPolicy RetryPolicy
+    + ResourceLimits ResourceLimits
+    --
+    + Validate(schema JSONSchema) error
+    + Get(key string) any
+    + Set(key string, value any)
+}
+
+class ResourceLimits {
+    + MaxCPU float64
+    + MaxMemory int64
+    + MaxFileDescriptors int
+}
+
+class RetryPolicy {
+    + MaxRetries int
+    + InitialInterval time.Duration
+    + MaxInterval time.Duration
+    + Multiplier float64
+}
+
+' 关系定义
+Plugin <|-- "实现" GRPCPluginClient
+Plugin <|-- "实现" StdinStdoutPluginClient
+
+PluginMetadata *-- Dependency : contains
+PluginMetadata *-- Runtime : contains
+PluginMetadata --> PluginType : uses
+
+PluginInstance *-- PluginMetadata : contains
+PluginInstance *-- PluginState : has
+PluginInstance *-- Config : has
+PluginInstance *-- HealthStatus : has
+PluginInstance o-- PluginClient : uses
+
+PluginRegistry *-- "many" PluginInstance : manages
+PluginRegistry *-- "many" PluginMetadata : stores
+
+PluginLoader *-- PluginRegistry : uses
+PluginLoader *-- DiscoveryService : uses
+PluginLoader *-- VersionManager : uses
+PluginLoader *-- DependencyResolver : uses
+
+DependencyResolver --> PluginRegistry : queries
+VersionManager --> PluginRegistry : queries
+
+Config *-- ResourceLimits : contains
+Config *-- RetryPolicy : contains
+
+note right of PluginRegistry
+  **插件注册中心职责**
+  • 管理所有插件实例
+  • 存储插件元数据
+  • 提供插件查询/搜索
+  • 双层存储 (内存+DB)
+  • Redis缓存加速查询
+end note
+
+note right of PluginLoader
+  **插件加载器职责**
+  • 从文件系统发现插件
+  • 加载插件二进制
+  • 解析依赖关系
+  • 版本兼容性检查
+  • 热更新支持
+end note
+
+note bottom of PluginClient
+  **两种客户端实现**
+  • GRPCPluginClient: 长驻进程
+  • StdinStdoutPluginClient: 临时进程
+end note
+
+@enduml
