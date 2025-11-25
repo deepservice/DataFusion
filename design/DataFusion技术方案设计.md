@@ -86,9 +86,353 @@
 *   **任务队列:** Master与Worker之间通过RabbitMQ消息队列进行任务的异步分发和结果的回传，提升了系统的吞吐量和鲁棒性
 *   **水平扩展:** Master节点和Worker节点均可水平扩展，满足不同规模的业务需求
 
-### 2.2. 技术选型
+### 2.2. 架构及技术选型
 
-为了实现上述设计目标，我们选择了以下成熟、开源的技术栈：
+#### 2.2.1. 架构选型
+
+在实现DataFusion数据采集和融合系统时,需要在系统架构层面做出合理选择。本节对候选架构方案进行对比分析,并给出最终的架构选型决策。
+
+##### 2.2.1.1. 候选架构方案
+
+基于数据采集系统的特点(周期性任务、批量处理、异步执行、状态管理、高并发),我们考察了以下四种架构实现方案:
+
+**方案一:云原生架构(Kubernetes Operator模式)**
+
+将Kubernetes不仅作为容器编排平台,更作为开发框架。核心特点:
+- 使用Kubernetes的声明式方式和Operator作为开发模式
+- 用户请求转化为自定义资源(CR),Controller管理数据采集服务的状态
+- 利用Kubernetes的list-watch机制实现消息传递和状态管理
+- 复用Kubernetes的ETCD、Service、ConfigMap等原生能力
+
+**方案二:传统微服务架构**
+
+将Kubernetes仅作为容器编排工具,系统组件的选型和通信自行维护。核心特点:
+- 自行选择和维护消息队列(RabbitMQ/Kafka)
+- 自行维护状态存储和管理(PostgreSQL/Redis)
+- 自行编写管理面和控制面逻辑
+- 每个功能模块拆分为独立微服务,通过REST API或gRPC通信
+
+**方案三:事件驱动架构(Event-Driven Architecture)**
+
+系统组件通过事件进行异步通信,采用消息队列解耦。核心特点:
+- 所有组件间交互都通过事件完成
+- 生产者发布事件到消息队列,消费者订阅并处理事件
+- 支持事件溯源(Event Sourcing)和CQRS模式
+- 天然支持异步处理和高并发场景
+
+**方案四:混合架构(微服务 + 事件驱动)**
+
+结合微服务的模块化和事件驱动的异步特性。核心特点:
+- 用户交互、查询操作使用同步REST API
+- 任务执行、数据处理等耗时操作使用异步事件驱动
+- Master节点提供RESTful API,Worker通过消息队列异步通信
+- 兼顾系统的响应性和吞吐量
+
+##### 2.2.1.2. 架构方案对比分析
+
+从四个关键维度对候选架构方案进行对比:
+
+**对比维度一:开发与运维成本**
+
+| 架构方案 | 开发周期 | 开发复杂度 | 运维成本(100任务规模) | 人才要求 |
+|---------|---------|-----------|---------------------|---------|
+| Kubernetes Operator | 3-4个月(团队有K8s经验)<br>6-9个月(团队K8s经验不足) | 高(需掌握Operator开发) | 1人 + $1500-2000/月 | 需要K8s+Operator专家 |
+| 传统微服务 | 3-4个月 | 中等 | 1.5人 + $1500-2500/月 | 常规微服务技能 |
+| 事件驱动架构 | 4-6个月 | 中高(异步编程复杂) | 1.5人 + $1800-2800/月 | 需要异步编程经验 |
+| 混合架构 | 4-5个月 | 中高 | 1.5人 + $1800-2800/月 | 微服务+消息队列 |
+
+**对比维度二:系统可用性与自动化**
+
+| 架构方案 | 系统可用性 | 故障恢复时间 | 自动扩缩容 | 版本升级回滚 |
+|---------|-----------|-------------|-----------|-------------|
+| Kubernetes Operator | 99.9% | 30秒-2分钟(自动) | ✅ 原生HPA支持 | ✅ 自动回滚 |
+| 传统微服务 | 99.5% | 5-10分钟(人工) | ⚠️ 需自己实现 | ⚠️ 需自己实现 |
+| 事件驱动架构 | 99.5% | 3-5分钟(半自动) | ⚠️ 基于队列长度 | ⚠️ 需自己实现 |
+| 混合架构 | 99.5% | 5-10分钟(半自动) | ⚠️ 部分自动化 | ⚠️ 需自己实现 |
+
+**对比维度三:可扩展性与灵活性**
+
+| 架构方案 | 水平扩展能力 | 扩展速度 | 新增数据源成本 | 技术栈灵活性 |
+|---------|------------|---------|---------------|-------------|
+| Kubernetes Operator | ★★★★★ | 5-10分钟 | 1-2天(修改CRD) | ★★★☆☆ |
+| 传统微服务 | ★★★★☆ | 10-15分钟 | 1-3天(新增服务) | ★★★★★ |
+| 事件驱动架构 | ★★★★★ | 3-5分钟 | 1-2天(新增消费者) | ★★★★☆ |
+| 混合架构 | ★★★★★ | 5-10分钟 | 1-3天 | ★★★★★ |
+
+**对比维度四:长期成本(5年TCO)**
+
+| 架构方案 | 初期开发 | 代码维护 | 运维人力 | 5年总成本 |
+|---------|---------|---------|---------|----------|
+| Kubernetes Operator | 3-4个月 | 低(复用K8s) | 1人 | **约$120K** ✅ |
+| 传统微服务 | 3-4个月 | 高(自维护) | 1.5人 | 约$180K |
+| 事件驱动架构 | 4-6个月 | 中等 | 1.5人 | 约$170K |
+| 混合架构 | 4-5个月 | 中高 | 1.5人 | 约$180K |
+
+##### 2.2.1.3. 架构选型决策
+
+**最终选择: Kubernetes Operator模式**
+
+综合考虑团队Kubernetes技术栈经验、系统高度自动化运维需求、以及长期成本优化目标,我们选择 **Kubernetes Operator模式** 作为DataFusion系统的核心架构。
+
+**选型理由:**
+
+1. **团队技术栈匹配**:团队具备丰富的Kubernetes经验,有2人以上掌握Operator开发,开发周期可控制在3-4个月,风险可控。
+
+2. **高度自动化运维**:复用Kubernetes原生的自愈、健康检查、自动扩缩容、滚动更新等能力,系统可用性从99.5%提升到99.9%,故障恢复时间缩短80%(从5-10分钟降至30秒-2分钟)。
+
+3. **简化系统架构**:复用Kubernetes的ETCD(状态存储)、list-watch(消息传递)、Service(服务发现)、ConfigMap(配置管理)等机制,减少约80%基础设施代码,降低维护复杂度。
+
+4. **长期成本优势**:虽然初期开发需要3-4个月,但长期运维成本降低40%(1人 vs 1.5人),5年TCO节省约$60K($120K vs $180K)。
+
+5. **云原生生态集成**:无缝集成Prometheus监控、Helm包管理、RBAC权限控制、Istio服务网格等云原生生态工具,避免重复造轮子。
+
+**注意事项:**
+
+⚠️ **技术复杂度**:Reconcile循环逻辑复杂,需要处理并发协调和幂等性,调试难度较高。
+- **应对**: 建立完善的单元测试和集成测试体系,使用Jaeger追踪Reconcile流程。
+
+⚠️ **CRD版本管理**:CRD字段变更需要careful设计,需要实现Conversion Webhook支持向后兼容。
+- **应对**: 前期充分设计评审,保持API向后兼容,实现Conversion Webhook。
+
+⚠️ **团队依赖风险**:至少需要2人深度掌握Operator开发,避免关键人员离职导致项目停滞。
+- **应对**: 完善的代码注释和文档,定期知识分享和培训,建立技术传承机制。
+
+##### 2.2.1.4. Kubernetes Operator模式设计要点
+
+基于Kubernetes Operator模式,系统架构设计的核心要点如下:
+
+**1. 自定义资源(CRD)设计**
+
+定义以下核心CRD,通过声明式API管理数据采集全生命周期:
+
+**(1) CollectionTask (采集任务)**
+
+```yaml
+apiVersion: datafusion.io/v1
+kind: CollectionTask
+metadata:
+  name: daily-product-scraping
+  namespace: datafusion
+spec:
+  # 数据源引用
+  dataSourceRef:
+    name: ecommerce-website
+
+  # 调度配置
+  schedule:
+    cron: "0 2 * * *"
+    timezone: "Asia/Shanghai"
+
+  # 采集配置
+  collector:
+    type: web-rpa  # web-rpa, api, database
+    replicas: 3    # 并发采集实例数
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "500m"
+      limits:
+        memory: "1Gi"
+        cpu: "1"
+
+  # 数据处理配置
+  processor:
+    cleaningRules:
+      - name: price-normalization
+      - name: duplicate-removal
+    transformRules:
+      - name: field-mapping
+
+  # 存储配置
+  storage:
+    target: postgresql
+    database: products_db
+    table: products
+
+  # 自动扩缩容配置
+  autoScaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    metrics:
+      - type: Custom
+        custom:
+          metric:
+            name: task_queue_length
+          target:
+            type: AverageValue
+            averageValue: "100"
+
+status:
+  phase: Running  # Pending, Running, Succeeded, Failed
+  lastScheduleTime: "2025-11-25T02:00:00Z"
+  lastSuccessTime: "2025-11-25T02:15:30Z"
+  statistics:
+    totalRuns: 150
+    successfulRuns: 148
+    failedRuns: 2
+    totalRecords: 1500000
+```
+
+**(2) DataSource (数据源定义)**
+
+```yaml
+apiVersion: datafusion.io/v1
+kind: DataSource
+metadata:
+  name: ecommerce-website
+spec:
+  type: web-rpa
+  connection:
+    url: "https://example.com/products"
+    authentication:
+      type: cookie
+      secretRef:
+        name: ecommerce-auth
+  rpaConfig:
+    browserType: chromium
+    headless: true
+    waitStrategy:
+      type: networkIdle
+      timeout: 30s
+  selectors:
+    productList: ".product-item"
+    productName: "h2.title"
+    price: "span.price"
+    stock: "div.inventory"
+```
+
+**(3) CleaningRule (数据清洗规则)**
+
+```yaml
+apiVersion: datafusion.io/v1
+kind: CleaningRule
+metadata:
+  name: price-normalization
+spec:
+  targetField: price
+  rules:
+    - type: regex
+      pattern: "[^0-9.]"
+      replacement: ""
+    - type: convert
+      targetType: float
+    - type: validate
+      condition: "value > 0 && value < 1000000"
+```
+
+**2. Controller职责划分**
+
+**(1) CollectionTaskController**
+- 监听CollectionTask资源变化
+- 根据schedule配置创建CronJob或Job
+- 为每个Job创建对应的Worker Pod
+- 监控Job执行状态并更新CollectionTask.status
+- 处理失败重试和告警通知
+- 实现自动扩缩容逻辑
+
+**(2) DataSourceController**
+- 验证DataSource配置的合法性
+- 测试数据源连通性
+- 管理Secret引用的认证信息
+- 更新数据源状态(Available/Unavailable)
+
+**(3) CleaningRuleController**
+- 验证清洗规则语法
+- 将规则编译为可执行的表达式
+- 将规则注入到ConfigMap供Worker使用
+- 支持规则热更新
+
+**3. Reconcile循环逻辑**
+
+```go
+func (r *CollectionTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // 1. 获取CollectionTask资源
+    var task datafusionv1.CollectionTask
+    if err := r.Get(ctx, req.NamespacedName, &task); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // 2. 根据schedule创建或更新CronJob
+    if task.Spec.Schedule.Cron != "" {
+        if err := r.reconcileCronJob(ctx, &task); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    // 3. 管理Worker Pod副本数
+    if err := r.reconcileWorkerPods(ctx, &task); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 4. 处理自动扩缩容
+    if task.Spec.AutoScaling.Enabled {
+        if err := r.reconcileHPA(ctx, &task); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    // 5. 更新status
+    return ctrl.Result{}, r.updateStatus(ctx, &task)
+}
+```
+
+**4. 实施路线图**
+
+```
+Phase 1: 基础框架搭建 (1周)
+├─ 使用kubebuilder初始化Operator项目
+├─ 定义CRD(CollectionTask、DataSource、CleaningRule)
+├─ 设计API版本和字段结构
+└─ 配置RBAC权限和Webhook
+
+Phase 2: 核心Controller开发 (8-10周)
+├─ 实现CollectionTaskController Reconcile逻辑
+├─ 实现DataSourceController和CleaningRuleController
+├─ 开发Admission Webhook(Validation)
+├─ 实现自动扩缩容逻辑
+├─ 编写单元测试和集成测试
+└─ 构建Docker镜像和Helm Chart
+
+Phase 3: Worker组件开发 (4-6周,可与Phase 2并行)
+├─ 开发Web RPA采集器(基于Puppeteer/Playwright)
+├─ 开发API采集器(基于resty)
+├─ 开发数据库采集器
+├─ 实现数据处理和清洗引擎
+└─ 实现数据存储模块
+
+Phase 4: 测试和优化 (2-3周)
+├─ 功能测试和端到端测试
+├─ 压力测试和性能调优
+├─ 故障注入测试(Chaos Engineering)
+├─ 文档编写和部署指南
+└─ 生产环境试运行
+
+总开发周期: 3-4个月
+```
+
+**5. 关键风险和缓解策略**
+
+| 风险类别 | 具体风险 | 影响 | 缓解措施 |
+|---------|---------|------|---------|
+| **技术风险** | CRD设计不合理,频繁变更 | 高 | 前期充分设计评审;实现Conversion Webhook;保持API向后兼容 |
+| | Reconcile逻辑bug导致资源泄漏 | 高 | 完善的单元测试和集成测试;实现资源清理finalizer |
+| | Operator性能瓶颈 | 中 | 使用缓存减少API Server请求;优化Reconcile逻辑 |
+| **团队风险** | 关键人员离职 | 高 | 至少2人掌握Operator开发;完善文档;定期知识分享 |
+| | K8s经验不足 | 中 | 安排培训;引入顾问;从简单功能开始迭代 |
+
+**缓解策略总结:**
+1. **MVP优先**:先实现核心功能(CollectionTask),验证可行性后再扩展
+2. **充分测试**:建立完善的测试体系,包括单元测试、集成测试、混沌工程
+3. **监控告警**:完善的Metrics和日志,快速发现和定位问题
+4. **应急预案**:准备回滚方案,关键功能保留手动操作入口
+5. **知识传承**:完善的文档、代码注释、定期培训
+
+
+
+#### 2.2.2. 技术选型
+
+为了实现上述设计目标,我们选择了以下成熟、开源的技术栈:
 
 | 领域 | 技术选型 | 理由 |
 | :--- | :--- | :--- |
