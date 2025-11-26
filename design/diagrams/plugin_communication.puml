@@ -1,5 +1,4 @@
 @startuml plugin_communication
-!theme plain
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true
 autonumber

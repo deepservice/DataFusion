@@ -1,0 +1,99 @@
+@startuml k8s_operator_class_diagram
+
+' CRD定义
+class CollectionTask {
+  **Spec:**
+  + Name: string
+  + Schedule: string
+  + CollectorType: enum
+  + DataSource: DataSourceRef
+  + Processor: ProcessorConfig
+  + Storage: StorageConfig
+  + RetryPolicy: RetryConfig
+  + ConcurrencyPolicy: enum
+  --
+  **Status:**
+  + Phase: enum
+  + Conditions: []Condition
+  + LastScheduleTime: time
+  + LastSuccessTime: time
+  + ActiveJobs: []JobRef
+  + History: []JobHistory
+}
+
+class DataSource {
+  **Spec:**
+  + Type: enum (Web/API/Database)
+  + ConnectionConfig: map
+  + AuthConfig: AuthInfo
+  + RateLimitConfig: RateLimit
+  --
+  **Status:**
+  + Phase: enum
+  + ConnectionStatus: enum
+  + LastTestTime: time
+}
+
+class CleaningRule {
+  **Spec:**
+  + Name: string
+  + TargetFields: []string
+  + Rules: []RuleDefinition
+  + ValidationRules: []Validator
+  --
+  **Status:**
+  + Active: bool
+  + LastAppliedTime: time
+}
+
+class JobResult {
+  **Spec:**
+  + TaskRef: TaskRef
+  + JobName: string
+  + StartTime: time
+  + CompletionTime: time
+  --
+  **Status:**
+  + Phase: enum
+  + RecordsCollected: int
+  + RecordsProcessed: int
+  + RecordsStored: int
+  + Errors: []ErrorInfo
+}
+
+' Controller结构
+class CollectionTaskReconciler {
+  + Client: client.Client
+  + Scheme: *runtime.Scheme
+  + Recorder: record.EventRecorder
+  --
+  + Reconcile(ctx, req): Result
+  - ensureCronJob(): error
+  - updateStatus(): error
+  - handleDeletion(): error
+}
+
+' 关系
+CollectionTask "1" --> "0..1" DataSource : references
+CollectionTask "1" --> "0..*" CleaningRule : uses
+CollectionTask "1" --> "0..*" JobResult : produces
+
+CollectionTaskReconciler ..> CollectionTask : reconciles
+CollectionTaskReconciler ..> DataSource : watches
+CollectionTaskReconciler ..> CleaningRule : watches
+
+note right of CollectionTask
+  核心CRD: 采集任务定义
+  - 定时/手动触发
+  - 关联数据源和规则
+  - 追踪执行历史
+end note
+
+note right of CollectionTaskReconciler
+  Operator核心控制器
+  - list-watch机制
+  - Reconcile循环
+  - 幂等性保证
+end note
+
+@enduml

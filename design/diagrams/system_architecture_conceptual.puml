@@ -1,0 +1,90 @@
+@startuml system_architecture_conceptual
+!define RECTANGLE class
+
+skinparam componentStyle rectangle
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontSize 12
+
+package "用户层" {
+  [Web浏览器]
+  [第三方应用]
+  [命令行工具]
+}
+
+package "接入层" {
+  [负载均衡器\n& SSL终止]
+  [静态资源托管]
+}
+
+package "前端层" {
+  [Web UI\n(单页应用)]
+}
+
+package "应用服务层" {
+  rectangle "API网关" {
+    [认证授权]
+    [请求路由]
+    [限流控制]
+  }
+
+  rectangle "任务编排服务" {
+    [任务管理]
+    [调度策略]
+    [配置管理]
+    [高可用机制]
+  }
+}
+
+package "任务执行层" {
+  [数据采集器]
+  [数据处理器]
+  [数据存储器]
+}
+
+package "基础设施层" {
+  database "数据存储" {
+    [业务数据库]
+  }
+
+  rectangle "监控与日志" {
+    [指标采集]
+    [日志聚合]
+    [告警通知]
+  }
+
+  rectangle "服务协调" {
+    [服务注册]
+    [配置中心]
+    [健康检查]
+  }
+}
+
+' 连接关系
+[Web浏览器] --> [负载均衡器\n& SSL终止]
+[第三方应用] --> [负载均衡器\n& SSL终止]
+[命令行工具] --> [负载均衡器\n& SSL终止]
+
+[负载均衡器\n& SSL终止] --> [Web UI\n(单页应用)]
+[负载均衡器\n& SSL终止] --> [API网关]
+
+[Web UI\n(单页应用)] --> [API网关]
+
+[API网关] --> [任务编排服务]
+[任务编排服务] ..> [任务执行层] : 任务分发
+[任务执行层] --> [数据存储]
+[任务编排服务] --> [配置中心]
+[任务执行层] --> [监控与日志]
+
+note right of [任务编排服务]
+  声明式管理
+  自动调度
+  故障自愈
+end note
+
+note right of [任务执行层]
+  弹性伸缩
+  水平扩展
+  隔离执行
+end note
+
+@enduml

@@ -1,5 +1,4 @@
 @startuml plugin_registry
-!theme plain
 skinparam classAttributeIconSize 0
 skinparam class {
     BackgroundColor<<interface>> #E8F5E9

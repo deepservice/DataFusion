@@ -1,5 +1,4 @@
 @startuml plugin_lifecycle
-!theme plain
 skinparam state {
     BackgroundColor<<initial>> #90EE90
     BackgroundColor<<running>> #87CEEB

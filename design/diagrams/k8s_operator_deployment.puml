@@ -1,0 +1,111 @@
+@startuml k8s_operator_deployment
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontSize 11
+
+' Kubernetes集群边界
+rectangle "Kubernetes集群" #326CE5 {
+
+  ' datafusion-system命名空间
+  package "命名空间: datafusion-system" #00897B {
+    rectangle "Operator Manager\n(Deployment, 2副本)" as OM {
+      card "Pod 1\n(Leader)" as OM1
+      card "Pod 2\n(Standby)" as OM2
+    }
+
+    database "CRD定义" {
+      [CollectionTask]
+      [DataSource]
+      [CleaningRule]
+    }
+
+    note right of OM
+      - Leader Election
+      - Reconcile循环
+      - Webhook验证
+    end note
+  }
+
+  ' datafusion命名空间
+  package "命名空间: datafusion" #00897B {
+    rectangle "CollectionTask CR实例" as CR {
+      card "task-web-001"
+      card "task-api-002"
+      card "task-db-003"
+    }
+
+    rectangle "CronJob / Job" as Jobs {
+      card "CronJob: web-001\n(定时触发)" as CJ1
+      card "Job: manual-run\n(手动触发)" as J1
+    }
+
+    rectangle "Worker Pods\n(临时执行)" #FF6F00 {
+      card "Pod: collector-web-xxx"
+      card "Pod: collector-api-yyy"
+      card "Pod: collector-db-zzz"
+    }
+
+    database "PostgreSQL\n(业务数据)" {
+      [采集数据表]
+      [任务执行历史]
+    }
+
+    rectangle "ConfigMap / Secret" {
+      [数据源配置]
+      [清洗规则]
+      [凭证信息]
+    }
+  }
+
+  ' datafusion-monitor命名空间
+  package "命名空间: datafusion-monitor" #00897B {
+    rectangle "Prometheus\n(Deployment)" as PROM
+    rectangle "Grafana\n(Deployment)" as GRAF
+    rectangle "AlertManager\n(Deployment)" as ALERT
+  }
+
+  ' K8S原生组件
+  cloud "K8S原生能力" {
+    database "etcd\n(CRD状态存储)"
+    [API Server]
+    [Scheduler]
+    [Controller Manager]
+  }
+}
+
+' 外部访问
+actor "用户/系统" as User
+[kubectl / K8S API] as CLI
+
+' 连接关系
+User --> CLI
+CLI --> [API Server]
+
+[API Server] <--> OM : list-watch
+[API Server] <--> etcd
+OM --> CR : 创建/更新
+CR --> Jobs : 触发
+Jobs --> [Worker Pods\n(临时执行)] : 创建Pod
+[Worker Pods\n(临时执行)] --> [PostgreSQL\n(业务数据)] : 存储数据
+[Worker Pods\n(临时执行)] --> [ConfigMap / Secret] : 读取配置
+[Worker Pods\n(临时执行)] --> PROM : 上报Metrics
+OM --> PROM : 上报Metrics
+PROM --> GRAF : 数据查询
+PROM --> ALERT : 告警规则
+
+note bottom of [Worker Pods\n(临时执行)]
+  - 动态创建
+  - 任务完成后销毁
+  - 资源自动回收
+end note
+
+legend right
+  |= 组件类型 |= 说明 |
+  | CRD | 自定义资源定义 |
+  | Operator | 自定义控制器 |
+  | CronJob | 定时任务 |
+  | Job | 一次性任务 |
+  | Pod | 容器运行实例 |
+endlegend
+
+@enduml
