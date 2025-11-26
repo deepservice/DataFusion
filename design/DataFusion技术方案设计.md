@@ -4948,6 +4948,561 @@ spec:
 ```
 
 这样设计后，Worker Job Pod成为完全无状态的临时容器，Controller只需创建Job，K8S自动调度、监控、重试，大幅简化了系统复杂度。
+
+#### 3.2.7. Deployment常驻Worker架构（架构优化方案）
+
+> **设计背景**：当前基于CronJob/Job的临时Pod架构在高频采集场景下存在显著的容器启动开销（5-8秒Pod启动 + 3-5秒浏览器初始化），导致2分钟间隔的API采集任务中，启动开销占比高达60-71%。为提升性能并降低资源峰值，本节提出基于Deployment的常驻Worker架构优化方案。
+
+##### 3.2.7.1. 架构对比与优化目标
+
+**当前架构（Job临时Pod模式）**
+
+```
+CollectionTask CR
+  → Operator创建CronJob
+  → 定时创建Job Pod（每次启动新容器）
+  → Pod执行：读ConfigMap → 初始化浏览器 → 采集 → 处理 → 存储 → 上报Metrics
+  → Pod销毁（浏览器关闭、连接断开）
+  → Controller watch Job状态 → 更新CR.status
+```
+
+**优化架构（Deployment常驻Worker模式）**
+
+```
+CollectionTask CR
+  → Operator写入PostgreSQL任务配置表
+  → 常驻Worker Pod定时器轮询PostgreSQL（每30秒）
+  → 获取到期任务
+  → 分布式锁争抢（PostgreSQL行锁）
+  → 抢到锁的Worker执行任务
+  → Worker执行：复用浏览器池/连接池 → 采集 → 处理 → 存储
+  → 更新PostgreSQL执行记录
+  → Operator定期同步状态到CR.status（每1分钟）
+```
+
+**性能优化目标**
+
+| 场景 | Job模式耗时 | Deployment模式耗时 | 优化幅度 |
+|-----|------------|-------------------|---------|
+| 高频API采集（2分钟间隔） | 5-7秒（启动3-5秒 + 采集2秒） | 2秒（采集2秒） | **-60~71%** |
+| RPA轻量采集（5分钟间隔） | 18-23秒（Pod启动5-8秒 + 浏览器启动3-5秒 + 采集10秒） | 10.1秒（池获取0.1秒 + 采集10秒） | **-44~56%** |
+| 资源峰值（100个任务） | 10GB内存（100个Pod） | 6GB内存（7个常驻Pod） | **-40%** |
+
+##### 3.2.7.2. 核心技术设计
+
+###### (1) PostgreSQL作为任务配置中心
+
+不引入RabbitMQ等消息队列，充分复用PostgreSQL作为任务配置存储和分布式锁管理。
+
+**任务配置表（collection_tasks）**
+
+```sql
+CREATE TABLE collection_tasks (
+    id UUID PRIMARY KEY,
+    name VARCHAR(200) NOT NULL,
+
+    -- CR关联
+    cr_namespace VARCHAR(63),
+    cr_name VARCHAR(253),
+    cr_uid VARCHAR(36) UNIQUE,
+    cr_generation BIGINT,  -- 检测配置变更
+
+    -- Collector配置
+    collector_type VARCHAR(50),  -- api, web-rpa, database
+    collector_config JSONB,
+
+    -- 调度配置
+    schedule_cron VARCHAR(100),
+    schedule_timezone VARCHAR(50) DEFAULT 'UTC',
+    enabled BOOLEAN DEFAULT true,
+
+    -- 数据处理配置
+    parsing_rules JSONB,
+    cleaning_rules JSONB,
+
+    -- 存储配置
+    storage_type VARCHAR(50),
+    storage_config JSONB,
+
+    -- 运行时状态
+    next_run_time TIMESTAMP,  -- Worker轮询此字段
+    last_success_time TIMESTAMP,
+
+    -- 统计
+    total_runs BIGINT DEFAULT 0,
+    successful_runs BIGINT DEFAULT 0,
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+
+    INDEX idx_enabled_next_run (enabled, next_run_time)
+);
+```
+
+**任务执行记录表（task_executions）**
+
+```sql
+CREATE TABLE task_executions (
+    id UUID PRIMARY KEY,
+    task_id UUID REFERENCES collection_tasks(id),
+
+    status VARCHAR(20),  -- running, success, failed
+    start_time TIMESTAMP NOT NULL,
+    end_time TIMESTAMP,
+
+    worker_pod VARCHAR(255),  -- Pod名称
+    records_fetched INTEGER,
+    records_stored INTEGER,
+    error_message TEXT,
+
+    retry_count INTEGER DEFAULT 0,
+
+    INDEX idx_task_id_start_time (task_id, start_time DESC)
+);
+```
+
+**分布式锁表（task_locks）**
+
+```sql
+CREATE TABLE task_locks (
+    id UUID PRIMARY KEY,
+    task_id UUID UNIQUE NOT NULL,
+    locked_at TIMESTAMP,
+    locked_by VARCHAR(255),  -- Pod名称
+    lock_version BIGINT DEFAULT 0
+);
+```
+
+###### (2) 分布式锁机制（PostgreSQL行锁）
+
+使用PostgreSQL的`FOR UPDATE SKIP LOCKED`实现分布式锁，保证多副本场景下任务不重复执行。
+
+```sql
+BEGIN;
+
+-- 尝试抢锁（抢不到直接跳过，不阻塞）
+SELECT id FROM task_locks
+WHERE task_id = $1
+FOR UPDATE SKIP LOCKED;
+
+-- 如果抢到锁，更新锁信息
+UPDATE task_locks
+SET locked_at = NOW(),
+    locked_by = $2,  -- Pod名称
+    lock_version = lock_version + 1
+WHERE task_id = $1;
+
+COMMIT;
+
+-- 执行任务...
+
+-- 释放锁
+UPDATE task_locks
+SET locked_at = NULL, locked_by = NULL
+WHERE task_id = $1;
+```
+
+**优势**：
+- 无需额外组件，复用PostgreSQL
+- SKIP LOCKED避免阻塞，性能好
+- 事务保证可靠性
+- 自动死锁检测
+
+###### (3) 浏览器池设计（RPA Worker专用）
+
+```go
+type BrowserPool struct {
+    pool        chan *BrowserInstance
+    poolSize    int
+    maxLifetime time.Duration  // 30分钟
+    maxIdleTime time.Duration  // 10分钟
+}
+
+type BrowserInstance struct {
+    Browser     playwright.Browser
+    Context     playwright.BrowserContext
+    CreatedAt   time.Time
+    UsageCount  int64
+    LastUsedAt  time.Time
+}
+```
+
+**工作流程**：
+1. Pod启动时预创建5个浏览器实例
+2. 执行任务时从池获取实例（channel阻塞等待）
+3. 使用完毕归还池（清除cookie/localStorage，关闭页面）
+4. 后台goroutine定期健康检查，回收过期实例（30分钟超时或使用100次）
+
+**性能提升**：浏览器启动耗时从3-5秒降至0.1秒（池获取），**减少97%**
+
+###### (4) Worker内部架构
+
+Worker Pod启动后的初始化流程：
+
+```go
+func main() {
+    // 1. 初始化PostgreSQL连接池（25个连接）
+    db, _ := worker.NewDBPool(context.Background())
+
+    // 2. 初始化资源池
+    switch collectorType {
+    case "web-rpa":
+        browserPool, _ := worker.NewBrowserPool(5)  // 预创建5个浏览器
+    case "api":
+        httpPool := worker.NewHTTPClientPool()      // HTTP连接复用
+    case "database":
+        dbConnPool := worker.NewTargetDBPool()      // 数据库连接池
+    }
+
+    // 3. 启动Metrics和健康检查服务
+    go metrics.NewServer(":9090").Start()   // Prometheus抓取
+    go worker.NewHealthServer(":8080").Start()  // K8S探针
+
+    // 4. 创建调度器（每30秒轮询PostgreSQL）
+    scheduler := worker.NewScheduler(worker.SchedulerConfig{
+        DB:           db,
+        PollInterval: 30 * time.Second,
+    })
+
+    // 5. 启动调度器
+    scheduler.Start(context.Background())
+
+    // 6. 优雅关闭（等待任务完成，最多120秒）
+    <-sigterm
+    scheduler.Shutdown(context.WithTimeout(context.Background(), 120*time.Second))
+}
+```
+
+**调度器核心逻辑**：
+
+```go
+func (s *Scheduler) pollAndExecute(ctx context.Context) {
+    // 1. 查询到期且未锁定的任务
+    tasks, _ := s.fetchDueTasks(ctx)  // WHERE enabled=true AND next_run_time <= NOW()
+
+    // 2. 为每个任务尝试抢锁并执行
+    for _, task := range tasks {
+        go func(t *Task) {
+            // 尝试抢锁
+            locked, _ := s.acquireLock(ctx, t.ID)
+            if !locked {
+                return  // 抢锁失败，其他Worker执行
+            }
+            defer s.releaseLock(ctx, t.ID)
+
+            // 执行任务（带重试，最多3次）
+            s.executeTaskWithRetry(ctx, t)
+
+            // 更新next_run_time（根据cron表达式）
+            s.updateNextRunTime(ctx, t)
+        }(task)
+    }
+}
+```
+
+##### 3.2.7.3. Controller改造设计
+
+**Reconcile逻辑变更**
+
+```go
+func (r *CollectionTaskReconciler) Reconcile(ctx, req) {
+    // 1. 获取CR
+    var task datafusionv1.CollectionTask
+    r.Get(ctx, req.NamespacedName, &task)
+
+    // 2. 同步CR配置到PostgreSQL
+    r.syncCRToDB(ctx, &task)  // 检查generation变更，INSERT或UPDATE
+
+    // 3. 从PostgreSQL同步执行状态到CR.status
+    r.syncDBToStatus(ctx, &task)  // 查询task_executions最新记录
+
+    // 4. 定期Reconcile（每1分钟）
+    return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+}
+```
+
+**删除的逻辑**：
+- ~~`r.reconcileCronJob(ctx, &task)`~~ - 不再创建CronJob
+- ~~`r.reconcileWorkerPods(ctx, &task)`~~ - 不再创建Job Pod
+- ~~`r.createConfigMap(ctx, &task)`~~ - 配置存储在PostgreSQL
+
+**ConfigMap/Secret处理**：
+- 所有配置存储在PostgreSQL的JSONB字段
+- 敏感信息（如数据库密码）仍使用K8S Secret，Worker启动时通过envFrom注入
+
+##### 3.2.7.4. Deployment配置
+
+**RPA Collector Deployment**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rpa-collector
+  namespace: datafusion
+spec:
+  replicas: 1  # 默认1副本，手动修改扩缩容
+  selector:
+    matchLabels:
+      app: rpa-collector
+  template:
+    metadata:
+      labels:
+        app: rpa-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      containers:
+      - name: rpa-collector
+        image: datafusion/rpa-collector:v1.0.0
+
+        env:
+        - name: COLLECTOR_TYPE
+          value: "web-rpa"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+        # PostgreSQL连接配置（从Secret读取）
+        envFrom:
+        - secretRef:
+            name: postgresql-credentials
+        - configMapRef:
+            name: browser-pool-config
+
+        ports:
+        - name: metrics
+          containerPort: 9090
+        - name: health
+          containerPort: 8080
+
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 30
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "2Gi"
+          limits:
+            cpu: "2000m"
+            memory: "4Gi"
+
+        # 浏览器需要共享内存
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Gi
+
+      terminationGracePeriodSeconds: 120  # 优雅终止，等待任务完成
+```
+
+**API Collector Deployment**（更轻量）
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-collector
+  namespace: datafusion
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-collector
+  template:
+    spec:
+      containers:
+      - name: api-collector
+        image: datafusion/api-collector:v1.0.0
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        # ...（同上，省略重复配置）
+```
+
+**Database Collector Deployment**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-collector
+  namespace: datafusion
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db-collector
+  template:
+    spec:
+      containers:
+      - name: db-collector
+        image: datafusion/db-collector:v1.0.0
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+        # ...（同上，省略重复配置）
+```
+
+##### 3.2.7.5. 监控与可观测性
+
+**新增Metrics指标**
+
+```go
+// 分布式锁指标
+datafusion_lock_acquired_total{task_id}          // 抢锁成功次数
+datafusion_lock_contention_total{task_id}        // 抢锁失败次数
+datafusion_lock_hold_duration_seconds{task_id}   // 锁持有时间
+
+// 浏览器池指标
+datafusion_browser_pool_size                     // 池大小
+datafusion_browser_pool_available                // 可用浏览器数
+datafusion_browser_instance_age_seconds          // 浏览器实例年龄
+
+// 数据库连接池指标
+datafusion_db_pool_open_connections              // 打开连接数
+datafusion_db_pool_idle_connections              // 空闲连接数
+```
+
+**Prometheus告警规则**
+
+```yaml
+# 浏览器池耗尽
+- alert: BrowserPoolExhausted
+  expr: datafusion_browser_pool_available == 0
+  for: 1m
+  labels:
+    severity: warning
+
+# 锁争用频繁
+- alert: LockContentionHigh
+  expr: |
+    rate(datafusion_lock_contention_total[5m])
+    / (rate(datafusion_lock_acquired_total[5m]) + rate(datafusion_lock_contention_total[5m])) > 0.5
+  for: 5m
+  labels:
+    severity: warning
+```
+
+##### 3.2.7.6. 故障恢复与容错
+
+**Pod重启恢复**
+
+```go
+func (s *Scheduler) recoverUnfinishedTasks(ctx context.Context) {
+    // 查询运行中但Worker已不存在的任务
+    query := `
+        SELECT id, task_id FROM task_executions
+        WHERE status = 'running'
+          AND worker_pod = $1
+          AND start_time < NOW() - INTERVAL '10 minutes'
+    `
+
+    for _, exec := range executions {
+        // 标记为失败
+        db.Exec("UPDATE task_executions SET status = 'failed', error_message = 'Worker pod restarted' WHERE id = $1", exec.ID)
+
+        // 释放锁
+        s.releaseLock(ctx, exec.TaskID)
+    }
+}
+```
+
+**优雅关闭**
+
+```go
+func (s *Scheduler) Shutdown(ctx context.Context) {
+    // 1. 停止接收新任务
+    s.stopPolling()
+
+    // 2. 等待运行中的任务完成
+    done := make(chan struct{})
+    go func() {
+        s.waitForRunningTasks()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        log.Info("All tasks completed gracefully")
+    case <-ctx.Done():
+        log.Warn("Shutdown timeout, canceling running tasks")
+        s.cancelAllTasks()
+    }
+
+    // 3. 释放所有锁、关闭资源池、关闭数据库连接
+    s.releaseAllLocks()
+    s.resourcePool.Close()
+    s.db.Close()
+}
+```
+
+**terminationGracePeriodSeconds: 120** - K8S会先发送SIGTERM，等待120秒后才发送SIGKILL
+
+##### 3.2.7.7. 迁移实施计划
+
+**分阶段渐进式迁移**
+
+| 阶段 | 时间 | 目标 | 关键任务 |
+|-----|------|------|---------|
+| **准备阶段** | 1-2周 | 搭建基础设施 | 创建PostgreSQL表、部署Deployment(replicas=0)、构建Worker镜像 |
+| **双写阶段** | 2-4周 | Controller同时支持Job和PostgreSQL | 修改Reconcile逻辑、保留CronJob创建、新增syncCRToDB |
+| **Canary测试** | 1-2周 | 小范围验证 | 选择3-5个低优先级任务、启动Worker(replicas=1)、监控1周 |
+| **灰度迁移** | 2-4周 | 分批迁移 | Week1:API Collector、Week2:DB Collector、Week3-4:RPA Collector |
+| **完全切换** | 1周 | 删除Job代码 | 删除CronJob逻辑、清理Job资源、观察3-5天 |
+
+**回滚方案**：每个阶段都可独立回滚
+- 阶段2：删除syncCRToDB逻辑，CronJob继续工作
+- 阶段3：缩容Deployment到0，删除Canary任务annotation
+- 阶段4：删除已迁移任务annotation，缩容Deployment
+- 阶段5：回滚Controller到旧版本
+
+##### 3.2.7.8. 架构对比总结
+
+| 维度 | Job临时Pod模式 | Deployment常驻Worker模式 |
+|-----|--------------|----------------------|
+| **性能** | 启动开销60-71%（高频任务） | 启动开销0%，性能提升60-72% |
+| **资源** | 峰值10GB（100个Pod） | 峰值6GB（7个Pod），节省40% |
+| **复杂度** | 简单，K8S原生调度 | 中等，需管理PostgreSQL和分布式锁 |
+| **可扩展性** | K8S自动调度 | 手动修改replicas，支持HPA（可选） |
+| **故障恢复** | Job失败自动重试 | Worker内部重试 + Pod重启恢复 |
+| **适用场景** | 低频任务、一次性任务 | 高频任务、资源密集型任务 |
+
+**推荐策略**：
+- **当前阶段**：保留Job模式用于低频任务（>1小时间隔）和一次性导入
+- **未来优化**：高频任务（<5分钟间隔）全部迁移到Deployment模式
+- **混合架构**：根据任务特征智能选择（可通过CR annotation控制）
+
+---
+
+**设计要点**：本架构优化方案在不破坏现有Job模式的前提下，通过引入Deployment常驻Worker和PostgreSQL任务配置中心，实现了高频任务的显著性能提升。核心创新点包括：（1）零外部依赖的分布式锁（PostgreSQL行锁）、（2）浏览器池和连接池复用、（3）渐进式迁移策略。该方案已在计划文档中详细设计，待资源充足时可逐步实施。
+
 ### 3.3. 核心类型与接口设计
 
 DataFusion采用K8S+Operator架构，系统核心由**CRD类型定义**、**Controller Reconcile逻辑**和**插件接口**三部分组成。本节从架构师视角，阐述系统的类型设计、接口抽象和设计原则，体现K8S声明式API和插件化架构的优势。

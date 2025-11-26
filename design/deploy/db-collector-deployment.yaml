@@ -1,0 +1,214 @@
+# DataFusion - Database Collector Deployment
+# 用途：常驻Worker，用于执行数据库采集任务
+# 特点：包含数据库连接池，适合高频数据库数据采集
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-collector
+  namespace: datafusion
+  labels:
+    app: db-collector
+    component: collector
+    collector-type: database
+spec:
+  # 副本数（默认1，手动调整扩缩容）
+  replicas: 1
+
+  # 滚动更新策略
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # 保证始终有1个Pod可用
+
+  selector:
+    matchLabels:
+      app: db-collector
+
+  template:
+    metadata:
+      labels:
+        app: db-collector
+        component: collector
+        collector-type: database
+      annotations:
+        # Prometheus自动发现配置
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+        # 配置版本
+        config/version: "1.0.0"
+
+    spec:
+      # 服务账号
+      serviceAccountName: datafusion-worker
+
+      # 容器配置
+      containers:
+      - name: db-collector
+        # 镜像
+        image: datafusion/db-collector:v1.0.0
+        imagePullPolicy: IfNotPresent
+
+        # 环境变量
+        env:
+        # Worker类型标识
+        - name: COLLECTOR_TYPE
+          value: "database"
+
+        # Pod信息
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+
+        # 日志配置
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_FORMAT
+          value: "json"
+
+        # 数据库连接池配置
+        - name: DB_POOL_MAX_OPEN_CONNS
+          value: "25"
+        - name: DB_POOL_MAX_IDLE_CONNS
+          value: "5"
+        - name: DB_POOL_CONN_MAX_LIFETIME
+          value: "30m"
+        - name: DB_POOL_CONN_MAX_IDLE_TIME
+          value: "10m"
+
+        # 调度器配置
+        - name: SCHEDULER_POLL_INTERVAL
+          value: "30s"
+        - name: SCHEDULER_MAX_CONCURRENT_TASKS
+          value: "3"
+
+        # 从Secret注入环境变量
+        envFrom:
+        # PostgreSQL连接配置（控制面数据库）
+        - secretRef:
+            name: postgresql-credentials
+
+        # 端口配置
+        ports:
+        # Metrics端口
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        # 健康检查端口
+        - name: health
+          containerPort: 8080
+          protocol: TCP
+
+        # 存活探针
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        # 就绪探针
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # 启动探针
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 6  # 最多30秒启动时间
+
+        # 资源配置
+        resources:
+          requests:
+            cpu: "500m"       # 0.5核CPU
+            memory: "1Gi"     # 1GB内存
+          limits:
+            cpu: "1000m"      # 最多1核CPU
+            memory: "2Gi"     # 最多2GB内存
+
+        # 安全上下文
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+
+      # 优雅终止时间
+      terminationGracePeriodSeconds: 60
+
+---
+# HorizontalPodAutoscaler（可选）
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: db-collector-hpa
+  namespace: datafusion
+  labels:
+    app: db-collector
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: db-collector
+
+  # 副本数范围
+  minReplicas: 1
+  maxReplicas: 5
+
+  # 扩缩容指标
+  metrics:
+  # CPU利用率
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+  # 内存利用率
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+  # 扩缩容行为
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60

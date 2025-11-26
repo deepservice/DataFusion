@@ -1,0 +1,251 @@
+# DataFusion - RPA Collector Deployment
+# 用途：常驻Worker，用于执行RPA网页采集任务
+# 特点：包含浏览器池，适合高频轻量级网页采集
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rpa-collector
+  namespace: datafusion
+  labels:
+    app: rpa-collector
+    component: collector
+    collector-type: web-rpa
+spec:
+  # 副本数（默认1，手动调整扩缩容）
+  replicas: 1
+
+  # 滚动更新策略
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # 保证始终有1个Pod可用
+
+  selector:
+    matchLabels:
+      app: rpa-collector
+
+  template:
+    metadata:
+      labels:
+        app: rpa-collector
+        component: collector
+        collector-type: web-rpa
+      annotations:
+        # Prometheus自动发现配置
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+        # 配置版本（更新后重启Pod）
+        config/version: "1.0.0"
+
+    spec:
+      # 服务账号（用于访问K8S API，如需要）
+      serviceAccountName: datafusion-worker
+
+      # 容器配置
+      containers:
+      - name: rpa-collector
+        # 镜像（需要替换为实际镜像）
+        image: datafusion/rpa-collector:v1.0.0
+        imagePullPolicy: IfNotPresent
+
+        # 环境变量
+        env:
+        # Worker类型标识
+        - name: COLLECTOR_TYPE
+          value: "web-rpa"
+
+        # Pod信息（用于分布式锁）
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+
+        # 日志配置
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_FORMAT
+          value: "json"
+
+        # 浏览器池配置
+        - name: BROWSER_POOL_SIZE
+          value: "5"
+        - name: BROWSER_MAX_LIFETIME
+          value: "30m"
+        - name: BROWSER_MAX_IDLE_TIME
+          value: "10m"
+        - name: BROWSER_MAX_USAGE_COUNT
+          value: "100"
+
+        # 调度器配置
+        - name: SCHEDULER_POLL_INTERVAL
+          value: "30s"
+        - name: SCHEDULER_MAX_CONCURRENT_TASKS
+          value: "3"
+
+        # 从Secret和ConfigMap注入环境变量
+        envFrom:
+        # PostgreSQL连接配置
+        - secretRef:
+            name: postgresql-credentials
+        # 浏览器池配置（可选，也可用环境变量）
+        - configMapRef:
+            name: browser-pool-config
+            optional: true
+
+        # 端口配置
+        ports:
+        # Metrics端口（Prometheus抓取）
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        # 健康检查端口
+        - name: health
+          containerPort: 8080
+          protocol: TCP
+
+        # 存活探针（检测Pod是否需要重启）
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 30  # 浏览器池初始化需要时间
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        # 就绪探针（检测Pod是否可接收流量）
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # 启动探针（给予充足的启动时间）
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 12  # 最多60秒启动时间
+
+        # 资源配置
+        resources:
+          requests:
+            cpu: "1000m"      # 1核CPU
+            memory: "2Gi"     # 2GB内存
+          limits:
+            cpu: "2000m"      # 最多2核CPU
+            memory: "4Gi"     # 最多4GB内存
+
+        # 卷挂载
+        volumeMounts:
+        # 浏览器共享内存（Playwright需要）
+        - name: dshm
+          mountPath: /dev/shm
+
+        # 安全上下文
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: false  # Playwright需要写入临时文件
+
+      # 卷定义
+      volumes:
+      # 共享内存（浏览器需要）
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Gi
+
+      # 优雅终止时间（等待任务完成）
+      terminationGracePeriodSeconds: 120
+
+      # 节点亲和性（可选，指定特定节点）
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #       - matchExpressions:
+      #         - key: workload-type
+      #           operator: In
+      #           values:
+      #           - datafusion-worker
+
+      # 容忍度（可选，允许调度到特定污点节点）
+      # tolerations:
+      # - key: "datafusion-worker"
+      #   operator: "Equal"
+      #   value: "true"
+      #   effect: "NoSchedule"
+
+---
+# HorizontalPodAutoscaler（可选，自动扩缩容）
+# 注意：当前设计是手动扩缩容，此HPA仅供参考
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rpa-collector-hpa
+  namespace: datafusion
+  labels:
+    app: rpa-collector
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rpa-collector
+
+  # 副本数范围
+  minReplicas: 1
+  maxReplicas: 5
+
+  # 扩缩容指标
+  metrics:
+  # CPU利用率
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70  # CPU超过70%时扩容
+
+  # 内存利用率
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80  # 内存超过80%时扩容
+
+  # 扩缩容行为
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5分钟稳定窗口
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60  # 每分钟最多缩容50%
+    scaleUp:
+      stabilizationWindowSeconds: 60  # 1分钟稳定窗口
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60  # 每分钟最多扩容100%

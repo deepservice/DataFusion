@@ -1,0 +1,214 @@
+# DataFusion - API Collector Deployment
+# 用途：常驻Worker，用于执行API接口采集任务
+# 特点：轻量级，HTTP连接复用，适合高频API采集
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-collector
+  namespace: datafusion
+  labels:
+    app: api-collector
+    component: collector
+    collector-type: api
+spec:
+  # 副本数（默认1，手动调整扩缩容）
+  replicas: 1
+
+  # 滚动更新策略
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # 保证始终有1个Pod可用
+
+  selector:
+    matchLabels:
+      app: api-collector
+
+  template:
+    metadata:
+      labels:
+        app: api-collector
+        component: collector
+        collector-type: api
+      annotations:
+        # Prometheus自动发现配置
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+        # 配置版本
+        config/version: "1.0.0"
+
+    spec:
+      # 服务账号
+      serviceAccountName: datafusion-worker
+
+      # 容器配置
+      containers:
+      - name: api-collector
+        # 镜像
+        image: datafusion/api-collector:v1.0.0
+        imagePullPolicy: IfNotPresent
+
+        # 环境变量
+        env:
+        # Worker类型标识
+        - name: COLLECTOR_TYPE
+          value: "api"
+
+        # Pod信息
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+
+        # 日志配置
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_FORMAT
+          value: "json"
+
+        # HTTP客户端池配置
+        - name: HTTP_MAX_IDLE_CONNS
+          value: "100"
+        - name: HTTP_MAX_CONNS_PER_HOST
+          value: "10"
+        - name: HTTP_IDLE_CONN_TIMEOUT
+          value: "90s"
+        - name: HTTP_TIMEOUT
+          value: "30s"
+
+        # 调度器配置
+        - name: SCHEDULER_POLL_INTERVAL
+          value: "30s"
+        - name: SCHEDULER_MAX_CONCURRENT_TASKS
+          value: "5"  # API采集可以更高并发
+
+        # 从Secret注入环境变量
+        envFrom:
+        # PostgreSQL连接配置
+        - secretRef:
+            name: postgresql-credentials
+
+        # 端口配置
+        ports:
+        # Metrics端口
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        # 健康检查端口
+        - name: health
+          containerPort: 8080
+          protocol: TCP
+
+        # 存活探针
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        # 就绪探针
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # 启动探针
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 6  # 最多30秒启动时间
+
+        # 资源配置（比RPA更轻量）
+        resources:
+          requests:
+            cpu: "500m"       # 0.5核CPU
+            memory: "512Mi"   # 512MB内存
+          limits:
+            cpu: "1000m"      # 最多1核CPU
+            memory: "1Gi"     # 最多1GB内存
+
+        # 安全上下文
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true  # API采集不需要写入文件
+
+      # 优雅终止时间
+      terminationGracePeriodSeconds: 60
+
+---
+# HorizontalPodAutoscaler（可选）
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-collector-hpa
+  namespace: datafusion
+  labels:
+    app: api-collector
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-collector
+
+  # 副本数范围
+  minReplicas: 1
+  maxReplicas: 10  # API采集可以更多副本
+
+  # 扩缩容指标
+  metrics:
+  # CPU利用率
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+  # 内存利用率
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+  # 扩缩容行为
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60

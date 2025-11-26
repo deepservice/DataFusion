@@ -1,0 +1,253 @@
+# DataFusion - Collector Services
+# 用途：为Collector Deployment创建Service，用于Prometheus Metrics抓取和健康检查
+
+---
+# RPA Collector Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: rpa-collector
+  namespace: datafusion
+  labels:
+    app: rpa-collector
+    component: collector
+    collector-type: web-rpa
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless Service，用于Pod直接访问
+  selector:
+    app: rpa-collector
+
+  ports:
+  # Metrics端口（Prometheus抓取）
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+
+  # 健康检查端口
+  - name: health
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+
+  # Session亲和性（可选，保持连接到同一Pod）
+  sessionAffinity: None
+
+---
+# API Collector Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-collector
+  namespace: datafusion
+  labels:
+    app: api-collector
+    component: collector
+    collector-type: api
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless Service
+  selector:
+    app: api-collector
+
+  ports:
+  # Metrics端口
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+
+  # 健康检查端口
+  - name: health
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+
+  sessionAffinity: None
+
+---
+# Database Collector Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-collector
+  namespace: datafusion
+  labels:
+    app: db-collector
+    component: collector
+    collector-type: database
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless Service
+  selector:
+    app: db-collector
+
+  ports:
+  # Metrics端口
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+
+  # 健康检查端口
+  - name: health
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+
+  sessionAffinity: None
+
+---
+# ServiceMonitor（Prometheus Operator）
+# 用途：自动配置Prometheus抓取Collector Metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: datafusion-collectors
+  namespace: datafusion
+  labels:
+    app: datafusion-collector
+    prometheus: kube-prometheus
+spec:
+  # 选择Service
+  selector:
+    matchLabels:
+      component: collector
+
+  # 命名空间选择器
+  namespaceSelector:
+    matchNames:
+    - datafusion
+
+  # Metrics抓取端点配置
+  endpoints:
+  - port: metrics
+    interval: 30s  # 每30秒抓取一次
+    scrapeTimeout: 10s
+    path: /metrics
+    scheme: http
+
+    # 重新标记（可选）
+    relabelings:
+    # 添加collector_type标签
+    - sourceLabels: [__meta_kubernetes_service_label_collector_type]
+      targetLabel: collector_type
+      action: replace
+
+    # 添加pod标签
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod
+      action: replace
+
+    # 添加namespace标签
+    - sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+      action: replace
+
+---
+# ConfigMap - Browser Pool Configuration
+# 用途：浏览器池配置（可选，也可用环境变量）
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: browser-pool-config
+  namespace: datafusion
+  labels:
+    app: rpa-collector
+data:
+  browser_pool_size: "5"
+  browser_max_lifetime: "30m"
+  browser_max_idle_time: "10m"
+  browser_max_usage_count: "100"
+  browser_headless: "true"
+  browser_disable_gpu: "true"
+
+---
+# Secret - PostgreSQL Credentials
+# 用途：PostgreSQL连接凭证（示例，生产环境应使用Vault等密钥管理系统）
+# 注意：此Secret需要提前创建或由外部系统管理
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgresql-credentials
+  namespace: datafusion
+  labels:
+    app: datafusion
+type: Opaque
+stringData:
+  # PostgreSQL连接配置
+  POSTGRES_HOST: "postgresql.datafusion.svc.cluster.local"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "datafusion_control"
+  POSTGRES_USER: "datafusion_worker"
+  POSTGRES_PASSWORD: "CHANGE_ME_IN_PRODUCTION"  # 生产环境必须修改
+
+  # 连接池配置
+  POSTGRES_MAX_CONNS: "25"
+  POSTGRES_MIN_CONNS: "5"
+  POSTGRES_MAX_CONN_LIFETIME: "30m"
+  POSTGRES_MAX_CONN_IDLE_TIME: "10m"
+
+---
+# ServiceAccount - DataFusion Worker
+# 用途：Worker Pod使用的服务账号
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: datafusion-worker
+  namespace: datafusion
+  labels:
+    app: datafusion
+
+---
+# Role - DataFusion Worker
+# 用途：Worker Pod所需的K8S权限（如果需要访问K8S API）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: datafusion-worker
+  namespace: datafusion
+  labels:
+    app: datafusion
+rules:
+# 读取ConfigMap和Secret（如果需要）
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+
+# 读取Pod信息（用于监控和调试）
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+# RoleBinding - DataFusion Worker
+# 用途：绑定Role到ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: datafusion-worker
+  namespace: datafusion
+  labels:
+    app: datafusion
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: datafusion-worker
+subjects:
+- kind: ServiceAccount
+  name: datafusion-worker
+  namespace: datafusion
