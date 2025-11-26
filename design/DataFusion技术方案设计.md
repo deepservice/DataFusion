@@ -318,6 +318,24 @@
 
 基于Kubernetes Operator模式,系统架构设计的核心要点如下:
 
+**Kubernetes Operator部署架构:**
+
+![Kubernetes Operator部署架构图](diagrams/k8s_operator_deployment.png)
+
+如上图所示,K8S Operator架构将系统部署在Kubernetes集群中,主要包含三个命名空间:
+
+- **datafusion-system命名空间**: 部署Operator Manager(2副本高可用)和CRD定义
+- **datafusion命名空间**: 运行CollectionTask CR实例、动态创建的Worker Pods、PostgreSQL业务数据库
+- **datafusion-monitor命名空间**: 部署Prometheus、Grafana、AlertManager监控组件
+
+核心工作流程:
+1. 用户通过kubectl或K8S API创建/更新CollectionTask CR
+2. Operator Manager监听(list-watch)CR变化,触发Reconcile循环
+3. Operator根据CR配置创建对应的CronJob/Job
+4. K8S Scheduler调度Job创建临时Worker Pod执行采集任务
+5. Worker Pod完成任务后自动销毁,释放资源
+6. 执行结果存储到PostgreSQL,Metrics上报到Prometheus
+
 **1. 自定义资源(CRD)设计**
 
 定义以下核心CRD,通过声明式API管理数据采集全生命周期:
