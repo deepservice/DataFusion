@@ -584,7 +584,7 @@ Phase 4: 测试和优化 (2-3周)
 | **JSONPath解析** | gjson (Go) | 高性能的Go JSON解析库，支持复杂的JSONPath表达式，用于从API响应中提取目标数据。 |
 | **清洗规则引擎** | expr (Go) | 快速、安全的表达式引擎，支持自定义函数和变量，用于实现灵活的数据清洗规则DSL。 |
 | **数据库** | PostgreSQL, MongoDB | **PostgreSQL** 用于存储任务配置、调度信息、用户信息、清洗规则、字段映射等结构化数据。**MongoDB** 作为可选的数据存储目标，适合存储非结构化的采集结果。 |
-| **任务调度** | K8S CronJob/Job | K8S原生的任务调度机制，支持定时任务和一次性任务，无需额外的消息队列中间件。 |
+| **任务调度** | PostgreSQL + Worker轮询 | Worker Pod轮询PostgreSQL任务配置表，通过分布式锁争抢任务执行权，无需消息队列中间件。详见[2.3.1节部署方式说明](#231-部署方式说明)。 |
 | **服务发现**| K8S Service/DNS | K8S内置服务发现机制，通过Service和DNS实现Pod间通信和负载均衡。 |
 | **配置管理** | ConfigMap/Secret | K8S原生配置管理，ConfigMap存储配置数据，Secret存储敏感凭证，支持热更新。 |
 | **MCP SDK** | MCP Go SDK | Model Context Protocol官方Go SDK，用于实现标准的MCP Server，对外提供工具（Tools）和资源（Resources）访问能力。 |
@@ -607,7 +607,7 @@ DataFusion采用**Kubernetes + Operator模式**作为官方部署方案，充分
 | 特性 | K8S+Operator | 传统部署（已废弃） |
 |------|-------------|------------------|
 | 架构设计 | 云原生Operator模式 | Master-Worker+消息队列 |
-| 任务调度 | K8S CronJob/Job | 自建Scheduler |
+| 任务调度 | PostgreSQL + Worker轮询 | 自建Scheduler + 消息队列 |
 | 状态管理 | CRD + etcd | PostgreSQL + Redis |
 | 配置管理 | ConfigMap/Secret | 数据库配置表 |
 | 服务发现 | K8S Service | 自建etcd |

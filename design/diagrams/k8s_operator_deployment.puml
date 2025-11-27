@@ -34,26 +34,26 @@ rectangle "Kubernetes集群" #326CE5 {
       card "task-db-003"
     }
 
-    rectangle "CronJob / Job" as Jobs {
-      card "CronJob: web-001\n(定时触发)" as CJ1
-      card "Job: manual-run\n(手动触发)" as J1
+    database "PostgreSQL Control Center" #E1F5FE {
+      [collection_tasks\n(任务配置)]
+      [task_executions\n(执行记录)]
+      [task_locks\n(分布式锁)]
     }
 
-    rectangle "Worker Pods\n(临时执行)" #FF6F00 {
-      card "Pod: collector-web-xxx"
-      card "Pod: collector-api-yyy"
-      card "Pod: collector-db-zzz"
+    rectangle "Deployment Collectors\n(常驻Worker)" #FF6F00 {
+      card "RPA Collector\n(replicas=1-3)" as RPAWorker
+      card "API Collector\n(replicas=1-2)" as APIWorker
+      card "DB Collector\n(replicas=1)" as DBWorker
     }
 
     database "PostgreSQL\n(业务数据)" {
       [采集数据表]
-      [任务执行历史]
+      [数据分析结果]
     }
 
-    rectangle "ConfigMap / Secret" {
-      [数据源配置]
-      [清洗规则]
-      [凭证信息]
+    rectangle "Secret" {
+      [数据源凭证]
+      [数据库密码]
     }
   }
 
@@ -84,28 +84,30 @@ CLI --> [API Server]
 [API Server] <--> OM : list-watch
 [API Server] <--> etcd
 OM --> CR : 创建/更新
-CR --> Jobs : 触发
-Jobs --> [Worker Pods\n(临时执行)] : 创建Pod
-[Worker Pods\n(临时执行)] --> [PostgreSQL\n(业务数据)] : 存储数据
-[Worker Pods\n(临时执行)] --> [ConfigMap / Secret] : 读取配置
-[Worker Pods\n(临时执行)] --> PROM : 上报Metrics
+OM --> [PostgreSQL Control Center] : syncCRToDB()\n同步配置
+[Deployment Collectors\n(常驻Worker)] --> [PostgreSQL Control Center] : 轮询任务(30s)\n抢锁执行
+[PostgreSQL Control Center] --> OM : syncDBToStatus()\n状态回传
+[Deployment Collectors\n(常驻Worker)] --> [PostgreSQL\n(业务数据)] : 存储数据
+[Deployment Collectors\n(常驻Worker)] --> Secret : 读取凭证
+[Deployment Collectors\n(常驻Worker)] --> PROM : 上报Metrics
 OM --> PROM : 上报Metrics
 PROM --> GRAF : 数据查询
 PROM --> ALERT : 告警规则
 
-note bottom of [Worker Pods\n(临时执行)]
-  - 动态创建
-  - 任务完成后销毁
-  - 资源自动回收
+note bottom of [Deployment Collectors\n(常驻Worker)]
+  - Deployment常驻
+  - 轮询PostgreSQL执行任务
+  - 内置资源池(浏览器/连接)
+  - 分布式锁防重复执行
 end note
 
 legend right
   |= 组件类型 |= 说明 |
   | CRD | 自定义资源定义 |
   | Operator | 自定义控制器 |
-  | CronJob | 定时任务 |
-  | Job | 一次性任务 |
-  | Pod | 容器运行实例 |
+  | Deployment | 常驻Pod管理 |
+  | PostgreSQL | 任务配置中心 |
+  | Worker | 常驻采集器 |
 endlegend
 
 @enduml
