@@ -1364,6 +1364,19 @@ spec:
 
 #### 3.1.1. 声明式资源管理场景
 
+> ### ⚠️ 架构版本说明
+>
+> 本节（3.1节）时序图描述基于**Job/CronJob临时Pod架构**（v1.0，已规划优化）。
+>
+> **生产环境推荐使用Deployment常驻Worker架构**（v2.0），相关文档：
+> - [3.2.7节 Deployment常驻Worker架构](#327-deployment常驻worker架构) - 完整架构设计
+> - [seq_create_task.puml](diagrams/seq_create_task.puml) - 任务创建时序图（Deployment架构）
+> - [seq_execute_task.puml](diagrams/seq_execute_task.puml) - 任务执行时序图（Deployment架构）
+> - [k8s_operator_deployment.puml](diagrams/k8s_operator_deployment.puml) - 部署架构图（Deployment架构）
+> - [deploy/README.md](deploy/README.md) - Deployment部署指南
+>
+> 两种架构对比详见[3.2.7.1节](#3271-架构对比与优化目标)。
+
 ##### 3.1.1.1. 创建CollectionTask任务流程
 
 **场景描述:**
