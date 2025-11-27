@@ -1,160 +1,188 @@
 @startuml
-title 定时任务创建与调度时序图
+title CollectionTask创建与配置同步时序图 (Deployment常驻Worker架构)
 
 skinparam backgroundColor #FFFFFF
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true
 
 actor User as user
-participant "Web UI" as ui
-participant "API Gateway" as gateway
-participant "Master\nTask Service" as master
-database "PostgreSQL" as db
-participant "Scheduler\nEngine" as scheduler
-participant "Redis" as redis
-participant "etcd" as etcd
+participant "Web UI\n(Management Plane)" as ui
+participant "K8s API Server" as apiserver
+participant "Operator\nController" as operator
+participant "CollectionTask\nCR" as cr
+database "PostgreSQL\nControl Center" as controldb
+participant "Worker Pod\n(Deployment)" as worker
 
 autonumber
 
-== 任务配置阶段 ==
+== CR创建阶段 ==
 
-user -> ui: 填写任务配置\n(名称、数据源、调度策略等)
+user -> ui: 填写任务配置\n(名称、数据源、采集规则等)
 note right of user
   配置内容：
   - 任务名称: "每日医药资讯采集"
-  - 数据源ID: ds_12345
-  - Cron: "0 0 8 * * ?" (每天8点)
-  - 重试策略: 最大3次,指数退避
-  - 告警: 邮件+短信
+  - Collector类型: web-rpa
+  - 数据源: https://example.com
+  - Cron: "0 8 * * *" (每天8点)
+  - 解析规则: XPath/CSS选择器
+  - 存储配置: 目标PostgreSQL库
 end note
 
 ui -> ui: 前端验证(必填项、格式等)
 ui -> ui: Cron表达式可视化预览
 
-user -> ui: 点击"保存并启动"
+user -> ui: 点击"创建任务"
 
-ui -> gateway: POST /api/v1/tasks\n{task_config}
-gateway -> gateway: 验证JWT Token
-gateway -> gateway: 限流检查(Rate Limiting)
-gateway -> master: CreateTask(task_config, user_id)
-activate master
+ui -> apiserver: POST /apis/datafusion.io/v1/namespaces/default/collectiontasks\n{CR YAML}
+activate apiserver
 
-master -> master: 验证配置参数\n(数据源ID、Cron表达式等)
-master -> master: 解析Cron表达式
+apiserver -> apiserver: 验证CR Schema
+apiserver -> apiserver: RBAC权限检查
 
-alt Cron表达式无效
-    master --> gateway: 400 Bad Request\n{error: "Invalid cron expression"}
-    gateway --> ui: 显示错误提示
-    ui --> user: "Cron表达式格式错误"
+alt CR验证失败
+    apiserver --> ui: 400 Bad Request\n{error: "Invalid CR spec"}
+    ui --> user: "配置验证失败"
     note right: 提前终止流程
 end
 
-master -> master: 生成任务ID (UUID)
-master -> master: 计算下次执行时间
+apiserver -> apiserver: 持久化CR到etcd
 
-== 持久化任务配置 ==
+apiserver -> cr: 创建CR对象
+activate cr
+cr --> apiserver: CR已创建\n{uid, generation=1}
+deactivate cr
 
-master -> db: BEGIN TRANSACTION
-activate db
+apiserver --> ui: 201 Created\n{metadata: {uid, name, ...}}
+deactivate apiserver
 
-master -> db: INSERT INTO tasks\n(id, name, datasource_id,\nstatus='active', created_by, ...)
-db --> master: OK
+ui --> user: 显示创建成功\n"任务已创建，等待调度..."
 
-master -> db: INSERT INTO task_schedules\n(task_id, cron_expr,\nnext_run_time, timezone)
-db --> master: OK
+== Operator监听与同步阶段 ==
 
-master -> db: INSERT INTO task_retry_policies\n(task_id, max_retries=3,\nbackoff_type='exponential')
-db --> master: OK
+operator -> operator: Watch事件触发\n(Add CollectionTask)
+activate operator
 
-master -> db: INSERT INTO task_alert_configs\n(task_id, channels=['email','sms'],\nrecipients)
-db --> master: OK
+operator -> apiserver: Get CollectionTask CR
+activate apiserver
+apiserver --> operator: CR详细信息\n{spec, metadata}
+deactivate apiserver
 
-master -> db: COMMIT TRANSACTION
-db --> master: Transaction Committed
-deactivate db
+operator -> operator: 验证CR配置完整性
+operator -> operator: 解析Cron表达式
+operator -> operator: 计算next_run_time
 
-== 注册到调度器 ==
+== 配置同步到PostgreSQL ==
 
-master -> scheduler: RegisterTask(task_id, schedule_config)
-activate scheduler
+operator -> controldb: BEGIN TRANSACTION
+activate controldb
 
-scheduler -> scheduler: 验证调度配置
+operator -> controldb: INSERT INTO collection_tasks\n(cr_uid, task_name, collector_type,\ncollector_config, parsing_rules,\ncleaning_rules, cron_schedule,\nnext_run_time, enabled=true,\ncreated_at=NOW())
+note right of controldb
+  表字段映射:
+  - cr_uid: CR的metadata.uid
+  - task_name: CR的metadata.name
+  - collector_type: spec.collectorType
+  - collector_config: spec.dataSource (JSON)
+  - parsing_rules: spec.processor (JSON)
+  - cron_schedule: spec.schedule
+  - next_run_time: 根据Cron计算
+  - enabled: 基于spec.suspended反转
+end note
+controldb --> operator: OK (task_id=123)
 
-' 分布式锁防止重复调度
-scheduler -> etcd: 尝试获取锁\nPUT /locks/scheduler/{task_id}\n(lease_ttl=10s)
-activate etcd
+operator -> controldb: COMMIT TRANSACTION
+controldb --> operator: Transaction Committed
+deactivate controldb
 
-alt 锁已被占用
-    etcd --> scheduler: 锁获取失败(已存在)
-    scheduler -> scheduler: 等待重试(最多3次)
-    scheduler -> etcd: 重新尝试获取锁
-end
+== 更新CR Status ==
 
-etcd --> scheduler: 锁获取成功(lease_id)
-deactivate etcd
+operator -> apiserver: Update CR.Status.Phase = "Active"
+activate apiserver
+operator -> apiserver: Update CR.Status.Conditions
+operator -> apiserver: Update CR.Status.ObservedGeneration = 1
+apiserver --> operator: Status Updated
+deactivate apiserver
 
-scheduler -> scheduler: 解析Cron表达式\n(使用robfig/cron库)
-scheduler -> scheduler: 计算下次执行时间
-scheduler -> scheduler: 添加到内存调度队列\n(优先级队列, 按next_run排序)
+operator -> operator: Requeue after 1 minute
+deactivate operator
 
-note right of scheduler
-  调度器状态机:
-  idle → validating → scheduling → scheduled
-
-  内存数据结构:
-  - 优先级队列(heap)
-  - 按next_run_time排序
-  - 支持动态添加/删除
+note right of operator
+  Reconcile完成:
+  - CR配置已同步到PostgreSQL
+  - Worker可以轮询获取任务
+  - 状态回传机制激活
 end note
 
-' 状态同步到Redis (分布式环境)
-scheduler -> redis: HSET task:{task_id}\nstatus=scheduled\nnext_run={timestamp}
-activate redis
-redis --> scheduler: OK
-deactivate redis
+== Worker轮询与执行 ==
 
-' 状态同步到etcd (服务发现)
-scheduler -> etcd: PUT /tasks/{task_id}\n{status, next_run, scheduler_node}
-activate etcd
-etcd --> scheduler: OK
-deactivate etcd
+worker -> worker: 定时器触发(每30秒)
+activate worker
 
-scheduler -> etcd: 释放锁\nDELETE /locks/scheduler/{task_id}
-activate etcd
-etcd --> scheduler: 锁已释放
-deactivate etcd
+worker -> controldb: SELECT * FROM collection_tasks\nWHERE enabled=true\nAND collector_type='web-rpa'\nAND next_run_time <= NOW()\nFOR UPDATE SKIP LOCKED\nLIMIT 1
+activate controldb
 
-scheduler --> master: 注册成功\n{next_run_time, scheduler_node_id}
-deactivate scheduler
-
-== 返回响应 ==
-
-master -> redis: SET task:{task_id}:meta\n{task_config} (缓存)
-activate redis
-redis --> master: OK
-deactivate redis
-
-master --> gateway: 201 Created\n{task_id, status, next_run_time}
-deactivate master
-
-gateway --> ui: HTTP 201 Created\n{task: {...}}
-ui -> ui: 更新任务列表
-
-ui --> user: 显示创建成功\n"任务已创建，下次执行: 2025-10-26 08:00:00"
-
-== 后台调度器监控 ==
-
-note over scheduler
-  调度器持续运行:
-  1. 每秒检查队列头部任务
-  2. 如果next_run_time <= now，推送到RabbitMQ
-  3. 更新next_run_time (根据Cron计算)
-  4. 重新插入队列
-
-  高可用机制:
-  - 多个调度器节点竞争etcd锁
-  - 仅一个节点负责调度
-  - 其他节点standby (lease过期自动接管)
+note right of controldb
+  分布式锁机制:
+  - FOR UPDATE SKIP LOCKED
+  - 多个Worker并发查询
+  - 只有一个Worker获取锁
+  - 避免重复执行
 end note
+
+controldb --> worker: 返回待执行任务\n{task_id=123, cr_uid, collector_config, ...}
+deactivate controldb
+
+worker -> controldb: BEGIN TRANSACTION
+activate controldb
+
+worker -> controldb: INSERT INTO task_executions\n(id, cr_uid, task_id,\nstatus='running',\nstart_time=NOW(),\nworker_pod='{POD_NAME}')
+controldb --> worker: execution_id
+
+worker -> controldb: UPDATE collection_tasks\nSET next_run_time = calculate_next(cron),\nlast_run_at = NOW()\nWHERE task_id = 123
+controldb --> worker: OK
+
+worker -> controldb: COMMIT TRANSACTION
+controldb --> worker: Transaction Committed
+deactivate controldb
+
+worker -> worker: 执行采集任务...\n(浏览器池/HTTP连接池)
+deactivate worker
+
+note right of worker
+  Worker执行流程:
+  1. 从资源池获取实例(浏览器/连接)
+  2. 执行数据采集
+  3. 数据处理(解析/清洗)
+  4. 存储到目标库
+  5. 更新task_executions状态
+end note
+
+== 状态回传到CR ==
+
+operator -> operator: 定时Reconcile触发\n(每1分钟)
+activate operator
+
+operator -> controldb: SELECT * FROM task_executions\nWHERE cr_uid = '{uid}'\nORDER BY start_time DESC LIMIT 1
+activate controldb
+controldb --> operator: 最新执行记录\n{status='success', records_stored=150, ...}
+deactivate controldb
+
+operator -> apiserver: Update CR.Status.LastScheduleTime
+activate apiserver
+operator -> apiserver: Update CR.Status.LastSuccessTime
+operator -> apiserver: Update CR.Status.LastExecutionSummary
+apiserver --> operator: Status Updated
+deactivate apiserver
+
+operator -> operator: Requeue after 1 minute
+deactivate operator
+
+ui -> apiserver: 定期查询CR状态\n(Watch或Polling)
+activate apiserver
+apiserver --> ui: CR最新状态\n{status: {lastSuccessTime, ...}}
+deactivate apiserver
+
+ui -> ui: 刷新任务列表
+ui --> user: 显示任务执行状态\n"最近执行: 2025-01-27 08:00 (成功, 150条记录)"
 
 @enduml

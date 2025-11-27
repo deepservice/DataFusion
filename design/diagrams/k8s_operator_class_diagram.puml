@@ -17,8 +17,9 @@ class CollectionTask {
   + Conditions: []Condition
   + LastScheduleTime: time
   + LastSuccessTime: time
-  + ActiveJobs: []JobRef
-  + History: []JobHistory
+  + LastFailureTime: time
+  + LastExecutionSummary: ExecutionSummary
+  + ObservedGeneration: int64
 }
 
 class DataSource {
@@ -46,19 +47,19 @@ class CleaningRule {
   + LastAppliedTime: time
 }
 
-class JobResult {
-  **Spec:**
-  + TaskRef: TaskRef
-  + JobName: string
-  + StartTime: time
-  + CompletionTime: time
-  --
-  **Status:**
-  + Phase: enum
-  + RecordsCollected: int
-  + RecordsProcessed: int
-  + RecordsStored: int
-  + Errors: []ErrorInfo
+class TaskExecution {
+  **PostgreSQL表: task_executions**
+  + id: UUID
+  + cr_uid: string
+  + task_id: int64
+  + status: enum (running/success/failed)
+  + start_time: timestamp
+  + end_time: timestamp
+  + worker_pod: string
+  + records_fetched: int
+  + records_stored: int
+  + error_message: text
+  + retry_count: int
 }
 
 ' Controller结构
@@ -66,9 +67,11 @@ class CollectionTaskReconciler {
   + Client: client.Client
   + Scheme: *runtime.Scheme
   + Recorder: record.EventRecorder
+  + DBClient: *sql.DB
   --
   + Reconcile(ctx, req): Result
-  - ensureCronJob(): error
+  - syncCRToDB(): error
+  - syncDBToStatus(): error
   - updateStatus(): error
   - handleDeletion(): error
 }
@@ -76,24 +79,34 @@ class CollectionTaskReconciler {
 ' 关系
 CollectionTask "1" --> "0..1" DataSource : references
 CollectionTask "1" --> "0..*" CleaningRule : uses
-CollectionTask "1" --> "0..*" JobResult : produces
+CollectionTask "1" --> "0..*" TaskExecution : tracks
 
 CollectionTaskReconciler ..> CollectionTask : reconciles
 CollectionTaskReconciler ..> DataSource : watches
 CollectionTaskReconciler ..> CleaningRule : watches
+CollectionTaskReconciler ..> TaskExecution : syncs
 
 note right of CollectionTask
   核心CRD: 采集任务定义
   - 定时/手动触发
   - 关联数据源和规则
-  - 追踪执行历史
+  - 配置同步到PostgreSQL
 end note
 
 note right of CollectionTaskReconciler
   Operator核心控制器
   - list-watch机制
   - Reconcile循环
+  - syncCRToDB(): CR → PostgreSQL
+  - syncDBToStatus(): PostgreSQL → CR.Status
   - 幂等性保证
+end note
+
+note right of TaskExecution
+  PostgreSQL存储
+  - Worker轮询获取任务
+  - 分布式锁(FOR UPDATE SKIP LOCKED)
+  - 执行记录持久化
 end note
 
 @enduml

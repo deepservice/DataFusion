@@ -66,16 +66,16 @@ package "Kubernetes集群 (v1.28+)" {
             component "Container: webui\nWeb UI\nPORT: 8080" as svc_webui1 <<Service>>
         }
 
-        artifact "Pod:\ndatafusion-worker-1" <<Pod>> as pod_worker1_1 {
-            component "Container: worker\nDataFusion Worker服务" as svc_worker1_1 <<Service>>
+        artifact "Pod:\nrpa-collector-xxx\n(Deployment)" <<Pod>> as pod_worker1_1 {
+            component "Container: rpa-collector\nRPA Collector Worker\n(浏览器池常驻)" as svc_worker1_1 <<Service>>
         }
 
-        artifact "Pod:\ndatafusion-worker-2" <<Pod>> as pod_worker1_2 {
-            component "Container: worker\nDataFusion Worker服务" as svc_worker1_2 <<Service>>
+        artifact "Pod:\napi-collector-yyy\n(Deployment)" <<Pod>> as pod_worker1_2 {
+            component "Container: api-collector\nAPI Collector Worker\n(HTTP连接池)" as svc_worker1_2 <<Service>>
         }
 
         artifact "Pod:\npostgresql-0\n(StatefulSet)" <<Pod>> as pod_pg1 {
-            component "Container: postgres\nPostgreSQL主库\nPORT: 5432" as svc_pg1 <<Service>>
+            component "Container: postgres\nPostgreSQL主库\n(业务数据+控制中心)\nPORT: 5432" as svc_pg1 <<Service>>
         }
 
         artifact "Pod:\nredis-0\n(StatefulSet)" <<Pod>> as pod_redis1 {
@@ -111,16 +111,16 @@ package "Kubernetes集群 (v1.28+)" {
             component "Container: master\nDataFusion Master服务\nPORT: 9000" as svc_master2 <<Service>>
         }
 
-        artifact "Pod:\ndatafusion-worker-3" <<Pod>> as pod_worker2_1 {
-            component "Container: worker\nDataFusion Worker服务" as svc_worker2_1 <<Service>>
+        artifact "Pod:\ndb-collector-zzz\n(Deployment)" <<Pod>> as pod_worker2_1 {
+            component "Container: db-collector\nDatabase Collector Worker\n(DB连接池)" as svc_worker2_1 <<Service>>
         }
 
-        artifact "Pod:\ndatafusion-worker-4" <<Pod>> as pod_worker2_2 {
-            component "Container: worker\nDataFusion Worker服务" as svc_worker2_2 <<Service>>
+        artifact "Pod:\nrpa-collector-aaa\n(Deployment)" <<Pod>> as pod_worker2_2 {
+            component "Container: rpa-collector\nRPA Collector Worker\n(浏览器池常驻)" as svc_worker2_2 <<Service>>
         }
 
         artifact "Pod:\npostgresql-1\n(StatefulSet)" <<Pod>> as pod_pg2 {
-            component "Container: postgres\nPostgreSQL从库\nPORT: 5432" as svc_pg2 <<Service>>
+            component "Container: postgres\nPostgreSQL从库\n(业务数据+控制中心)\nPORT: 5432" as svc_pg2 <<Service>>
         }
 
         artifact "Pod:\nredis-1\n(StatefulSet)" <<Pod>> as pod_redis2 {
@@ -265,17 +265,28 @@ legend right
   - RabbitMQ: 2副本镜像队列
   - 提供稳定的网络标识和持久化存储
 
-  **Pod副本配置 (默认简化配置):**
+  **Pod副本配置 (Deployment常驻Worker架构):**
   - DataFusion Master: 2个Pod (可扩展至3-5)
-  - DataFusion Worker: 4个Pod (可HPA自动扩展至50+)
+  - RPA Collector: 1-3个Pod (Deployment常驻,包含浏览器池)
+  - API Collector: 1-2个Pod (Deployment常驻,HTTP连接池)
+  - DB Collector: 1个Pod (Deployment常驻,DB连接池)
   - API Gateway: 1个Pod (可扩展至3)
   - Web UI: 1个Pod (可扩展至2)
+  - Collector Worker自动扩缩容: 基于CPU/内存HPA
+
+  **Deployment常驻Worker优势:**
+  - Worker Pod始终运行,无容器启动开销(5-8秒)
+  - 内置资源池(浏览器/HTTP/DB),无初始化开销(3-5秒)
+  - 通过PostgreSQL轮询获取任务,分布式锁防重复
+  - 多个Worker并发执行,自动负载均衡
+  - HPA自动扩缩容,基于CPU/内存利用率
 
   **扩展说明:**
   - 增加K8s Worker节点可水平扩展
-  - 使用HPA自动扩展Worker Pod副本数
+  - 使用HPA自动扩展Collector Pod副本数
   - 使用PVC挂载持久化存储卷
   - 可选用云RDS替代PostgreSQL StatefulSet
+  - PostgreSQL Control Center包含: collection_tasks, task_executions, task_locks
 endlegend
 
 @enduml
