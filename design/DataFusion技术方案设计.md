@@ -328,7 +328,7 @@
 如上图所示,K8S Operator架构将系统部署在Kubernetes集群中,主要包含三个命名空间:
 
 - **datafusion-system命名空间**: 部署Operator Manager(2副本高可用)和CRD定义
-- **datafusion命名空间**: 运行CollectionTask CR实例、动态创建的Worker Pods、PostgreSQL业务数据库
+- **datafusion命名空间**: 运行CollectionTask CR实例、常驻Worker Deployment Pods、PostgreSQL业务数据库
 - **datafusion-monitor命名空间**: 部署Prometheus、Grafana、AlertManager监控组件
 
 核心工作流程:
@@ -574,7 +574,7 @@ Phase 4: 测试和优化 (2-3周)
 
 | 领域 | 技术选型 | 理由 |
 | :--- | :--- | :--- |
-| **后端语言** | Go, Python | **Go** 用于开发高性能的 Operator Controller 和 Worker Job Pod 核心服务，其并发模型和性能非常适合 I/O 密集型的数据采集场景。**Python** 用于编写灵活的采集脚本和解析插件，利用其丰富的第三方库生态。 |
+| **后端语言** | Go, Python | **Go** 用于开发高性能的 Operator Controller 和 Worker Deployment Pod 核心服务，其并发模型和性能非常适合 I/O 密集型的数据采集场景。**Python** 用于编写灵活的采集脚本和解析插件，利用其丰富的第三方库生态。 |
 | **Web 框架** | Gin (Go), FastAPI (Python) | **Gin** 是一个高性能的 Go Web 框架，用于构建核心 API 服务。**FastAPI** 用于快速开发 Python 插件的 API 接口。 |
 | **前端框架** | Vue.js + Element Plus | 成熟的前端技术栈，拥有丰富的组件库和活跃的社区，能够快速构建现代化的管理界面。 |
 | **RPA引擎** | Puppeteer / Playwright | **Puppeteer** 是Chrome官方支持的无头浏览器自动化库，性能稳定。**Playwright** 是微软推出的跨浏览器自动化库，支持Chrome/Firefox/Safari。两者均支持JavaScript脚本执行、页面等待策略、代理配置等RPA核心功能。 |
@@ -1342,8 +1342,8 @@ spec:
 
 **性能监控指标:**
 *   根据CPU/内存使用率动态调整
-*   关注Job队列长度（Pending Job数量）和处理延迟
-*   Worker Job Pod资源利用率保持在70-80%最佳
+*   关注任务队列长度（PostgreSQL待执行任务数）和处理延迟
+*   Worker Pod资源利用率保持在70-80%最佳
 
 ## 3. 模块设计
 
