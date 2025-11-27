@@ -1327,17 +1327,17 @@ spec:
 
 **小规模场景（<50任务）:**
 *   Operator Controller: 2-3副本（保证高可用）
-*   Worker Job并发数: 1-5（通过CollectionTask.spec.collector.replicas配置）
+*   Worker Pod并发数: 1-5（通过Deployment副本数配置）
 *   RESTful API Adapter: 1-2副本
 
 **中等规模（50-200任务）:**
 *   Operator Controller: 3副本
-*   Worker Job并发数: 5-20
+*   Worker Pod并发数: 5-20
 *   RESTful API Adapter: 2-3副本
 
 **大规模场景（>200任务）:**
 *   Operator Controller: 3-5副本
-*   Worker Job并发数: 20-50（配置HPA根据Job队列长度自动扩缩容）
+*   Worker Pod并发数: 20-50（配置HPA根据PostgreSQL任务队列长度自动扩缩容）
 *   RESTful API Adapter: 3-5副本
 
 **性能监控指标:**
@@ -5468,7 +5468,7 @@ DataFusion采用K8S+Operator架构，系统核心由**CRD类型定义**、**Cont
 
 ![K8S+Operator核心类型关系图](diagrams/k8s_operator_class_diagram.png)
 
-类图展示了系统的主要类型和接口：CRD类型（CollectionTask、DataSource）、Controller结构（CollectionTaskReconciler）、Plugin接口（Collector、Parser、Storage）以及Worker Job Pod的组件结构。
+类图展示了系统的主要类型和接口：CRD类型（CollectionTask、DataSource）、Controller结构（CollectionTaskReconciler）、Plugin接口（Collector、Parser、Storage）以及Worker Pod的组件结构。
 
 #### 3.3.1. CRD类型定义
 
@@ -5934,7 +5934,7 @@ type CollectionTaskReconciler struct {
     client.Client
     Scheme *runtime.Scheme
 
-    // WorkerImage Worker Job Pod镜像
+    // WorkerImage Worker Pod镜像
     WorkerImage string
 
     // Recorder 事件记录器
@@ -6190,9 +6190,9 @@ func (r *CollectionTaskReconciler) findTasksForWorker(obj client.Object) []recon
 4. **RequeueAfter**：定期Reconcile (1分钟) 确保状态最终一致性
 5. **Worker Deployment监控**：通过Watches监控Worker Deployment状态变化，更新WorkerReady Condition
 
-#### 3.3.3. Worker Job Pod插件接口设计
+#### 3.3.3. Worker Pod插件接口设计
 
-Worker Job Pod是实际执行数据采集、处理、存储的临时容器，采用插件化架构支持动态扩展。
+Worker Pod是实际执行数据采集、处理、存储的常驻容器，采用插件化架构支持动态扩展。
 
 ##### 3.3.3.1. 核心插件接口层
 
@@ -8772,7 +8772,7 @@ kubectl logs -n datafusion-system deployment/api-adapter | grep audit
 *   **增量采集:** 对于支持增量的数据源，记录上次采集的时间戳或游标，只获取新增数据。
 *   **缓存机制:**
     - 配置和规则通过ConfigMap/Secret管理，K8S自动缓存
-    - Worker Job Pod启动时读取ConfigMap，缓存在内存中
+    - Worker Pod启动时读取ConfigMap，缓存在内存中
     - 对于频繁访问的数据源元数据，可使用本地缓存减少API Server访问
 
 ### 5.2. 存储性能优化
@@ -8785,7 +8785,7 @@ kubectl logs -n datafusion-system deployment/api-adapter | grep audit
 
 *   **负载均衡:** 通过 K8s Service 实现 Operator Controller 和 RESTful API Adapter 的负载均衡。
 *   **资源限制:** 为每个 Pod 设置合理的 CPU 和内存限制（requests/limits），防止资源耗尽。
-*   **弹性伸缩:** 根据 Job 队列长度（CronJob 创建的 Job 数量）或集群资源使用率自动调整 Worker Job Pod 并发数量（通过 HPA 或集群自动伸缩）。
+*   **弹性伸缩:** 根据PostgreSQL任务队列长度或集群资源使用率自动调整Worker Pod并发数量（通过HPA或集群自动伸缩）。
 
 ## 6. 开发规范
 
