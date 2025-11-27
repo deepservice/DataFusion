@@ -226,13 +226,13 @@
 | 传统架构组件 | K8S Operator架构 | 演进说明 |
 |-------------|-----------------|---------|
 | **Master节点集群** | Operator Manager (2副本) | K8S Deployment自动管理副本,Leader Election内置 |
-| **任务调度器** | CronJob/Job Controller | K8S原生调度能力,无需自建调度器 |
+| **任务调度器** | PostgreSQL+Worker轮询 | 任务配置存储在PostgreSQL,Worker自主轮询执行 |
 | **RabbitMQ消息队列** | list-watch + Informer | K8S原生事件驱动机制,延迟更低 |
 | **独立etcd集群** | K8S etcd | 复用K8S集群的etcd,减少运维成本 |
 | **Redis缓存** | CRD Status字段 | 状态存储在K8S etcd中,自动持久化 |
 | **配置管理服务** | ConfigMap/Secret | K8S原生配置管理,支持热更新 |
 | **服务注册发现** | K8S Service/Endpoints | 原生服务发现,自动负载均衡 |
-| **Worker守护进程** | 临时Job Pod | 按需创建,任务完成后自动销毁,资源利用率更高 |
+| **Worker守护进程** | Deployment常驻Worker | 长期运行,轮询PostgreSQL执行任务,复用资源池 |
 | **健康检查机制** | Liveness/Readiness Probe | K8S原生健康检查,自动重启故障Pod |
 | **日志采集** | Fluent Bit DaemonSet | K8S标准日志采集方案 |
 | **监控指标** | Prometheus ServiceMonitor | K8S生态标准监控方案 |
@@ -243,9 +243,9 @@
    - 减少80%基础设施代码(调度、服务发现、配置管理、健康检查)
    - 降低维护复杂度,团队聚焦业务逻辑
 
-2. **从"长期运行进程"到"临时任务Pod"**
-   - 传统架构: Worker节点长期运行,资源占用固定
-   - K8S架构: Job Pod按需创建,任务完成后销毁,资源利用率提升50%+
+2. **从"传统Worker进程"到"云原生Deployment常驻Worker"**
+   - 传统架构: Worker节点长期运行,资源占用固定,手动管理生命周期
+   - K8S架构: Deployment常驻Worker,自动健康检查,资源池复用,降低启动开销60%+
 
 3. **从"消息队列"到"声明式API"**
    - 传统架构: Master通过RabbitMQ推送任务给Worker
@@ -331,10 +331,12 @@
 核心工作流程:
 1. 用户通过kubectl或K8S API创建/更新CollectionTask CR
 2. Operator Manager监听(list-watch)CR变化,触发Reconcile循环
-3. Operator根据CR配置创建对应的CronJob/Job
-4. K8S Scheduler调度Job创建临时Worker Pod执行采集任务
-5. Worker Pod完成任务后自动销毁,释放资源
-6. 执行结果存储到PostgreSQL,Metrics上报到Prometheus
+3. Operator将CR配置同步到PostgreSQL任务配置表(syncCRToDB)
+4. 常驻Worker Pod轮询PostgreSQL任务表(每30秒)
+5. Worker通过PostgreSQL分布式锁争抢任务执行权
+6. Worker执行任务(复用浏览器池/连接池)并更新PostgreSQL执行记录
+7. Operator定期从PostgreSQL同步状态到CR.status(每1分钟,syncDBToStatus)
+8. Metrics上报到Prometheus,执行结果持久化到业务数据库
 
 **1. 自定义资源(CRD)设计**
 
@@ -460,11 +462,11 @@ spec:
 
 **(1) CollectionTaskController**
 - 监听CollectionTask资源变化
-- 根据schedule配置创建CronJob或Job
-- 为每个Job创建对应的Worker Pod
-- 监控Job执行状态并更新CollectionTask.status
+- 将CR配置同步到PostgreSQL collection_tasks表(syncCRToDB)
+- 从PostgreSQL同步执行状态到CR.status(syncDBToStatus)
+- 管理Worker Deployment健康状态
 - 处理失败重试和告警通知
-- 实现自动扩缩容逻辑
+- 支持手动扩缩容Worker副本数
 
 **(2) DataSourceController**
 - 验证DataSource配置的合法性
@@ -631,12 +633,12 @@ Kubernetes + Operator部署方式提供云原生的声明式管理、自动化�
 **核心组件部署:**
 *   **Operator Manager (Deployment):** 2副本高可用，运行CollectionTask/DataSource/CleaningRule三个Controller
 *   **CRD (CustomResourceDefinition):** 定义CollectionTask、DataSource、CleaningRule三种自定义资源
-*   **PostgreSQL (StatefulSet or Cloud RDS):** 存储业务数据和任务历史记录
-*   **Worker Pod (Job临时Pod):** 由Controller根据CollectionTask动态创建，任务完成后自动销毁
+*   **PostgreSQL (StatefulSet or Cloud RDS):** 存储业务数据、任务配置表(collection_tasks)和执行历史记录(task_executions)
+*   **Worker Pod (Deployment常驻Pod):** 由Deployment管理(3种类型:rpa-collector、api-collector、db-collector),长期运行,轮询PostgreSQL任务表
 
 **删除的传统组件（已被K8S原生能力替代）:**
 *   ~~Master节点集群~~ → 改为Operator Manager
-*   ~~RabbitMQ消息队列~~ → 改为K8S list-watch + Job API
+*   ~~RabbitMQ消息队列~~ → 改为PostgreSQL任务配置表+Worker轮询
 *   ~~自建etcd服务~~ → 复用K8S集群etcd
 *   ~~Redis缓存（状态管理）~~ → 改为CRD状态存储
 
@@ -1994,7 +1996,7 @@ Job Controller      Scheduler       Worker Node      Job Pod         Operator Co
 
 这是系统的核心控制模块，采用Kubernetes Operator模式实现。三个Controller（CollectionTaskController、DataSourceController、CleaningRuleController）监听自定义资源（CRD）的变化，通过Reconcile循环自动协调实际状态与期望状态，管理数据采集任务的全生命周期。
 
-*   **功能:** 监听CollectionTask/DataSource/CleaningRule CR的创建、更新、删除事件，自动创建/管理K8S Job、CronJob、ConfigMap等资源，实时更新CR status，实现声明式任务管理。
+*   **功能:** 监听CollectionTask/DataSource/CleaningRule CR的创建、更新、删除事件，将CR配置同步到PostgreSQL任务配置表(syncCRToDB)，从PostgreSQL同步执行状态到CR.status(syncDBToStatus)，管理Worker Deployment健康状态，实现声明式任务管理。
 *   **实现:** 基于kubebuilder框架开发（Go语言），使用controller-runtime库实现Controller逻辑。任务配置和状态存储在Kubernetes etcd（通过CRD），业务数据存储在PostgreSQL。
 
 ##### 3.2.1.1. CRD API类型定义
@@ -2185,29 +2187,21 @@ type CollectionTaskStatus struct {
     // +optional
     Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-    // CronJobName is the name of the managed CronJob
-    // +optional
-    CronJobName string `json:"cronJobName,omitempty"`
-
-    // LastScheduleTime is the last time a Job was scheduled
+    // LastScheduleTime is the last time a task was executed
     // +optional
     LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
 
-    // LastSuccessTime is the last time a Job completed successfully
+    // LastSuccessTime is the last time a task completed successfully
     // +optional
     LastSuccessTime *metav1.Time `json:"lastSuccessTime,omitempty"`
 
-    // LastFailureTime is the last time a Job failed
+    // LastFailureTime is the last time a task failed
     // +optional
     LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
 
-    // Active lists currently running Jobs
+    // LastExecutionSummary contains summary from PostgreSQL (Total/Success/Failed counts)
     // +optional
-    Active []JobReference `json:"active,omitempty"`
-
-    // LastExecutionSummary contains summary of last execution
-    // +optional
-    LastExecutionSummary *ExecutionSummary `json:"lastExecutionSummary,omitempty"`
+    LastExecutionSummary string `json:"lastExecutionSummary,omitempty"`
 
     // ObservedGeneration reflects the generation of the most recently observed spec
     // +optional
@@ -2219,29 +2213,10 @@ type TaskPhase string
 
 const (
     TaskPhasePending   TaskPhase = "Pending"   // CRD创建，等待Controller处理
-    TaskPhaseActive    TaskPhase = "Active"    // CronJob已创建，任务运行中
+    TaskPhaseActive    TaskPhase = "Active"    // 配置已同步到PostgreSQL，Worker正在处理
     TaskPhaseSuspended TaskPhase = "Suspended" // 任务已暂停
     TaskPhaseFailed    TaskPhase = "Failed"    // 任务配置错误或持续失败
 )
-
-// ExecutionSummary contains execution statistics
-type ExecutionSummary struct {
-    Status         string       `json:"status"` // Success, Failed, Running
-    StartTime      *metav1.Time `json:"startTime,omitempty"`
-    CompletionTime *metav1.Time `json:"completionTime,omitempty"`
-    Duration       string       `json:"duration,omitempty"`
-    RecordsFetched int32        `json:"recordsFetched,omitempty"`
-    RecordsStored  int32        `json:"recordsStored,omitempty"`
-    RecordsFailed  int32        `json:"recordsFailed,omitempty"`
-    ErrorMessage   string       `json:"errorMessage,omitempty"`
-}
-
-type JobReference struct {
-    Name      string       `json:"name"`
-    Namespace string       `json:"namespace"`
-    UID       string       `json:"uid"`
-    StartTime *metav1.Time `json:"startTime,omitempty"`
-}
 
 // +kubebuilder:object:root=true
 // CollectionTaskList contains a list of CollectionTask
@@ -2391,8 +2366,8 @@ type CleaningRuleList struct {
 4. **关系特点**:
    - CollectionTask通过`dataSourceRef`引用DataSource
    - 所有敏感信息（密码、Token等）存储在K8S Secret中
-   - Controller监听这些CRD的变化，自动创建/更新K8S Job/CronJob
-   - 任务状态完全通过CR的`status`子资源反映，无需数据库
+   - Controller监听这些CRD的变化，将配置同步到PostgreSQL数据库
+   - 任务配置存储在PostgreSQL collection_tasks表，Worker轮询执行，状态通过syncDBToStatus同步回CR.status
 
 ##### 3.2.1.2. Controller Reconcile逻辑
 
@@ -2431,9 +2406,6 @@ type CollectionTaskReconciler struct {
 // +kubebuilder:rbac:groups=datafusion.io,resources=collectiontasks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=datafusion.io,resources=collectiontasks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=datafusion.io,resources=collectiontasks/finalizers,verbs=update
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 
 // Reconcile implements the reconciliation loop
@@ -2476,48 +2448,38 @@ func (r *CollectionTaskReconciler) Reconcile(ctx context.Context, req ctrl.Reque
         return ctrl.Result{}, nil
     }
 
-    // 3. Handle suspended tasks
-    if task.Spec.Suspended != nil && *task.Spec.Suspended {
-        return r.handleSuspendedTask(ctx, task)
-    }
-
-    // 4. Create or update ConfigMap for task configuration
-    configMap, err := r.reconcileConfigMap(ctx, task)
-    if err != nil {
-        logger.Error(err, "Failed to reconcile ConfigMap")
-        r.updateStatusCondition(ctx, task, "ConfigMapReady", metav1.ConditionFalse, "ConfigMapError", err.Error())
+    // 3. Validate CR configuration
+    if err := r.validateTask(ctx, task); err != nil {
+        logger.Error(err, "Task validation failed")
+        r.updateStatusCondition(ctx, task, "Valid", metav1.ConditionFalse, "ValidationError", err.Error())
+        task.Status.Phase = datafusionv1.TaskPhaseFailed
+        r.Status().Update(ctx, task)
         return ctrl.Result{}, err
     }
-    r.updateStatusCondition(ctx, task, "ConfigMapReady", metav1.ConditionTrue, "ConfigMapCreated", "ConfigMap created successfully")
+    r.updateStatusCondition(ctx, task, "Valid", metav1.ConditionTrue, "ValidationPassed", "Task configuration is valid")
 
-    // 5. Reconcile CronJob or Job based on schedule
-    if task.Spec.Schedule != nil {
-        // Scheduled task: create/update CronJob
-        if err := r.reconcileCronJob(ctx, task, configMap); err != nil {
-            logger.Error(err, "Failed to reconcile CronJob")
-            r.updateStatusCondition(ctx, task, "CronJobReady", metav1.ConditionFalse, "CronJobError", err.Error())
-            task.Status.Phase = datafusionv1.TaskPhaseFailed
-            r.Status().Update(ctx, task)
-            return ctrl.Result{}, err
-        }
-        r.updateStatusCondition(ctx, task, "CronJobReady", metav1.ConditionTrue, "CronJobCreated", "CronJob created successfully")
-        task.Status.Phase = datafusionv1.TaskPhaseActive
+    // 4. Handle suspended tasks
+    if task.Spec.Suspended != nil && *task.Spec.Suspended {
+        task.Status.Phase = datafusionv1.TaskPhaseSuspended
+        r.updateStatusCondition(ctx, task, "Active", metav1.ConditionFalse, "TaskSuspended", "Task execution is suspended")
+        // Note: Suspended tasks should be marked as disabled in PostgreSQL by syncCRToDB
     } else {
-        // One-time task: create Job
-        if err := r.reconcileJob(ctx, task, configMap); err != nil {
-            logger.Error(err, "Failed to reconcile Job")
-            r.updateStatusCondition(ctx, task, "JobReady", metav1.ConditionFalse, "JobError", err.Error())
-            task.Status.Phase = datafusionv1.TaskPhaseFailed
-            r.Status().Update(ctx, task)
-            return ctrl.Result{}, err
-        }
-        r.updateStatusCondition(ctx, task, "JobReady", metav1.ConditionTrue, "JobCreated", "Job created successfully")
         task.Status.Phase = datafusionv1.TaskPhaseActive
+        r.updateStatusCondition(ctx, task, "Active", metav1.ConditionTrue, "TaskActive", "Task is active and ready for execution")
     }
 
-    // 6. Watch and update status from Jobs
-    if err := r.syncJobStatus(ctx, task); err != nil {
-        logger.Error(err, "Failed to sync Job status")
+    // 5. Sync CR configuration to PostgreSQL (syncCRToDB)
+    if err := r.syncCRToDB(ctx, task); err != nil {
+        logger.Error(err, "Failed to sync CR to PostgreSQL")
+        r.updateStatusCondition(ctx, task, "DBSyncReady", metav1.ConditionFalse, "DBSyncError", err.Error())
+        return ctrl.Result{}, err
+    }
+    r.updateStatusCondition(ctx, task, "DBSyncReady", metav1.ConditionTrue, "DBSynced", "Configuration synced to PostgreSQL successfully")
+
+    // 6. Sync execution status from PostgreSQL to CR.status (syncDBToStatus)
+    if err := r.syncDBToStatus(ctx, task); err != nil {
+        logger.Error(err, "Failed to sync status from PostgreSQL")
+        // Non-fatal error, log and continue
     }
 
     // 7. Update status
@@ -2528,272 +2490,241 @@ func (r *CollectionTaskReconciler) Reconcile(ctx context.Context, req ctrl.Reque
     }
 
     logger.Info("Successfully reconciled CollectionTask")
-    return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+    // Requeue after 1 minute to periodically sync status from PostgreSQL
+    return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 
-// reconcileConfigMap creates or updates ConfigMap containing task configuration
-func (r *CollectionTaskReconciler) reconcileConfigMap(ctx context.Context, task *datafusionv1.CollectionTask) (*corev1.ConfigMap, error) {
-    logger := log.FromContext(ctx)
-
-    configMapName := fmt.Sprintf("%s-config", task.Name)
-    configMap := &corev1.ConfigMap{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      configMapName,
-            Namespace: task.Namespace,
-        },
-        Data: map[string]string{
-            "collector.type":   task.Spec.Collector.Type,
-            "collector.config": string(mustMarshalJSON(task.Spec.Collector.Config)),
-            "parsing.rules":    string(mustMarshalJSON(task.Spec.Parsing)),
-            "cleaning.rules":   string(mustMarshalJSON(task.Spec.Cleaning)),
-            "storage.type":     task.Spec.Storage.Type,
-            "storage.config":   string(mustMarshalJSON(task.Spec.Storage.Config)),
-        },
+// validateTask validates CR configuration
+func (r *CollectionTaskReconciler) validateTask(ctx context.Context, task *datafusionv1.CollectionTask) error {
+    // Validate collector type
+    validCollectorTypes := map[string]bool{
+        "web-rpa":  true,
+        "api":      true,
+        "database": true,
+    }
+    if !validCollectorTypes[task.Spec.Collector.Type] {
+        return fmt.Errorf("invalid collector type: %s", task.Spec.Collector.Type)
     }
 
-    // Set owner reference for garbage collection
-    if err := controllerutil.SetControllerReference(task, configMap, r.Scheme); err != nil {
-        return nil, err
-    }
-
-    // Create or update ConfigMap
-    existingConfigMap := &corev1.ConfigMap{}
-    err := r.Get(ctx, types.NamespacedName{Name: configMapName, Namespace: task.Namespace}, existingConfigMap)
-    if err != nil {
-        if errors.IsNotFound(err) {
-            logger.Info("Creating ConfigMap", "name", configMapName)
-            if err := r.Create(ctx, configMap); err != nil {
-                return nil, err
-            }
-            return configMap, nil
+    // Validate cron expression if schedule is set
+    if task.Spec.Schedule != nil && task.Spec.Schedule.Cron != "" {
+        if _, err := cron.ParseStandard(task.Spec.Schedule.Cron); err != nil {
+            return fmt.Errorf("invalid cron expression: %w", err)
         }
-        return nil, err
     }
 
-    // Update existing ConfigMap
-    existingConfigMap.Data = configMap.Data
-    logger.Info("Updating ConfigMap", "name", configMapName)
-    if err := r.Update(ctx, existingConfigMap); err != nil {
-        return nil, err
-    }
-
-    return existingConfigMap, nil
-}
-
-// reconcileCronJob creates or updates CronJob for scheduled tasks
-func (r *CollectionTaskReconciler) reconcileCronJob(ctx context.Context, task *datafusionv1.CollectionTask, configMap *corev1.ConfigMap) error {
-    logger := log.FromContext(ctx)
-
-    cronJobName := fmt.Sprintf("%s-cronjob", task.Name)
-
-    // Build Job template
-    jobTemplate := r.buildJobTemplate(task, configMap)
-
-    // Build CronJob spec
-    cronJob := &batchv1.CronJob{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      cronJobName,
-            Namespace: task.Namespace,
-        },
-        Spec: batchv1.CronJobSpec{
-            Schedule:          task.Spec.Schedule.Cron,
-            ConcurrencyPolicy: batchv1.ConcurrencyPolicy(task.Spec.Schedule.ConcurrencyPolicy),
-            JobTemplate:       jobTemplate,
-            TimeZone:          &task.Spec.Schedule.Timezone,
-        },
-    }
-
-    // Set owner reference
-    if err := controllerutil.SetControllerReference(task, cronJob, r.Scheme); err != nil {
-        return err
-    }
-
-    // Create or update CronJob
-    existingCronJob := &batchv1.CronJob{}
-    err := r.Get(ctx, types.NamespacedName{Name: cronJobName, Namespace: task.Namespace}, existingCronJob)
-    if err != nil {
-        if errors.IsNotFound(err) {
-            logger.Info("Creating CronJob", "name", cronJobName)
-            if err := r.Create(ctx, cronJob); err != nil {
-                return err
-            }
-            task.Status.CronJobName = cronJobName
-            return nil
-        }
-        return err
-    }
-
-    // Update existing CronJob
-    existingCronJob.Spec = cronJob.Spec
-    logger.Info("Updating CronJob", "name", cronJobName)
-    if err := r.Update(ctx, existingCronJob); err != nil {
-        return err
-    }
-
-    task.Status.CronJobName = cronJobName
-    return nil
-}
-
-// buildJobTemplate builds K8S Job template for worker pods
-func (r *CollectionTaskReconciler) buildJobTemplate(task *datafusionv1.CollectionTask, configMap *corev1.ConfigMap) batchv1.JobTemplateSpec {
-    replicas := int32(1)
-    if task.Spec.Collector.Replicas != nil {
-        replicas = *task.Spec.Collector.Replicas
-    }
-
-    timeout := int32(3600)
-    if task.Spec.TimeoutSeconds != nil {
-        timeout = *task.Spec.TimeoutSeconds
-    }
-
-    backoffLimit := int32(6)
-    if task.Spec.Retry != nil && task.Spec.Retry.BackoffLimit != nil {
-        backoffLimit = *task.Spec.Retry.BackoffLimit
-    }
-
-    return batchv1.JobTemplateSpec{
-        Spec: batchv1.JobSpec{
-            Parallelism:  &replicas,
-            BackoffLimit: &backoffLimit,
-            Template: corev1.PodTemplateSpec{
-                Spec: corev1.PodSpec{
-                    RestartPolicy:      corev1.RestartPolicyOnFailure,
-                    ServiceAccountName: "datafusion-worker",
-                    Containers: []corev1.Container{
-                        {
-                            Name:  "worker",
-                            Image: "datafusion-worker:v1.0.0",
-                            Env: []corev1.EnvVar{
-                                {
-                                    Name:  "TASK_NAME",
-                                    Value: task.Name,
-                                },
-                                {
-                                    Name:  "COLLECTOR_TYPE",
-                                    Value: task.Spec.Collector.Type,
-                                },
-                                {
-                                    Name:  "TIMEOUT_SECONDS",
-                                    Value: fmt.Sprintf("%d", timeout),
-                                },
-                            },
-                            EnvFrom: []corev1.EnvFromSource{
-                                {
-                                    ConfigMapRef: &corev1.ConfigMapEnvSource{
-                                        LocalObjectReference: corev1.LocalObjectReference{
-                                            Name: configMap.Name,
-                                        },
-                                    },
-                                },
-                                {
-                                    SecretRef: &corev1.SecretEnvSource{
-                                        LocalObjectReference: corev1.LocalObjectReference{
-                                            Name: task.Spec.Storage.SecretRef.Name,
-                                        },
-                                    },
-                                },
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    }
-}
-
-// syncJobStatus watches Jobs and updates CollectionTask status
-func (r *CollectionTaskReconciler) syncJobStatus(ctx context.Context, task *datafusionv1.CollectionTask) error {
-    logger := log.FromContext(ctx)
-
-    // List Jobs owned by this CollectionTask
-    jobList := &batchv1.JobList{}
-    if err := r.List(ctx, jobList, client.InNamespace(task.Namespace), client.MatchingLabels{
-        "datafusion.io/task": task.Name,
-    }); err != nil {
-        return err
-    }
-
-    // Update active jobs list
-    task.Status.Active = []datafusionv1.JobReference{}
-    for _, job := range jobList.Items {
-        if job.Status.Active > 0 {
-            task.Status.Active = append(task.Status.Active, datafusionv1.JobReference{
-                Name:      job.Name,
-                Namespace: job.Namespace,
-                UID:       string(job.UID),
-                StartTime: job.Status.StartTime,
-            })
-        }
-
-        // Update last execution summary
-        if job.Status.CompletionTime != nil {
-            task.Status.LastScheduleTime = job.Status.StartTime
-            if job.Status.Succeeded > 0 {
-                task.Status.LastSuccessTime = job.Status.CompletionTime
-                logger.Info("Job succeeded", "job", job.Name)
-            } else if job.Status.Failed > 0 {
-                task.Status.LastFailureTime = job.Status.CompletionTime
-                logger.Info("Job failed", "job", job.Name)
-            }
-        }
+    // Validate storage configuration
+    if task.Spec.Storage.Type == "" {
+        return fmt.Errorf("storage type is required")
     }
 
     return nil
 }
 
-// handleSuspendedTask handles suspended tasks
-func (r *CollectionTaskReconciler) handleSuspendedTask(ctx context.Context, task *datafusionv1.CollectionTask) (ctrl.Result, error) {
+// syncCRToDB synchronizes CR configuration to PostgreSQL collection_tasks table
+func (r *CollectionTaskReconciler) syncCRToDB(ctx context.Context, task *datafusionv1.CollectionTask) error {
     logger := log.FromContext(ctx)
-    logger.Info("Task is suspended", "name", task.Name)
 
-    // Delete CronJob if exists
-    if task.Status.CronJobName != "" {
-        cronJob := &batchv1.CronJob{}
-        err := r.Get(ctx, types.NamespacedName{Name: task.Status.CronJobName, Namespace: task.Namespace}, cronJob)
-        if err == nil {
-            if err := r.Delete(ctx, cronJob); err != nil {
-                return ctrl.Result{}, err
+    // 1. Connect to PostgreSQL
+    db, err := r.getPostgreSQLConn(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to connect to PostgreSQL: %w", err)
+    }
+    defer db.Close()
+
+    // 2. Check if task exists in PostgreSQL
+    var existingTaskID string
+    err = db.QueryRowContext(ctx,
+        "SELECT id FROM collection_tasks WHERE cr_uid = $1",
+        string(task.UID),
+    ).Scan(&existingTaskID)
+
+    // 3. Calculate next_run_time based on cron expression
+    var nextRunTime *time.Time
+    if task.Spec.Schedule != nil && task.Spec.Schedule.Cron != "" {
+        parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+        schedule, err := parser.Parse(task.Spec.Schedule.Cron)
+        if err != nil {
+            return fmt.Errorf("failed to parse cron expression: %w", err)
+        }
+        next := schedule.Next(time.Now())
+        nextRunTime = &next
+    }
+
+    // 4. Serialize collector/parsing/cleaning/storage config as JSONB
+    collectorConfigJSON, _ := json.Marshal(task.Spec.Collector.Config)
+    parsingRulesJSON, _ := json.Marshal(task.Spec.Parsing)
+    cleaningRulesJSON, _ := json.Marshal(task.Spec.Cleaning)
+    storageConfigJSON, _ := json.Marshal(task.Spec.Storage.Config)
+
+    // 5. Insert or update task in PostgreSQL
+    if err == sql.ErrNoRows {
+        // Insert new task
+        logger.Info("Inserting new task to PostgreSQL", "task", task.Name)
+        _, err = db.ExecContext(ctx, `
+            INSERT INTO collection_tasks (
+                cr_uid, task_name, collector_type, collector_config,
+                parsing_rules, cleaning_rules, storage_type, storage_config,
+                cron_schedule, next_run_time, enabled, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+        `,
+            string(task.UID), task.Name, task.Spec.Collector.Type, collectorConfigJSON,
+            parsingRulesJSON, cleaningRulesJSON, task.Spec.Storage.Type, storageConfigJSON,
+            task.Spec.Schedule.Cron, nextRunTime, !(task.Spec.Suspended != nil && *task.Spec.Suspended),
+        )
+        if err != nil {
+            return fmt.Errorf("failed to insert task to PostgreSQL: %w", err)
+        }
+    } else if err == nil {
+        // Update existing task if generation changed
+        if task.Status.ObservedGeneration != task.Generation {
+            logger.Info("Updating task in PostgreSQL", "task", task.Name, "generation", task.Generation)
+            _, err = db.ExecContext(ctx, `
+                UPDATE collection_tasks SET
+                    task_name = $2, collector_type = $3, collector_config = $4,
+                    parsing_rules = $5, cleaning_rules = $6, storage_type = $7, storage_config = $8,
+                    cron_schedule = $9, next_run_time = $10, enabled = $11, updated_at = NOW()
+                WHERE cr_uid = $1
+            `,
+                string(task.UID), task.Name, task.Spec.Collector.Type, collectorConfigJSON,
+                parsingRulesJSON, cleaningRulesJSON, task.Spec.Storage.Type, storageConfigJSON,
+                task.Spec.Schedule.Cron, nextRunTime, !(task.Spec.Suspended != nil && *task.Spec.Suspended),
+            )
+            if err != nil {
+                return fmt.Errorf("failed to update task in PostgreSQL: %w", err)
             }
+        }
+    } else {
+        return fmt.Errorf("failed to query PostgreSQL: %w", err)
+    }
+
+    return nil
+}
+
+// syncDBToStatus synchronizes execution status from PostgreSQL to CR.status
+func (r *CollectionTaskReconciler) syncDBToStatus(ctx context.Context, task *datafusionv1.CollectionTask) error {
+    logger := log.FromContext(ctx)
+
+    // 1. Connect to PostgreSQL
+    db, err := r.getPostgreSQLConn(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to connect to PostgreSQL: %w", err)
+    }
+    defer db.Close()
+
+    // 2. Query latest execution record from task_executions table
+    var (
+        lastExecutionTime   *time.Time
+        lastExecutionStatus string
+        errorMessage        *string
+    )
+    err = db.QueryRowContext(ctx, `
+        SELECT start_time, status, error_message
+        FROM task_executions
+        WHERE cr_uid = $1
+        ORDER BY start_time DESC
+        LIMIT 1
+    `, string(task.UID)).Scan(&lastExecutionTime, &lastExecutionStatus, &errorMessage)
+
+    if err == sql.ErrNoRows {
+        // No execution records yet
+        logger.Info("No execution records found for task", "task", task.Name)
+        return nil
+    } else if err != nil {
+        return fmt.Errorf("failed to query execution records: %w", err)
+    }
+
+    // 3. Update CR.Status.LastExecutionTime and LastExecutionStatus
+    if lastExecutionTime != nil {
+        task.Status.LastScheduleTime = &metav1.Time{Time: *lastExecutionTime}
+
+        if lastExecutionStatus == "success" {
+            task.Status.LastSuccessTime = &metav1.Time{Time: *lastExecutionTime}
+        } else if lastExecutionStatus == "failed" {
+            task.Status.LastFailureTime = &metav1.Time{Time: *lastExecutionTime}
         }
     }
 
-    task.Status.Phase = datafusionv1.TaskPhaseSuspended
-    r.updateStatusCondition(ctx, task, "Suspended", metav1.ConditionTrue, "TaskSuspended", "Task execution is suspended")
+    // 4. Query statistics (total_runs, successful_runs, failed_runs)
+    var (
+        totalRuns      int
+        successfulRuns int
+        failedRuns     int
+    )
+    err = db.QueryRowContext(ctx, `
+        SELECT
+            COUNT(*) as total_runs,
+            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successful_runs,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_runs
+        FROM task_executions
+        WHERE cr_uid = $1
+    `, string(task.UID)).Scan(&totalRuns, &successfulRuns, &failedRuns)
 
-    if err := r.Status().Update(ctx, task); err != nil {
-        return ctrl.Result{}, err
+    if err != nil {
+        return fmt.Errorf("failed to query execution statistics: %w", err)
     }
 
-    return ctrl.Result{}, nil
+    // 5. Update CR.Status.LastExecutionSummary
+    task.Status.LastExecutionSummary = fmt.Sprintf(
+        "Total: %d, Success: %d, Failed: %d",
+        totalRuns, successfulRuns, failedRuns,
+    )
+
+    logger.Info("Synced status from PostgreSQL",
+        "task", task.Name,
+        "last_execution", lastExecutionTime,
+        "status", lastExecutionStatus,
+    )
+
+    return nil
 }
 
-// cleanupResources cleans up owned resources on deletion
+// cleanupResources cleans up PostgreSQL records on CR deletion
 func (r *CollectionTaskReconciler) cleanupResources(ctx context.Context, task *datafusionv1.CollectionTask) error {
     logger := log.FromContext(ctx)
-    logger.Info("Cleaning up resources for CollectionTask", "name", task.Name)
+    logger.Info("Cleaning up PostgreSQL records for CollectionTask", "name", task.Name)
 
-    // Delete CronJob
-    if task.Status.CronJobName != "" {
-        cronJob := &batchv1.CronJob{}
-        err := r.Get(ctx, types.NamespacedName{Name: task.Status.CronJobName, Namespace: task.Namespace}, cronJob)
-        if err == nil {
-            if err := r.Delete(ctx, cronJob); err != nil {
-                return err
-            }
-        }
+    // Connect to PostgreSQL
+    db, err := r.getPostgreSQLConn(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to connect to PostgreSQL: %w", err)
+    }
+    defer db.Close()
+
+    // Delete task record from collection_tasks table
+    // Note: task_executions records are retained for auditing (CASCADE will handle if needed)
+    _, err = db.ExecContext(ctx,
+        "DELETE FROM collection_tasks WHERE cr_uid = $1",
+        string(task.UID),
+    )
+    if err != nil {
+        return fmt.Errorf("failed to delete task from PostgreSQL: %w", err)
     }
 
-    // Delete ConfigMap
-    configMapName := fmt.Sprintf("%s-config", task.Name)
-    configMap := &corev1.ConfigMap{}
-    err := r.Get(ctx, types.NamespacedName{Name: configMapName, Namespace: task.Namespace}, configMap)
-    if err == nil {
-        if err := r.Delete(ctx, configMap); err != nil {
-            return err
-        }
-    }
-
+    logger.Info("Successfully deleted task from PostgreSQL", "task", task.Name)
     return nil
+}
+
+// getPostgreSQLConn gets PostgreSQL database connection
+func (r *CollectionTaskReconciler) getPostgreSQLConn(ctx context.Context) (*sql.DB, error) {
+    // In production, get connection string from Secret
+    // For this design document, showing simplified version
+    connStr := os.Getenv("POSTGRES_CONN_STRING")
+    if connStr == "" {
+        connStr = "postgres://datafusion:password@postgresql:5432/datafusion_control?sslmode=disable"
+    }
+
+    db, err := sql.Open("postgres", connStr)
+    if err != nil {
+        return nil, err
+    }
+
+    if err := db.PingContext(ctx); err != nil {
+        db.Close()
+        return nil, err
+    }
+
+    return db, nil
 }
 
 // updateStatusCondition updates a condition in the status
@@ -2827,9 +2758,6 @@ func (r *CollectionTaskReconciler) updateStatusCondition(ctx context.Context, ta
 func (r *CollectionTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
     return ctrl.NewControllerManagedBy(mgr).
         For(&datafusionv1.CollectionTask{}).
-        Owns(&batchv1.CronJob{}).
-        Owns(&batchv1.Job{}).
-        Owns(&corev1.ConfigMap{}).
         Complete(r)
 }
 ```
@@ -2884,10 +2812,10 @@ const (
 **Phase状态转换:**
 
 ```
-Pending → Active (CronJob创建成功)
-Pending → Failed (配置错误)
-Active → Suspended (用户暂停)
-Suspended → Active (用户恢复)
+Pending → Active (配置已同步到PostgreSQL)
+Pending → Failed (配置验证错误)
+Active → Suspended (用户暂停任务)
+Suspended → Active (用户恢复任务)
 Active → Failed (持续失败超过阈值)
 ```
 
