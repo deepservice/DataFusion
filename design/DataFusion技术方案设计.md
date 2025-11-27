@@ -4901,13 +4901,13 @@ spec:
 
 这样设计后，Worker Pod作为常驻容器，通过PostgreSQL任务配置中心接收任务，内置浏览器池/连接池复用资源，显著降低启动开销，大幅提升系统性能。
 
-#### 3.2.7. Deployment常驻Worker架构（架构优化方案）
+#### 3.2.7. Deployment常驻Worker架构实施细节
 
-> **设计背景**：当前基于CronJob/Job的临时Pod架构在高频采集场景下存在显著的容器启动开销（5-8秒Pod启动 + 3-5秒浏览器初始化），导致2分钟间隔的API采集任务中，启动开销占比高达60-71%。为提升性能并降低资源峰值，本节提出基于Deployment的常驻Worker架构优化方案。
+> **架构说明**：本节描述DataFusion **当前生产架构**的实施细节。系统采用Deployment常驻Worker模式，Worker Pod长期运行并通过PostgreSQL Control Center轮询任务。相比早期规划的CronJob/Job临时Pod架构，常驻Worker架构消除了容器启动开销（5-8秒Pod启动 + 3-5秒浏览器初始化），显著提升高频采集场景的性能。
 
-##### 3.2.7.1. 架构对比与优化目标
+##### 3.2.7.1. 架构演进对比
 
-**当前架构（Job临时Pod模式）**
+**早期规划架构（Job临时Pod模式，v1.0）**
 
 ```
 CollectionTask CR
@@ -4918,7 +4918,7 @@ CollectionTask CR
   → Controller watch Job状态 → 更新CR.status
 ```
 
-**优化架构（Deployment常驻Worker模式）**
+**当前生产架构（Deployment常驻Worker模式，v2.0）**
 
 ```
 CollectionTask CR
