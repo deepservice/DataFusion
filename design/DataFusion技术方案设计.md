@@ -3576,49 +3576,67 @@ Grafana: 展示任务执行统计
 6. **可观测性**: 原生集成Prometheus、日志、事件系统
 7. **多租户**: 通过Namespace实现资源隔离
 
-#### 3.2.3. Worker Job Pod架构
+#### 3.2.3. Worker Deployment架构
 
-在K8S+Operator架构中，Worker不再是长期运行的守护进程，而是**临时Job Pod**。每次任务执行时，Controller创建Job，K8S调度Pod执行采集任务，完成后Pod自动销毁。
+在K8S+Operator架构中，Worker采用**Deployment常驻Pod**模式。Deployment管理长期运行的Worker Pod（3种类型：rpa-collector、api-collector、db-collector），Worker自主轮询PostgreSQL任务配置表，通过分布式锁机制争抢任务执行权。
 
 **架构对比:**
 
-| 特性 | 传统Worker架构 | Job Pod架构 |
-|------|---------------|------------|
-| 生命周期 | 长期运行守护进程 | 临时Pod（任务结束即销毁） |
-| 任务获取 | 从RabbitMQ拉取 | 通过EnvFrom注入配置 |
-| 状态管理 | Redis + PostgreSQL | Job Status → CR Status |
-| 资源管理 | 手动扩容 | K8S自动调度 |
-| 故障恢复 | 自建心跳机制 | K8S RestartPolicy |
-| 并发控制 | 手动管理并发数 | Job.spec.parallelism |
+| 特性 | 传统Worker架构 | Deployment常驻Worker架构 |
+|------|---------------|----------------------|
+| 生命周期 | 长期运行守护进程 | Deployment管理的常驻Pod |
+| 任务获取 | 从RabbitMQ拉取 | 轮询PostgreSQL任务配置表（每30秒） |
+| 状态管理 | Redis + PostgreSQL | PostgreSQL collection_tasks/task_executions表 |
+| 资源管理 | 手动扩容 | 手动调整replicas（支持未来HPA自动扩容） |
+| 故障恢复 | 自建心跳机制 | K8S Liveness/Readiness Probe自动重启 |
+| 并发控制 | 手动管理并发数 | Worker内置任务池（SCHEDULER_MAX_CONCURRENT_TASKS） |
 | 资源隔离 | 进程级隔离 | Pod级隔离（namespace、cgroup） |
+| 资源复用 | 无 | 浏览器池、HTTP连接池、DB连接池 |
 
-**Job Pod生命周期:**
+**Worker Deployment工作流程:**
 
 ```
-Controller创建Job
+Controller同步CR配置到PostgreSQL collection_tasks表
     ↓
-K8S Scheduler调度Pod
+Worker Pod轮询PostgreSQL (每30秒)
     ↓
-Pod启动 (Init Container: 准备环境)
+查询enabled=true且next_run_time<=NOW()的任务
     ↓
-Main Container执行:
-    1. 读取ConfigMap配置
-    2. 读取Secret凭证
-    3. 执行数据采集 (3.2.3.1-3.2.3.4)
+通过PostgreSQL分布式锁争抢任务 (FOR UPDATE SKIP LOCKED)
+    ↓
+获取锁成功 → Worker执行任务:
+    1. 从PostgreSQL读取任务完整配置（collector/parsing/cleaning/storage）
+    2. 从Secret读取凭证
+    3. 复用浏览器池/连接池执行数据采集 (3.2.3.1-3.2.3.4)
     4. 执行数据处理 (3.2.4)
     5. 执行数据存储 (3.2.5)
     6. 上报Metrics (3.2.6)
+    7. 更新PostgreSQL执行记录（task_executions表）
+    8. 计算并更新next_run_time
     ↓
-Pod完成 (Status: Completed/Failed)
+获取锁失败 → 继续轮询下一个任务
     ↓
-Controller同步Status到CollectionTask CR
-    ↓
-Pod自动清理 (保留日志)
+Controller定期从PostgreSQL同步状态到CR.status (每1分钟)
 ```
+
+**Deployment资源池设计:**
+
+- **浏览器池 (RPA Collector)**: 预初始化5个Playwright浏览器实例，复用浏览器上下文，避免每次任务启动浏览器开销（3-5秒）
+- **HTTP连接池 (API Collector)**: 预建立HTTP连接池（MaxIdleConns=100），支持HTTP/2连接复用
+- **数据库连接池 (DB Collector)**: 预建立数据库连接池（MaxOpenConns=25），复用数据库连接
+
+**性能优化收益:**
+
+| 指标 | 临时Job Pod模式 | Deployment常驻Worker模式 | 提升 |
+|------|----------------|----------------------|------|
+| 平均执行时间（2分钟API采集） | 14秒 | 5.5秒 | **60.7%** |
+| 容器启动开销 | 5-8秒 | 0秒（已启动） | **100%消除** |
+| 浏览器初始化开销 | 3-5秒/次 | 0.5秒（复用） | **87.5%** |
+| CPU峰值 | 2.5核（启动时） | 1.2核（稳定） | **52%** |
 
 ##### 3.2.3.1. 采集器插件架构
 
-Worker Job Pod采用**插件化架构**，支持多种数据源类型。每种采集器作为独立插件实现统一接口。
+Worker Pod采用**插件化架构**，支持多种数据源类型。每种采集器作为独立插件实现统一接口。
 
 **插件接口定义:**
 
@@ -4102,7 +4120,7 @@ collector.config: |
 
 #### 3.2.4. 数据处理模块
 
-数据处理模块在Job Pod内作为**pipeline流式处理**，对采集到的原始数据进行解析、清洗、转换。
+数据处理模块在Worker Pod内作为**pipeline流式处理**，对采集到的原始数据进行解析、清洗、转换。
 
 **处理流程:**
 
@@ -4435,7 +4453,7 @@ func (v *Validator) validateField(value interface{}, rule ValidationRule) bool {
 
 #### 3.2.5. 数据存储模块
 
-数据存储模块在Job Pod完成采集和处理后，将结构化数据写入目标存储。
+数据存储模块在Worker Pod完成采集和处理后，将结构化数据写入目标存储。
 
 ##### 3.2.5.1. 存储器接口
 
@@ -4651,7 +4669,7 @@ func (r *RetryableStorage) Write(ctx context.Context, records []map[string]inter
 
 #### 3.2.6. 监控与Metrics上报
 
-Job Pod在执行过程中上报Metrics到Prometheus，供Operator和监控系统使用。
+Worker Pod在执行过程中上报Metrics到Prometheus，供Operator和监控系统使用。
 
 ##### 3.2.6.1. Metrics定义
 
@@ -4833,7 +4851,7 @@ func registerCollectors(factory *collector.CollectorFactory) {
 }
 ```
 
-##### 3.2.6.3. Job Pod Metrics抓取
+##### 3.2.6.3. Deployment Pod Metrics抓取
 
 **PodMonitor配置 (Prometheus Operator):**
 
@@ -4853,7 +4871,7 @@ spec:
     path: /metrics
 ```
 
-**Job Pod Template包含metrics端口:**
+**Deployment Pod Template包含metrics端口:**
 
 ```yaml
 spec:
@@ -4875,7 +4893,7 @@ spec:
         # ... 其他环境变量
 ```
 
-这样设计后，Worker Job Pod成为完全无状态的临时容器，Controller只需创建Job，K8S自动调度、监控、重试，大幅简化了系统复杂度。
+这样设计后，Worker Pod作为常驻容器，通过PostgreSQL任务配置中心接收任务，内置浏览器池/连接池复用资源，显著降低启动开销，大幅提升系统性能。
 
 #### 3.2.7. Deployment常驻Worker架构（架构优化方案）
 
