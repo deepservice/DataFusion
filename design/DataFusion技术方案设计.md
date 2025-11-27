@@ -493,15 +493,13 @@ func (r *CollectionTaskReconciler) Reconcile(ctx context.Context, req ctrl.Reque
         return ctrl.Result{}, client.IgnoreNotFound(err)
     }
 
-    // 2. 根据schedule创建或更新CronJob
-    if task.Spec.Schedule.Cron != "" {
-        if err := r.reconcileCronJob(ctx, &task); err != nil {
-            return ctrl.Result{}, err
-        }
+    // 2. 同步CR配置到PostgreSQL Control Center
+    if err := r.syncCRToDB(ctx, &task); err != nil {
+        return ctrl.Result{}, err
     }
 
-    // 3. 管理Worker Pod副本数
-    if err := r.reconcileWorkerPods(ctx, &task); err != nil {
+    // 3. 从PostgreSQL同步执行状态到CR.Status
+    if err := r.syncDBToStatus(ctx, &task); err != nil {
         return ctrl.Result{}, err
     }
 
@@ -1043,11 +1041,11 @@ rules:
 - apiGroups: ["datafusion.io"]
   resources: ["collectiontasks/status", "datasources/status"]
   verbs: ["get", "update", "patch"]
-# Job和CronJob权限
-- apiGroups: ["batch"]
-  resources: ["jobs", "cronjobs"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-# Pod权限
+# Deployment权限 (用于监控Worker Deployment状态)
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+# Pod权限 (用于监控Worker Pod状态)
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
@@ -2793,19 +2791,16 @@ Operator使用Kubernetes标准的Conditions机制报告CR状态，并通过Phase
 **Conditions设计规范:**
 
 ```go
-// Standard condition types for CollectionTask
+// Standard condition types for CollectionTask (Deployment常驻Worker架构)
 const (
-    // ConfigMapReady indicates whether the ConfigMap is created successfully
-    ConditionConfigMapReady = "ConfigMapReady"
-
-    // CronJobReady indicates whether the CronJob is created successfully
-    ConditionCronJobReady = "CronJobReady"
-
-    // JobReady indicates whether the Job is created successfully (for one-time tasks)
-    ConditionJobReady = "JobReady"
+    // SyncedToDB indicates whether CR config is synced to PostgreSQL
+    ConditionSyncedToDB = "SyncedToDB"
 
     // DataSourceReady indicates whether the referenced DataSource is available
     ConditionDataSourceReady = "DataSourceReady"
+
+    // WorkerReady indicates whether Worker Deployment is ready
+    ConditionWorkerReady = "WorkerReady"
 
     // Suspended indicates whether the task is suspended
     ConditionSuspended = "Suspended"
@@ -2813,12 +2808,11 @@ const (
 
 // Condition reasons
 const (
-    ReasonConfigMapCreated     = "ConfigMapCreated"
-    ReasonConfigMapError       = "ConfigMapError"
-    ReasonCronJobCreated       = "CronJobCreated"
-    ReasonCronJobError         = "CronJobError"
-    ReasonJobCreated           = "JobCreated"
-    ReasonJobError             = "JobError"
+    ReasonSyncSuccess          = "SyncSuccess"
+    ReasonSyncError            = "SyncError"
+    ReasonPostgreSQLConnError  = "PostgreSQLConnectionError"
+    ReasonWorkerDeploymentReady = "WorkerDeploymentReady"
+    ReasonWorkerDeploymentNotReady = "WorkerDeploymentNotReady"
     ReasonDataSourceNotFound   = "DataSourceNotFound"
     ReasonDataSourceReady      = "DataSourceReady"
     ReasonTaskSuspended        = "TaskSuspended"
@@ -2869,40 +2863,36 @@ if !reflect.DeepEqual(oldStatus, task.Status) {
 }
 ```
 
-**用户查看状态示例:**
+**用户查看状态示例 (Deployment常驻Worker架构):**
 
 ```bash
 $ kubectl get collectiontask product-scraper -o yaml
 ...
 status:
   phase: Active
-  cronJobName: product-scraper-cronjob
-  lastScheduleTime: "2025-01-15T02:00:00Z"
-  lastSuccessTime: "2025-01-15T02:05:23Z"
+  lastScheduleTime: "2025-01-27T08:00:15Z"
+  lastSuccessTime: "2025-01-27T08:05:42Z"
   observedGeneration: 3
   conditions:
-  - type: ConfigMapReady
+  - type: SyncedToDB
     status: "True"
-    reason: ConfigMapCreated
-    message: ConfigMap created successfully
-    lastTransitionTime: "2025-01-15T01:30:00Z"
-  - type: CronJobReady
+    reason: SyncSuccess
+    message: Task config synced to PostgreSQL successfully
+    lastTransitionTime: "2025-01-27T07:30:00Z"
+  - type: WorkerReady
     status: "True"
-    reason: CronJobCreated
-    message: CronJob product-scraper-cronjob created successfully
-    lastTransitionTime: "2025-01-15T01:30:05Z"
+    reason: WorkerDeploymentReady
+    message: Worker Deployment rpa-collector is ready (3/3 replicas)
+    lastTransitionTime: "2025-01-27T07:30:05Z"
   - type: DataSourceReady
     status: "True"
     reason: DataSourceReady
     message: DataSource product-website is ready
-    lastTransitionTime: "2025-01-15T01:30:03Z"
-  active:
-  - name: product-scraper-cronjob-28434500
-    namespace: datafusion
-    uid: "a1b2c3d4-..."
-    startTime: "2025-01-15T02:00:00Z"
+    lastTransitionTime: "2025-01-27T07:30:03Z"
   lastExecutionSummary:
-    status: Success
+    status: success
+    recordsFetched: 150
+    recordsStored: 148
     startTime: "2025-01-15T02:00:00Z"
     completionTime: "2025-01-15T02:05:23Z"
     duration: "5m23s"
@@ -5742,37 +5732,25 @@ type CollectionTaskStatus struct {
     // +patchStrategy=merge
     Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 
-    // Active 正在运行的Job列表
-    // +optional
-    Active []JobReference `json:"active,omitempty"`
-
-    // LastExecutionTime 最后执行时间
-    // +optional
-    LastExecutionTime *metav1.Time `json:"lastExecutionTime,omitempty"`
-
-    // LastSuccessfulTime 最后成功时间
-    // +optional
-    LastSuccessfulTime *metav1.Time `json:"lastSuccessfulTime,omitempty"`
-
-    // LastScheduleTime 最后调度时间
+    // LastScheduleTime 最后调度时间 (从PostgreSQL task_executions同步)
     // +optional
     LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
 
-    // TotalExecutions 总执行次数
+    // LastSuccessTime 最后成功时间 (从PostgreSQL task_executions同步)
     // +optional
-    TotalExecutions int64 `json:"totalExecutions,omitempty"`
+    LastSuccessTime *metav1.Time `json:"lastSuccessTime,omitempty"`
 
-    // SuccessfulExecutions 成功次数
+    // LastFailureTime 最后失败时间 (从PostgreSQL task_executions同步)
     // +optional
-    SuccessfulExecutions int64 `json:"successfulExecutions,omitempty"`
+    LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
 
-    // FailedExecutions 失败次数
+    // LastExecutionSummary 最后执行摘要 (从PostgreSQL task_executions同步)
     // +optional
-    FailedExecutions int64 `json:"failedExecutions,omitempty"`
+    LastExecutionSummary *ExecutionSummary `json:"lastExecutionSummary,omitempty"`
 
-    // LastExecutionMetrics 最后执行指标
+    // ObservedGeneration 观察到的CR版本号 (用于判断CR是否有更新)
     // +optional
-    LastExecutionMetrics *ExecutionMetrics `json:"lastExecutionMetrics,omitempty"`
+    ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // TaskPhase 任务阶段枚举
@@ -5786,13 +5764,19 @@ const (
     TaskPhaseFailed    TaskPhase = "Failed"
 )
 
-// JobReference Job引用
-type JobReference struct {
-    // Name Job名称
-    Name string `json:"name"`
+// ExecutionSummary 执行摘要 (从PostgreSQL同步的执行统计信息)
+type ExecutionSummary struct {
+    // RecordsFetched 抓取记录数
+    RecordsFetched int64 `json:"recordsFetched"`
 
-    // Namespace Job命名空间
-    Namespace string `json:"namespace"`
+    // RecordsStored 存储记录数
+    RecordsStored int64 `json:"recordsStored"`
+
+    // Status 执行状态 (running/success/failed)
+    Status string `json:"status"`
+
+    // ErrorMessage 错误信息 (失败时)
+    ErrorMessage *string `json:"errorMessage,omitempty"`
 
     // UID Job UID
     UID string `json:"uid"`
@@ -6059,171 +6043,152 @@ func (r *CollectionTaskReconciler) reconcileConfigMap(ctx context.Context, task 
     return configMap, nil
 }
 
-// reconcileCronJob 创建或更新CronJob
-func (r *CollectionTaskReconciler) reconcileCronJob(ctx context.Context, task *datafusionv1.CollectionTask, configMap *corev1.ConfigMap) error {
-    cronJob := &batchv1.CronJob{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      task.Name,
-            Namespace: task.Namespace,
-        },
-        Spec: batchv1.CronJobSpec{
-            Schedule:                   task.Spec.Schedule,
-            ConcurrencyPolicy:          convertConcurrencyPolicy(task.Spec.ConcurrencyPolicy),
-            SuccessfulJobsHistoryLimit: task.Spec.SuccessfulJobsHistoryLimit,
-            FailedJobsHistoryLimit:     task.Spec.FailedJobsHistoryLimit,
-            JobTemplate: batchv1.JobTemplateSpec{
-                Spec: r.buildJobSpec(task, configMap),
-            },
-        },
+// syncCRToDB 将CR配置同步到PostgreSQL Control Center
+func (r *CollectionTaskReconciler) syncCRToDB(ctx context.Context, task *datafusionv1.CollectionTask) error {
+    // 计算下次执行时间
+    nextRunTime, err := calculateNextRunTime(task.Spec.Schedule)
+    if err != nil {
+        return fmt.Errorf("calculate next run time failed: %w", err)
     }
 
-    // 设置OwnerReference
-    if err := controllerutil.SetControllerReference(task, cronJob, r.Scheme); err != nil {
-        return err
+    // 准备配置数据
+    collectorConfig, _ := json.Marshal(task.Spec.DataSource)
+    parsingRules, _ := json.Marshal(task.Spec.Processor)
+    cleaningRules, _ := json.Marshal(task.Spec.Processor.CleaningRules)
+
+    // UPSERT到collection_tasks表
+    query := `
+        INSERT INTO collection_tasks (
+            cr_uid, task_name, collector_type,
+            collector_config, parsing_rules, cleaning_rules,
+            cron_schedule, next_run_time, enabled, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ON CONFLICT (cr_uid)
+        DO UPDATE SET
+            task_name = EXCLUDED.task_name,
+            collector_type = EXCLUDED.collector_type,
+            collector_config = EXCLUDED.collector_config,
+            parsing_rules = EXCLUDED.parsing_rules,
+            cleaning_rules = EXCLUDED.cleaning_rules,
+            cron_schedule = EXCLUDED.cron_schedule,
+            next_run_time = EXCLUDED.next_run_time,
+            enabled = EXCLUDED.enabled,
+            updated_at = NOW()
+    `
+
+    _, err = r.DBClient.ExecContext(ctx, query,
+        string(task.UID),           // cr_uid
+        task.Name,                  // task_name
+        task.Spec.CollectorType,    // collector_type
+        collectorConfig,            // collector_config
+        parsingRules,               // parsing_rules
+        cleaningRules,              // cleaning_rules
+        task.Spec.Schedule,         // cron_schedule
+        nextRunTime,                // next_run_time
+        !task.Spec.Suspended,       // enabled (反转suspended)
+    )
+
+    if err != nil {
+        return fmt.Errorf("sync to database failed: %w", err)
     }
 
-    // CreateOrUpdate
-    if err := r.Client.Create(ctx, cronJob); err != nil {
-        if !errors.IsAlreadyExists(err) {
-            return err
-        }
-        if err := r.Client.Update(ctx, cronJob); err != nil {
-            return err
+    return nil
+}
+
+// syncDBToStatus 从PostgreSQL同步执行状态到CR.Status
+func (r *CollectionTaskReconciler) syncDBToStatus(ctx context.Context, task *datafusionv1.CollectionTask) error {
+    // 查询最新执行记录
+    query := `
+        SELECT status, start_time, end_time, records_fetched, records_stored, error_message
+        FROM task_executions
+        WHERE cr_uid = $1
+        ORDER BY start_time DESC
+        LIMIT 1
+    `
+
+    var status string
+    var startTime, endTime *time.Time
+    var recordsFetched, recordsStored *int64
+    var errorMessage *string
+
+    err := r.DBClient.QueryRowContext(ctx, query, string(task.UID)).Scan(
+        &status, &startTime, &endTime, &recordsFetched, &recordsStored, &errorMessage,
+    )
+
+    if err != nil && err != sql.ErrNoRows {
+        return fmt.Errorf("query execution status failed: %w", err)
+    }
+
+    // 更新CR.Status
+    if startTime != nil {
+        task.Status.LastScheduleTime = &metav1.Time{Time: *startTime}
+    }
+
+    if status == "success" && endTime != nil {
+        task.Status.LastSuccessTime = &metav1.Time{Time: *endTime}
+    }
+
+    if status == "failed" && endTime != nil {
+        task.Status.LastFailureTime = &metav1.Time{Time: *endTime}
+    }
+
+    if recordsStored != nil {
+        task.Status.LastExecutionSummary = &datafusionv1.ExecutionSummary{
+            RecordsFetched: *recordsFetched,
+            RecordsStored:  *recordsStored,
+            Status:         status,
+            ErrorMessage:   errorMessage,
         }
     }
 
     return nil
 }
 
-// buildJobSpec 构建Job Spec
-func (r *CollectionTaskReconciler) buildJobSpec(task *datafusionv1.CollectionTask, configMap *corev1.ConfigMap) batchv1.JobSpec {
-    backoffLimit := int32(3)
-    if task.Spec.JobTemplate != nil && task.Spec.JobTemplate.BackoffLimit != nil {
-        backoffLimit = *task.Spec.JobTemplate.BackoffLimit
-    }
-
-    activeDeadlineSeconds := int64(3600)
-    if task.Spec.JobTemplate != nil && task.Spec.JobTemplate.Timeout != nil {
-        activeDeadlineSeconds = int64(*task.Spec.JobTemplate.Timeout)
-    }
-
-    return batchv1.JobSpec{
-        BackoffLimit:          &backoffLimit,
-        ActiveDeadlineSeconds: &activeDeadlineSeconds,
-        Template: corev1.PodTemplateSpec{
-            Spec: corev1.PodSpec{
-                RestartPolicy: corev1.RestartPolicyNever,
-                Containers: []corev1.Container{
-                    {
-                        Name:  "worker",
-                        Image: r.getWorkerImage(task),
-                        Env: []corev1.EnvVar{
-                            {
-                                Name:  "TASK_NAME",
-                                Value: task.Name,
-                            },
-                            {
-                                Name:  "TASK_NAMESPACE",
-                                Value: task.Namespace,
-                            },
-                        },
-                        VolumeMounts: []corev1.VolumeMount{
-                            {
-                                Name:      "config",
-                                MountPath: "/etc/datafusion",
-                                ReadOnly:  true,
-                            },
-                        },
-                        Resources: r.getResourceRequirements(task),
-                    },
-                },
-                Volumes: []corev1.Volume{
-                    {
-                        Name: "config",
-                        VolumeSource: corev1.VolumeSource{
-                            ConfigMap: &corev1.ConfigMapVolumeSource{
-                                LocalObjectReference: corev1.LocalObjectReference{
-                                    Name: configMap.Name,
-                                },
-                            },
-                        },
-                    },
-                },
-            },
-        },
-    }
-}
-
-// syncJobStatus 同步Job状态到CollectionTask
-func (r *CollectionTaskReconciler) syncJobStatus(ctx context.Context, task *datafusionv1.CollectionTask) error {
-    // 查询关联的Job列表
-    jobList := &batchv1.JobList{}
-    if err := r.List(ctx, jobList, client.InNamespace(task.Namespace), client.MatchingLabels{
-        "datafusion.io/task": task.Name,
-    }); err != nil {
-        return err
-    }
-
-    // 统计Job状态
-    var activeJobs []datafusionv1.JobReference
-    var successCount, failCount int64
-    var lastExecTime, lastSuccessTime *metav1.Time
-
-    for _, job := range jobList.Items {
-        if job.Status.Active > 0 {
-            activeJobs = append(activeJobs, datafusionv1.JobReference{
-                Name:      job.Name,
-                Namespace: job.Namespace,
-                UID:       string(job.UID),
-            })
-        }
-
-        if job.Status.Succeeded > 0 {
-            successCount++
-            if lastSuccessTime == nil || job.Status.CompletionTime.After(lastSuccessTime.Time) {
-                lastSuccessTime = job.Status.CompletionTime
-            }
-        }
-
-        if job.Status.Failed > 0 {
-            failCount++
-        }
-
-        if job.Status.StartTime != nil {
-            if lastExecTime == nil || job.Status.StartTime.After(lastExecTime.Time) {
-                lastExecTime = job.Status.StartTime
-            }
-        }
-    }
-
-    // 更新Status字段
-    task.Status.Active = activeJobs
-    task.Status.SuccessfulExecutions = successCount
-    task.Status.FailedExecutions = failCount
-    task.Status.LastExecutionTime = lastExecTime
-    task.Status.LastSuccessfulTime = lastSuccessTime
-
-    return nil
-}
-
-// SetupWithManager 注册Controller到Manager
+// SetupWithManager 注册Controller到Manager (Deployment常驻Worker架构)
 func (r *CollectionTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
     return ctrl.NewControllerManagedBy(mgr).
         For(&datafusionv1.CollectionTask{}).
-        Owns(&batchv1.CronJob{}).
-        Owns(&batchv1.Job{}).
-        Owns(&corev1.ConfigMap{}).
+        Watches(&source.Kind{Type: &appsv1.Deployment{}}, handler.EnqueueRequestsFromMapFunc(r.findTasksForWorker)).
         Complete(r)
+}
+
+// findTasksForWorker 用于监控Worker Deployment变化并触发相关CollectionTask的Reconcile
+func (r *CollectionTaskReconciler) findTasksForWorker(obj client.Object) []reconcile.Request {
+    deployment := obj.(*appsv1.Deployment)
+
+    // 只关注Worker Deployment (通过label识别)
+    if deployment.Labels["datafusion.io/component"] != "worker" {
+        return nil
+    }
+
+    // 查询所有CollectionTask,触发WorkerReady Condition更新
+    var tasks datafusionv1.CollectionTaskList
+    if err := r.List(context.Background(), &tasks); err != nil {
+        return nil
+    }
+
+    requests := make([]reconcile.Request, len(tasks.Items))
+    for i, task := range tasks.Items {
+        requests[i] = reconcile.Request{
+            NamespacedName: types.NamespacedName{
+                Name:      task.Name,
+                Namespace: task.Namespace,
+            },
+        }
+    }
+    return requests
 }
 ```
 
-**设计亮点：**
+**设计亮点 (Deployment常驻Worker架构):**
 
-1. **声明式编排**：通过OwnerReference和ControllerReference实现资源级联删除和垃圾回收
-2. **Finalizer机制**：确保资源删除前执行清理逻辑（如删除关联的Job）
-3. **RequeueAfter**：定期Reconcile确保状态最终一致性
-4. **ConfigMap注入**：任务配置通过ConfigMap挂载到Job Pod，实现配置与代码分离
-5. **Status同步**：定期同步Job状态到CollectionTask Status，提供统一的状态查询接口
+1. **双向同步机制**：
+   - `syncCRToDB()`: CR配置实时同步到PostgreSQL Control Center
+   - `syncDBToStatus()`: Worker执行状态回传到CR.Status
+2. **PostgreSQL作为Control Plane**：任务配置和执行状态持久化到PostgreSQL，CR仅作声明式接口
+3. **Finalizer机制**：CR删除前清理PostgreSQL中的任务配置和执行记录
+4. **RequeueAfter**：定期Reconcile (1分钟) 确保状态最终一致性
+5. **Worker Deployment监控**：通过Watches监控Worker Deployment状态变化，更新WorkerReady Condition
 
 #### 3.3.3. Worker Job Pod插件接口设计
 
