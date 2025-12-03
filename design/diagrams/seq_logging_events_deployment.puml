@@ -1,0 +1,112 @@
+@startuml
+title 日志聚合与事件追踪时序图 (Deployment常驻Worker架构)
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "Worker Pod\n(Deployment)" as worker
+participant "Operator\nController" as operator
+participant "Fluent Bit\n(DaemonSet)" as fluentbit
+database "Elasticsearch" as es
+participant "K8s API Server\n(Events)" as events
+participant "Kibana\n(日志查询)" as kibana
+actor User as user
+
+autonumber
+
+== Worker Pod日志采集 ==
+
+worker -> worker: 执行任务采集\nlog.Info("开始采集任务xxx")
+note right of worker
+  日志格式(JSON):
+  {
+    "timestamp": "2025-12-02T10:30:00Z",
+    "level": "info",
+    "message": "开始采集任务xxx",
+    "task_id": "task-123",
+    "worker_pod": "rpa-collector-abc",
+    "namespace": "datafusion"
+  }
+end note
+
+worker -> worker: stdout/stderr输出
+
+fluentbit -> worker: 采集容器日志\n(tail /var/log/containers/*.log)
+note right of fluentbit
+  Fluent Bit配置:
+  - Input: tail容器日志
+  - Filter: 添加K8s metadata
+  - Output: Elasticsearch
+end note
+
+fluentbit -> fluentbit: 添加K8s元数据\n(pod名称、namespace、labels)
+
+fluentbit -> es: 推送日志到Elasticsearch\nPOST /datafusion-logs-2025.12.02/_doc
+activate es
+
+es -> es: 索引日志文档
+note right of es
+  Elasticsearch索引策略:
+  - 索引模式: datafusion-logs-{date}
+  - 保留30天
+  - 按task_id、level、timestamp建索引
+end note
+
+es --> fluentbit: 日志已索引
+deactivate es
+
+== Operator事件记录 ==
+
+operator -> operator: Reconcile CollectionTask CR\nlog.Info("配置同步成功")
+
+operator -> events: 创建K8s Event\nPOST /api/v1/namespaces/datafusion/events
+activate events
+
+events -> events: 记录Event对象
+note right of events
+  Event示例:
+  kind: Event
+  reason: ConfigSyncSuccess
+  message: "CR配置已同步到PostgreSQL"
+  involvedObject:
+    kind: CollectionTask
+    name: product-scraper
+  type: Normal
+end note
+
+events --> operator: Event已记录
+deactivate events
+
+== 用户查询日志 ==
+
+user -> kibana: 查询任务执行日志\n(task_id: "task-123")
+activate kibana
+
+kibana -> es: GET /datafusion-logs-*/_search\n{\n  "query": {"match": {"task_id": "task-123"}},\n  "sort": [{"timestamp": "desc"}]\n}
+
+es --> kibana: 返回日志列表
+
+kibana --> user: 显示日志\n(时间线、日志级别、详细信息)
+note right of user
+  日志查询功能:
+  - 按task_id过滤
+  - 按时间范围
+  - 按日志级别(error/warn/info)
+  - 全文搜索
+end note
+deactivate kibana
+
+== 用户查询K8s Events ==
+
+user -> user: kubectl get events\n--namespace datafusion\n--field-selector involvedObject.name=product-scraper
+
+events --> user: 返回Event列表
+note right of user
+  Event示例输出:
+  2m   Normal   ConfigSyncSuccess   CollectionTask/product-scraper   配置同步成功
+  1m   Normal   TaskExecutionStart  CollectionTask/product-scraper   Worker开始执行任务
+  30s  Normal   TaskExecutionSuccess CollectionTask/product-scraper  执行成功,采集1234条记录
+end note
+
+@enduml

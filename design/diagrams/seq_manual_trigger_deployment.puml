@@ -1,0 +1,134 @@
+@startuml
+title 手动触发任务执行时序图 (Deployment常驻Worker架构)
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI" as ui
+participant "API Gateway" as api
+database "PostgreSQL\nControl Center" as controldb
+participant "Worker Pod\n(Deployment)" as worker
+participant "Collector\nEngine" as collector
+
+autonumber
+
+== 手动触发请求 ==
+
+user -> ui: 点击"立即执行"按钮
+note right of user
+  手动触发场景:
+  - 测试任务配置
+  - 紧急数据采集
+  - 补采历史数据
+end note
+
+ui -> api: POST /api/v1/tasks/{task-id}/trigger\n{parameters: {priority: 10}}
+activate api
+
+api -> api: 验证用户权限\n验证任务ID存在
+
+alt 权限验证失败
+    api --> ui: 403 Forbidden
+    ui --> user: "权限不足"
+    note right: 终止流程
+end
+
+== 插入高优先级任务记录 ==
+
+api -> controldb: BEGIN TRANSACTION
+activate controldb
+
+api -> controldb: INSERT INTO manual_triggers\n  (trigger_id, task_id, priority, status, triggered_by)\nVALUES\n  ($1, $2, 10, 'pending', $3)
+note right of controldb
+  手动触发记录:
+  - trigger_id: 唯一触发ID
+  - priority: 10 (最高优先级)
+  - status: pending (等待执行)
+  - triggered_by: 用户ID
+end note
+
+controldb --> api: INSERT成功
+
+api -> controldb: UPDATE collection_tasks\nSET next_run_time = NOW(),\n    priority = 10\nWHERE task_id = $1
+note right of controldb
+  关键操作:
+  - next_run_time = NOW(): 立即可执行
+  - priority = 10: 优先于所有定时任务
+end note
+
+controldb --> api: UPDATE成功
+
+api -> controldb: COMMIT
+deactivate controldb
+
+api --> ui: 200 OK\n{trigger_id: "xxx", status: "pending", message: "任务已提交,等待Worker执行"}
+deactivate api
+
+ui --> user: "任务触发成功,执行中..."
+
+== Worker优先获取手动触发任务 ==
+
+worker -> controldb: SELECT * FROM collection_tasks\nWHERE enabled=true\n  AND next_run_time <= NOW()\nORDER BY priority DESC, next_run_time ASC\nFOR UPDATE SKIP LOCKED\nLIMIT 1
+note right of worker
+  轮询周期: 30秒
+
+  查询策略:
+  1. ORDER BY priority DESC: 高优先级优先
+  2. 手动触发任务(priority=10)排最前
+  3. 最多30秒延迟(下次轮询时获取)
+end note
+
+controldb --> worker: 返回手动触发的任务\n(priority=10)
+
+== Worker执行任务 ==
+
+worker -> controldb: UPDATE manual_triggers\nSET status='running', started_at=NOW()\nWHERE trigger_id = $1
+
+worker -> collector: Execute(config)
+note right of collector
+  执行流程:
+  1. 加载任务配置
+  2. 初始化采集器(从浏览器池获取)
+  3. 执行数据采集
+  4. 解析和处理数据
+  5. 存储到目标数据库
+end note
+
+collector -> collector: 采集数据...
+
+alt 执行成功
+    collector --> worker: {records: 1234, duration: "30s"}
+
+    worker -> controldb: UPDATE manual_triggers\nSET status='success',\n    completed_at=NOW(),\n    records_fetched=1234\nWHERE trigger_id = $1
+
+    worker -> controldb: UPDATE collection_tasks\nSET priority=0,\n    next_run_time=calculate_next(cron_schedule)\nWHERE task_id = $1
+    note right of controldb
+      恢复正常调度:
+      - priority: 10 → 0 (恢复默认优先级)
+      - next_run_time: 重新计算Cron调度时间
+    end note
+else 执行失败
+    collector --> worker: {error: "Connection timeout"}
+
+    worker -> controldb: UPDATE manual_triggers\nSET status='failed',\n    completed_at=NOW(),\n    error_message='Connection timeout'\nWHERE trigger_id = $1
+end
+
+== 用户查询执行状态 ==
+
+user -> ui: 刷新页面/轮询状态
+
+ui -> api: GET /api/v1/triggers/{trigger-id}/status
+activate api
+
+api -> controldb: SELECT status, records_fetched, error_message\nFROM manual_triggers\nWHERE trigger_id = $1
+
+controldb --> api: {status: 'success', records: 1234}
+
+api --> ui: 200 OK\n{status: 'success', records: 1234}
+deactivate api
+
+ui --> user: "执行成功: 采集1234条记录"
+
+@enduml

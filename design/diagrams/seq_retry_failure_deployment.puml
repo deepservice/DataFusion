@@ -1,0 +1,169 @@
+@startuml
+title 任务失败自动重试时序图 (Deployment常驻Worker架构)
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "Worker Pod\n(Deployment)" as worker
+participant "Collector\nEngine" as collector
+database "PostgreSQL\nControl Center" as controldb
+participant "Operator\nController" as operator
+participant "CollectionTask\nCR" as cr
+participant "Monitoring\nSystem" as monitor
+
+autonumber
+
+== 任务执行失败(第1次) ==
+
+worker -> controldb: SELECT * FROM collection_tasks\nWHERE enabled=true AND next_run_time <= NOW()\nFOR UPDATE SKIP LOCKED LIMIT 1
+activate controldb
+
+controldb --> worker: 返回任务配置
+deactivate controldb
+
+worker -> collector: Execute(config)
+activate collector
+
+collector -> collector: 采集数据...\n(网络超时/数据源异常)
+
+collector --> worker: {error: "Connection timeout after 30s"}
+deactivate collector
+
+worker -> controldb: BEGIN TRANSACTION
+activate controldb
+
+worker -> controldb: INSERT INTO task_executions\n  (execution_id, task_id, status, retry_count, error_message, started_at, failed_at)\nVALUES\n  ($1, $2, 'failed', 1, 'Connection timeout', NOW(), NOW())
+note right of controldb
+  记录失败执行:
+  - retry_count: 1 (第1次失败)
+  - error_message: 详细错误信息
+  - failed_at: 失败时间戳
+end note
+
+worker -> worker: 计算指数退避延迟\ndelay = min(base_delay * 2^retry_count, max_delay)\n     = min(300 * 2^1, 3600)\n     = 600秒 (10分钟)
+note right of worker
+  重试策略配置:
+  - max_retries: 6
+  - base_delay: 300秒 (5分钟)
+  - max_delay: 3600秒 (1小时)
+  - backoff_type: exponential
+end note
+
+worker -> controldb: UPDATE collection_tasks\nSET next_run_time = NOW() + INTERVAL '600 seconds',\n    retry_count = 1,\n    last_failure_time = NOW()\nWHERE task_id = $1
+note right of controldb
+  重试调度:
+  - next_run_time: 600秒后重试
+  - retry_count: 记录当前重试次数
+  - Worker下次轮询时自动获取
+end note
+
+worker -> controldb: COMMIT
+deactivate controldb
+
+== 600秒后 - 第2次重试 ==
+
+worker -> controldb: SELECT * FROM collection_tasks\nWHERE enabled=true AND next_run_time <= NOW()\nFOR UPDATE SKIP LOCKED LIMIT 1
+
+controldb --> worker: 返回重试任务\n(retry_count=1)
+
+worker -> collector: Execute(config)
+activate collector
+
+collector -> collector: 采集数据...\n(仍然失败)
+
+collector --> worker: {error: "Connection refused"}
+deactivate collector
+
+worker -> controldb: BEGIN TRANSACTION
+activate controldb
+
+worker -> controldb: INSERT INTO task_executions\n  (status, retry_count, error_message, failed_at)\nVALUES\n  ('failed', 2, 'Connection refused', NOW())
+
+worker -> worker: 计算指数退避延迟\ndelay = min(300 * 2^2, 3600)\n     = 1200秒 (20分钟)
+
+worker -> controldb: UPDATE collection_tasks\nSET next_run_time = NOW() + INTERVAL '1200 seconds',\n    retry_count = 2
+
+worker -> controldb: COMMIT
+deactivate controldb
+
+== 重复重试... ==
+
+note over worker, controldb
+  重复上述流程:
+  - 第3次失败: 等待2400秒 (40分钟)
+  - 第4次失败: 等待3600秒 (1小时, 达到max_delay)
+  - 第5次失败: 等待3600秒 (1小时)
+  - 第6次失败: 等待3600秒 (1小时)
+end note
+
+== 达到最大重试次数(第7次失败) ==
+
+worker -> controldb: SELECT * FROM collection_tasks\nWHERE retry_count >= max_retries
+
+controldb --> worker: 返回任务\n(retry_count=6, max_retries=6)
+
+worker -> collector: Execute(config)
+activate collector
+
+collector --> worker: {error: "Connection timeout"}
+deactivate collector
+
+worker -> controldb: BEGIN TRANSACTION
+activate controldb
+
+worker -> controldb: INSERT INTO task_executions\n  (status, retry_count, error_message)\nVALUES\n  ('final_failed', 7, 'Max retries exceeded')
+note right of controldb
+  最终失败状态:
+  - status: 'final_failed' (不再重试)
+  - retry_count: 7 (超过max_retries)
+  - 不再更新next_run_time
+end note
+
+worker -> controldb: UPDATE collection_tasks\nSET status = 'failed',\n    retry_count = 7,\n    last_failure_time = NOW(),\n    next_run_time = NULL
+note right of controldb
+  停止重试:
+  - status: 'failed'
+  - next_run_time: NULL (不再调度)
+  - 等待人工干预
+end note
+
+worker -> controldb: COMMIT
+deactivate controldb
+
+== Operator同步失败状态 ==
+
+operator -> controldb: SELECT status, retry_count, error_message\nFROM collection_tasks\nWHERE cr_uid = $1
+note right of operator
+  syncDBToStatus()轮询:
+  - 每1分钟执行一次
+  - 同步PostgreSQL状态到CR
+end note
+
+controldb --> operator: {status: 'failed', retry_count: 7, error: '...'}
+
+operator -> cr: Update CR.Status\n{\n  phase: Failed,\n  retryCount: 7,\n  lastFailureTime: now(),\n  message: "Max retries exceeded: Connection timeout"\n}
+
+operator -> monitor: 触发Critical告警\n{\n  severity: "critical",\n  task: "product-scraper",\n  reason: "Max retries exceeded",\n  retry_count: 7,\n  last_error: "Connection timeout",\n  last_success_time: "2 hours ago"\n}
+note right of monitor
+  告警内容:
+  - 任务名称和ID
+  - 失败原因
+  - 重试次数
+  - 最后成功时间
+  - 需要人工介入
+end note
+
+monitor --> operator: 告警已发送
+
+== 人工干预后恢复 ==
+
+note over worker, cr
+  人工修复数据源问题后:
+  1. 用户通过Web UI或kubectl PATCH CR: {spec: {resetRetry: true}}
+  2. Operator Reconcile检测到resetRetry=true
+  3. UPDATE collection_tasks SET retry_count=0, status='active', next_run_time=NOW()
+  4. Worker下次轮询时重新执行任务
+end note
+
+@enduml

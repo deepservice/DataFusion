@@ -1,0 +1,127 @@
+@startuml
+title CollectionTask暂停与恢复时序图 (Deployment常驻Worker架构)
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI" as ui
+participant "K8s API Server" as apiserver
+participant "Operator\nController" as operator
+participant "CollectionTask\nCR" as cr
+database "PostgreSQL\nControl Center" as controldb
+participant "Worker Pod\n(Deployment)" as worker
+
+autonumber
+
+== 暂停任务流程 ==
+
+user -> ui: 点击"暂停任务"按钮
+note right of user
+  用户场景:
+  - 临时停止数据采集
+  - 数据源维护期间
+  - 调试问题时暂停
+end note
+
+ui -> apiserver: PATCH /apis/datafusion.io/v1/.../collectiontasks/{name}\n{spec: {suspended: true}}
+activate apiserver
+
+apiserver -> cr: 更新CR\nspec.suspended = true
+
+apiserver --> ui: 200 OK
+deactivate apiserver
+ui --> user: "任务已暂停"
+
+apiserver -> operator: Watch Event: Update
+activate operator
+
+operator -> cr: Get CollectionTask CR
+cr --> operator: {spec: {suspended: true}}
+
+operator -> controldb: UPDATE collection_tasks\nSET enabled = false,\n    suspended_at = NOW()\nWHERE cr_uid = $1
+note right of controldb
+  关键字段:
+  - enabled: false (Worker查询条件)
+  - suspended_at: 暂停时间戳
+
+  已运行的任务会继续执行完成
+end note
+
+controldb --> operator: 1 row updated
+
+operator -> cr: Update Status\n{phase: Suspended,\nsuspendedTime: now()}
+
+operator --> apiserver: Reconcile完成
+deactivate operator
+
+== Worker行为变化 ==
+
+worker -> controldb: SELECT * FROM collection_tasks\nWHERE enabled=true AND next_run_time <= NOW()
+note right of worker
+  Worker轮询查询条件:
+  enabled=true
+
+  暂停的任务不会被查询到
+end note
+
+controldb --> worker: 空结果集(暂停任务被过滤)
+
+worker -> worker: 跳过已暂停的任务
+note right of worker
+  暂停效果:
+  - Worker不再执行此任务
+  - 无需停止Worker Deployment
+  - 对其他任务无影响
+end note
+
+== 恢复任务流程 ==
+
+user -> ui: 点击"恢复任务"按钮
+
+ui -> apiserver: PATCH /apis/datafusion.io/v1/.../collectiontasks/{name}\n{spec: {suspended: false}}
+activate apiserver
+
+apiserver -> cr: 更新CR\nspec.suspended = false
+
+apiserver --> ui: 200 OK
+deactivate apiserver
+ui --> user: "任务已恢复"
+
+apiserver -> operator: Watch Event: Update
+activate operator
+
+operator -> cr: Get CollectionTask CR
+cr --> operator: {spec: {suspended: false}}
+
+operator -> controldb: UPDATE collection_tasks\nSET enabled = true,\n    resumed_at = NOW(),\n    next_run_time = calculate_next(cron_schedule)\nWHERE cr_uid = $1
+note right of controldb
+  关键字段:
+  - enabled: true (重新启用)
+  - resumed_at: 恢复时间戳
+  - next_run_time: 重新计算下次执行时间
+end note
+
+controldb --> operator: 1 row updated
+
+operator -> cr: Update Status\n{phase: Active,\nresumedTime: now()}
+
+operator --> apiserver: Reconcile完成
+deactivate operator
+
+== Worker自动恢复执行 ==
+
+worker -> controldb: SELECT * FROM collection_tasks\nWHERE enabled=true AND next_run_time <= NOW()
+
+controldb --> worker: 返回恢复后的任务
+
+worker -> worker: 按正常流程执行任务
+note right of worker
+  恢复效果:
+  - Worker下次轮询时(最多30秒)自动获取
+  - 根据Cron表达式重新调度
+  - 无需手动干预
+end note
+
+@enduml

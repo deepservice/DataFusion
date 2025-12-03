@@ -1,0 +1,110 @@
+@startuml
+title CollectionTask配置更新时序图 (Deployment常驻Worker架构)
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor User as user
+participant "Web UI\n(Management Plane)" as ui
+participant "K8s API Server" as apiserver
+participant "Operator\nController" as operator
+participant "CollectionTask\nCR" as cr
+database "PostgreSQL\nControl Center" as controldb
+participant "Worker Pod\n(Deployment)" as worker
+
+autonumber
+
+== CR配置更新阶段 ==
+
+user -> ui: 修改任务配置\n(Cron时间/采集规则等)
+note right of user
+  更新内容示例:
+  - Cron: "0 8 * * *" → "0 */4 * * *"
+    (每天8点 → 每4小时执行)
+  - 采集规则: 添加新字段提取
+  - 存储目标: 更换数据库表
+end note
+
+ui -> ui: 前端验证修改内容
+ui -> user: 显示配置变更对比
+
+user -> ui: 确认提交
+
+ui -> apiserver: PATCH /apis/datafusion.io/v1/namespaces/default/collectiontasks/{name}\n{更新的spec字段}
+activate apiserver
+
+apiserver -> apiserver: 验证更新内容Schema
+apiserver -> apiserver: RBAC权限检查
+
+apiserver -> cr: 更新CR对象spec
+note right of cr
+  metadata.generation自动递增
+  (用于检测配置变更)
+end note
+
+apiserver --> ui: 200 OK
+deactivate apiserver
+ui --> user: "配置更新成功"
+
+== Operator监听与同步阶段 ==
+
+apiserver -> operator: Watch Event: Update
+activate operator
+
+operator -> cr: Get CollectionTask CR
+cr --> operator: {metadata, spec, status}
+
+operator -> operator: 检测generation变化\nspec.generation > status.observedGeneration
+
+operator -> operator: 验证新配置\n(Cron表达式、数据源连接等)
+
+alt 配置验证失败
+    operator -> cr: Update Status\n{phase: Failed, message: "Invalid config"}
+    operator --> apiserver: Status更新完成
+    note right: 终止同步,等待用户修正
+end
+
+== 配置同步到PostgreSQL ==
+
+operator -> controldb: BEGIN TRANSACTION
+activate controldb
+
+operator -> controldb: UPDATE collection_tasks SET\n  collector_config = $1,\n  parsing_rules = $2,\n  cron_schedule = $3,\n  next_run_time = calculate_next($3),\n  updated_at = NOW()\nWHERE cr_uid = $4
+note right of controldb
+  关键更新字段:
+  - collector_config: 采集器配置JSON
+  - parsing_rules: 解析规则JSON
+  - cron_schedule: Cron表达式
+  - next_run_time: 重新计算下次执行时间
+end note
+
+controldb --> operator: 1 row updated
+
+operator -> controldb: COMMIT
+deactivate controldb
+
+operator -> cr: Update Status\n{observedGeneration: spec.generation,\nphase: Active,\nlastUpdateTime: now()}
+
+operator --> apiserver: Reconcile完成
+deactivate operator
+
+== Worker自动使用新配置 ==
+
+worker -> controldb: SELECT * FROM collection_tasks\nWHERE enabled=true AND next_run_time <= NOW()\nFOR UPDATE SKIP LOCKED LIMIT 1
+note right of worker
+  Worker轮询周期: 30秒
+  下次轮询时自动获取新配置
+end note
+
+controldb --> worker: 返回任务(包含更新后的配置)
+
+worker -> worker: 使用新配置执行采集\n(新Cron时间、新解析规则)
+note right of worker
+  配置热更新:
+  - 无需重启Worker Pod
+  - 无需重新创建任何K8S资源
+  - 配置变更对用户透明
+end note
+
+@enduml

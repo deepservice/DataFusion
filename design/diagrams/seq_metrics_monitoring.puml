@@ -1,0 +1,113 @@
+@startuml
+title Metrics采集与监控流程 (Deployment常驻Worker架构)
+
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "Worker Pod\n(Deployment)" as worker
+participant "Prometheus\nServer" as prometheus
+participant "PodMonitor\n(CR)" as podmonitor
+participant "Grafana\nDashboard" as grafana
+participant "Alertmanager" as alertmanager
+actor "User\n(Email/Slack)" as user
+
+autonumber
+
+== Worker Pod启动并暴露Metrics ==
+
+worker -> worker: 启动Worker进程\n初始化Metrics Registry
+note right of worker
+  Metrics暴露端口:
+  :8080/metrics (HTTP)
+
+  Prometheus格式:
+  # TYPE datafusion_records_fetched_total counter
+  datafusion_records_fetched_total{task="xxx"} 1523
+end note
+
+worker -> worker: HTTP Server监听\n:8080/metrics
+
+== Prometheus自动发现和抓取 ==
+
+podmonitor -> prometheus: 配置Pod发现规则\n(Label selector: app=rpa-collector)
+note right of podmonitor
+  PodMonitor CR定义:
+  apiVersion: monitoring.coreos.com/v1
+  kind: PodMonitor
+  spec:
+    selector:
+      matchLabels:
+        app: rpa-collector
+    podMetricsEndpoints:
+    - port: metrics
+      interval: 15s
+end note
+
+prometheus -> podmonitor: 查询匹配的Pod列表
+
+podmonitor --> prometheus: 返回Worker Pod列表\n(rpa-collector-deployment-abc)
+
+loop 每15秒抓取一次
+    prometheus -> worker: GET /metrics
+    activate worker
+
+    worker -> worker: 收集当前Metrics数据
+
+    worker --> prometheus: 返回Metrics\n(records_fetched, duration, etc.)
+    deactivate worker
+
+    prometheus -> prometheus: 存储到TSDB\n(时间序列数据库)
+end
+
+== Grafana可视化查询 ==
+
+grafana -> prometheus: 查询Metrics\n(PromQL查询语句)
+note right of grafana
+  查询示例:
+  rate(datafusion_records_fetched_total[5m])
+
+  sum(datafusion_worker_active_tasks) by (worker)
+
+  histogram_quantile(0.95,
+    datafusion_collection_duration_seconds)
+end note
+
+prometheus --> grafana: 返回时间序列数据
+
+grafana -> grafana: 渲染Dashboard\n(折线图、柱状图、热力图)
+
+user -> grafana: 访问Dashboard\n查看实时Metrics
+
+== 告警规则评估 ==
+
+prometheus -> prometheus: 评估告警规则\n(每15秒执行一次)
+note right of prometheus
+  告警规则示例:
+  alert: CollectionTaskFailureRateHigh
+  expr: rate(datafusion_records_failed_total[5m])
+        / rate(datafusion_records_fetched_total[5m]) > 0.5
+  for: 10m
+end note
+
+alt 失败率超过阈值(50%)且持续10分钟
+    prometheus -> alertmanager: 触发告警\n{alert: "CollectionTaskFailureRateHigh",\n task: "product-scraper",\n failure_rate: 0.65}
+    activate alertmanager
+
+    alertmanager -> alertmanager: 分组和去重\n(grouping, deduplication)
+
+    alertmanager -> user: 发送告警通知\n(Email/Slack Webhook)
+    note right of user
+      告警内容:
+      - 任务名称: product-scraper
+      - 失败率: 65%
+      - 持续时间: 10分钟
+      - 链接到Grafana Dashboard
+    end note
+
+    deactivate alertmanager
+else 未达到阈值
+    prometheus -> prometheus: 继续监控
+end
+
+@enduml

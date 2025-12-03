@@ -1266,18 +1266,22 @@ spec:
 *   支持GitOps工作流（ArgoCD、Flux）
 
 **2. 高可用设计:**
-*   Operator Manager双副本 + Leader Election
+*   Operator Manager双副本 + Leader Election机制
 *   单个副本故障，30秒内自动切换
-*   Worker Pod由Job管理，失败自动重试
+*   Worker Pod由Deployment管理，失败自动重启
+*   PostgreSQL Control Center作为任务配置中心
 
 **3. 自动化运维:**
-*   自动创建CronJob实现定时调度
+*   Worker轮询PostgreSQL任务配置表（每30秒）
 *   自动扩缩容（HPA）根据任务队列长度调整Pod数
 *   滚动更新和自动回滚
+*   声明式配置管理（CR + PostgreSQL双向同步）
 
 **4. 资源优化:**
-*   Worker Pod任务完成后自动销毁，空闲时不占用资源
-*   相比长驻进程模式，资源利用率提升50%+
+*   Worker Pod长期运行，复用浏览器池和连接池
+*   消除容器启动开销（5-8秒）和浏览器初始化开销（3-5秒）
+*   高频任务性能提升60-72%
+*   资源池预分配，稳定的内存和CPU占用
 
 **5. 安全隔离:**
 *   RBAC精细权限控制
@@ -1349,37 +1353,26 @@ spec:
 
 ### 3.1. 核心场景时序图
 
-基于K8S+Operator架构，系统的核心交互流程发生了根本性变化。本节提供更新后的时序图，展示声明式管理、事件驱动和自动化协调的新架构特点。
+基于K8S+Operator+Deployment常驻Worker架构，系统采用声明式管理、事件驱动和自动化协调模式。本节提供核心业务场景的时序图，展示Operator Controller、Worker Deployment Pod、PostgreSQL Control Center之间的交互流程。
+
+> **架构说明**: 本节描述基于Deployment常驻Worker架构的核心业务场景时序图。完整架构设计详见[3.2.7节 Deployment常驻Worker架构](#327-deployment常驻worker架构)。
 
 **架构变化对时序图的影响:**
-- ❌ **删除**: Master节点、RabbitMQ消息队列、Redis状态管理、Worker长期运行进程
-- ✅ **新增**: Operator Controller、CRD资源、K8S API Server、Job Pod、list-watch机制
+- ❌ **删除**: Master节点、RabbitMQ消息队列、Redis状态管理
+- ✅ **新增**: Operator Controller、CRD资源、K8S API Server、PostgreSQL Control Center、Worker Deployment Pod、list-watch机制
 
 时序图按功能分为三大类：
 - **声明式资源管理**：创建CollectionTask CR、更新配置、暂停/恢复任务
-- **自动化任务执行**：Controller Reconcile循环、Job Pod生命周期、状态同步
+- **自动化任务执行**：Controller Reconcile循环、Worker轮询机制、分布式锁、状态同步
 - **监控与可观测性**：Metrics采集、事件追踪、日志聚合
 
 #### 3.1.1. 声明式资源管理场景
-
-> ### ⚠️ 架构版本说明
->
-> 本节（3.1节）时序图描述基于**Job/CronJob临时Pod架构**（v1.0，已规划优化）。
->
-> **生产环境推荐使用Deployment常驻Worker架构**（v2.0），相关文档：
-> - [3.2.7节 Deployment常驻Worker架构](#327-deployment常驻worker架构) - 完整架构设计
-> - [seq_create_task.puml](diagrams/seq_create_task.puml) - 任务创建时序图（Deployment架构）
-> - [seq_execute_task.puml](diagrams/seq_execute_task.puml) - 任务执行时序图（Deployment架构）
-> - [k8s_operator_deployment.puml](diagrams/k8s_operator_deployment.puml) - 部署架构图（Deployment架构）
-> - [deploy/README.md](deploy/README.md) - Deployment部署指南
->
-> 两种架构对比详见[3.2.7.1节](#3271-架构对比与优化目标)。
 
 ##### 3.1.1.1. 创建CollectionTask任务流程
 
 **场景描述:**
 
-用户通过kubectl或RESTful API创建CollectionTask CR，Kubernetes API Server接收请求，触发ValidatingWebhook验证，CR写入etcd后，Controller watch到变化并执行Reconcile逻辑，自动创建ConfigMap和CronJob，完成任务注册。
+用户通过kubectl或RESTful API创建CollectionTask CR，Kubernetes API Server接收请求，触发ValidatingWebhook验证，CR写入etcd后，Operator Controller watch到变化并执行Reconcile逻辑，将CR配置同步到PostgreSQL Control Center（`syncCRToDB`），完成任务注册。
 
 **参与组件:**
 - kubectl / RESTful API Adapter（用户接口）
@@ -1387,50 +1380,11 @@ spec:
 - ValidatingWebhook（Operator webhook服务）
 - etcd（K8S存储后端）
 - Operator Controller（CollectionTaskReconciler）
-- K8S CronJob Controller（K8S内置控制器）
+- PostgreSQL Control Center（任务配置中心）
 
-**时序图描述:**
+**时序图:**
 
-```
-用户                  kubectl/API         K8S API Server      Webhook           etcd            Operator Controller      CronJob Controller
- |                       |                      |                 |                |                    |                        |
- |--apply task.yaml----->|                      |                 |                |                    |                        |
- |                       |--POST /apis/------->|                 |                |                    |                        |
- |                       |  datafusion.io/v1   |                 |                |                    |                        |
- |                       |  /collectiontasks   |                 |                |                    |                        |
- |                       |                      |--Validate------>|                |                    |                        |
- |                       |                      |  AdmissionReview|                |                    |                        |
- |                       |                      |                 |                |                    |                        |
- |                       |                      |                 |--Check cron--->|                    |                        |
- |                       |                      |                 |  expression    |                    |                        |
- |                       |                      |                 |--Check storage |                    |                        |
- |                       |                      |                 |  config        |                    |                        |
- |                       |                      |<--Validation OK-|                |                    |                        |
- |                       |                      |                 |                |                    |                        |
- |                       |                      |--Write CR------>|                |                    |                        |
- |                       |                      |                 |                |                    |                        |
- |                       |                      |                 |                |--list-watch------->|                        |
- |                       |                      |                 |                |  (Create event)    |                        |
- |                       |                      |                 |                |                    |                        |
- |                       |                      |                 |                |                    |--Reconcile start       |
- |                       |                      |                 |                |                    |                        |
- |                       |                      |                 |                |<--Create ConfigMap-|                        |
- |                       |                      |<--POST /api/v1/configmaps--------|                    |                        |
- |                       |                      |                 |                |                    |                        |
- |                       |                      |                 |                |<--Create CronJob---|                        |
- |                       |                      |<--POST /apis/batch/v1/cronjobs---|                    |                        |
- |                       |                      |                 |                |                    |                        |
- |                       |                      |--Notify-------->|                |                    |                        |
- |                       |                      |  CronJob        |                |                    |                        |
- |                       |                      |  created        |                |                    |----------------------->|
- |                       |                      |                 |                |                    |                   (注册cron)
- |                       |                      |                 |                |                    |                        |
- |                       |                      |                 |                |<--Update Status----|                        |
- |                       |                      |<--PATCH /status---------------|  |                    |                        |
- |                       |                      |  phase=Active   |                |                    |                        |
- |                       |<--task created-------|                 |                |                    |                        |
- |<--Success-------------|                      |                 |                |                    |                        |
-```
+![创建CollectionTask流程](diagrams/seq_create_task.png)
 
 **关键技术点:**
 
@@ -1441,20 +1395,29 @@ spec:
 
 2. **Webhook验证**
    - 在CR写入etcd前进行验证（ValidatingWebhook）
-   - 验证Cron表达式格式、Storage配置、DataSource引用
+   - 验证Cron表达式格式（使用`robfig/cron`库解析）
+   - 验证Storage配置（目标数据库连接信息）
+   - 验证DataSource引用（检查DataSource CR是否存在）
    - 失败直接拒绝请求，避免无效配置进入系统
 
 3. **Reconcile循环**
-   - Controller通过list-watch机制监听CR变化
+   - Controller通过list-watch机制监听CR变化（watch etcd）
    - 触发Reconcile函数，执行协调逻辑
-   - 创建ConfigMap存储任务配置
-   - 创建CronJob注册定时调度
-   - 更新CR Status反映实际状态
+   - 调用`syncCRToDB()`将CR配置同步到PostgreSQL
+   - 更新CR Status反映实际状态（`phase=Active`）
 
-4. **Owner Reference**
-   - ConfigMap和CronJob设置OwnerReference指向CollectionTask CR
-   - 删除CR时自动级联删除子资源
-   - K8S垃圾回收机制自动清理
+4. **配置同步机制（syncCRToDB）**
+   - CR的`spec`字段映射到PostgreSQL的`collection_tasks`表
+   - 包含字段: `task_name`, `collector_type`, `collector_config`, `parsing_rules`, `cron_schedule`, `storage_config`等
+   - Worker Pod通过轮询PostgreSQL获取任务配置
+   - CR.UID作为唯一标识（`cr_uid`字段），避免重复创建
+   - 计算并设置`next_run_time = calculate_next(cron_schedule)`
+
+5. **Owner Reference和级联删除**
+   - PostgreSQL记录包含`cr_uid`字段关联到K8S CR
+   - 删除CR时，Reconcile检测到Deletion事件
+   - 执行`DELETE FROM collection_tasks WHERE cr_uid = ?`
+   - Finalizer机制确保PostgreSQL清理完成后才删除CR
 
 ---
 
@@ -1462,59 +1425,46 @@ spec:
 
 **场景描述:**
 
-用户修改CollectionTask CR的spec字段（如修改cron表达式、采集配置等），Kubernetes API Server接收更新请求，Controller watch到Update事件，重新执行Reconcile逻辑，更新ConfigMap和CronJob，并更新CR Status的ObservedGeneration字段。
+用户修改CollectionTask CR的spec字段（如修改cron表达式、采集配置等），Kubernetes API Server接收更新请求，Operator Controller watch到Update事件，检测`generation`变化后重新执行Reconcile逻辑，将更新后的配置同步到PostgreSQL（`UPDATE collection_tasks SET ...`），并更新CR Status的`observedGeneration`字段。
 
-**时序图描述:**
+**时序图:**
 
-```
-用户               kubectl              K8S API Server       etcd         Operator Controller     CronJob Controller
- |                    |                       |                |                 |                       |
- |--edit task-------->|                       |                |                 |                       |
- |  (change cron)     |                       |                |                 |                       |
- |                    |--PATCH /collectiontasks/{name}-------->|                 |                       |
- |                    |  spec.schedule.cron="0 */4 * * *"      |                 |                       |
- |                    |                       |                |                 |                       |
- |                    |                       |--Update CR---->|                 |                       |
- |                    |                       |  (generation++) |                 |                       |
- |                    |                       |                |--list-watch---->|                       |
- |                    |                       |                | (Update event)  |                       |
- |                    |                       |                |                 |                       |
- |                    |                       |                |                 |--Reconcile start      |
- |                    |                       |                |                 | (detect spec change)  |
- |                    |                       |                |                 |                       |
- |                    |                       |                |<--Update ConfigMap                     |
- |                    |                       |<--PATCH /configmaps/{name}-----|                       |
- |                    |                       |                |                 |                       |
- |                    |                       |                |<--Update CronJob                       |
- |                    |                       |<--PATCH /cronjobs/{name}-------|                       |
- |                    |                       |  (new schedule) |                 |                       |
- |                    |                       |                |                 |                   CronJob
- |                    |                       |                |                 |                   更新调度
- |                    |                       |                |                 |                   <-----|
- |                    |                       |                |                 |                       |
- |                    |                       |                |<--Update Status |                       |
- |                    |                       |<--PATCH /status---------------|  |                       |
- |                    |                       |  observedGeneration=N          |                       |
- |                    |<--task updated--------|                |                 |                       |
- |<--Success----------|                       |                |                 |                       |
-```
+![更新CollectionTask配置流程](diagrams/seq_update_task.png)
 
 **关键技术点:**
 
 1. **Generation机制**
-   - metadata.generation在spec变化时自动递增
-   - Controller通过比较status.observedGeneration和metadata.generation判断是否处理过最新spec
+   - `metadata.generation`在spec变化时自动递增（K8S API Server自动管理）
+   - Controller通过比较`status.observedGeneration`和`metadata.generation`判断是否处理过最新spec
+   - `spec.generation > status.observedGeneration`时触发配置同步
    - 避免重复处理相同配置
 
 2. **配置热更新**
-   - ConfigMap更新后，下次Job运行时自动使用新配置
-   - CronJob schedule更新后，立即生效新的调度时间
-   - 无需重启任何服务
+   - PostgreSQL配置更新后，Worker下次轮询时自动获取新配置（最多30秒延迟）
+   - Cron schedule更新后，重新计算`next_run_time = calculate_next(cron_schedule)`
+   - 采集配置（`collector_config`）、解析规则（`parsing_rules`）立即生效
+   - 无需重启Worker Deployment，配置变更对用户透明
 
-3. **原子性更新**
-   - spec更新和status更新是两个独立操作
+3. **配置同步（UPDATE PostgreSQL）**
+   ```sql
+   UPDATE collection_tasks SET
+     collector_config = $1,
+     parsing_rules = $2,
+     cron_schedule = $3,
+     next_run_time = calculate_next($3),
+     storage_config = $4,
+     updated_at = NOW()
+   WHERE cr_uid = $5
+   ```
+   - 根据`cr_uid`唯一标识更新对应记录
+   - 更新所有可变字段（`collector_config`, `parsing_rules`, `cron_schedule`, `storage_config`）
+   - 重新计算下次执行时间（`next_run_time`）
+
+4. **原子性更新**
+   - CR spec更新和status更新是两个独立操作
    - spec更新使用PATCH方法，只修改变化字段
-   - status更新使用Status子资源，避免冲突
+   - status更新使用Status子资源（`/status`），避免与spec更新冲突
+   - PostgreSQL更新在事务中执行，确保数据一致性
 
 ---
 
@@ -1522,62 +1472,36 @@ spec:
 
 **场景描述:**
 
-用户通过设置CollectionTask CR的`spec.suspended=true`暂停任务，Controller检测到变化后删除CronJob，停止调度；设置`suspended=false`时恢复任务，Controller重新创建CronJob。
+用户通过设置CollectionTask CR的`spec.suspended=true`暂停任务，Operator Controller检测到变化后更新PostgreSQL的`enabled=false`，Worker轮询时跳过该任务；设置`suspended=false`时恢复任务，更新`enabled=true`并重新计算`next_run_time`。
 
-**时序图描述:**
+**时序图:**
 
-```
-用户               kubectl              K8S API Server       etcd         Operator Controller
- |                    |                       |                |                 |
- |--suspend task----->|                       |                |                 |
- |                    |--PATCH spec.suspended=true------------>|                 |
- |                    |                       |                |--list-watch---->|
- |                    |                       |                | (Update event)  |
- |                    |                       |                |                 |
- |                    |                       |                |                 |--Reconcile
- |                    |                       |                |                 |  (detect suspended=true)
- |                    |                       |                |                 |
- |                    |                       |                |<--Delete CronJob-|
- |                    |                       |<--DELETE /cronjobs/{name}-------|
- |                    |                       |                |                 |
- |                    |                       |                |<--Update Status-|
- |                    |                       |<--PATCH status.phase=Suspended--|
- |                    |<--task suspended------|                |                 |
- |<--Success----------|                       |                |                 |
- |                    |                       |                |                 |
- | (some time later)  |                       |                |                 |
- |                    |                       |                |                 |
- |--resume task------>|                       |                |                 |
- |                    |--PATCH spec.suspended=false----------->|                 |
- |                    |                       |                |--list-watch---->|
- |                    |                       |                |                 |
- |                    |                       |                |                 |--Reconcile
- |                    |                       |                |                 |  (detect suspended=false)
- |                    |                       |                |                 |
- |                    |                       |                |<--Create CronJob-|
- |                    |                       |<--POST /cronjobs---------------|
- |                    |                       |                |                 |
- |                    |                       |                |<--Update Status-|
- |                    |                       |<--PATCH status.phase=Active----|
- |                    |<--task resumed--------|                |                 |
- |<--Success----------|                       |                |                 |
-```
+![暂停和恢复CollectionTask流程](diagrams/seq_suspend_resume_task.png)
 
 **关键技术点:**
 
 1. **Suspended语义**
-   - `suspended=true`: 停止创建新Job，但不影响已运行的Job
-   - 已运行的Job会继续执行直到完成或超时
-   - CronJob被删除，调度完全停止
+   - `suspended=true`: Worker查询条件`WHERE enabled=true`会过滤掉该任务
+   - 已运行的Worker任务会继续执行直到完成
+   - 新的轮询不会获取到暂停的任务
 
 2. **状态转换**
-   - Active → Suspended: 删除CronJob
-   - Suspended → Active: 重新创建CronJob
-   - Phase字段反映当前状态
+   - Active → Suspended:
+     - 更新PostgreSQL: `UPDATE collection_tasks SET enabled=false, suspended_at=NOW() WHERE cr_uid=?`
+     - 更新CR Status: `phase=Suspended`, `suspendedTime=now()`
+   - Suspended → Active:
+     - 更新PostgreSQL: `UPDATE collection_tasks SET enabled=true, resumed_at=NOW(), next_run_time=calculate_next(cron) WHERE cr_uid=?`
+     - 更新CR Status: `phase=Active`, `resumedTime=now()`
 
-3. **幂等性**
-   - 重复设置suspended=true不会产生副作用
-   - Controller会检查CronJob是否存在，避免重复操作
+3. **暂停和恢复效果**
+   - 暂停后，Worker下次轮询时（最多30秒）自动跳过该任务
+   - 恢复后，Worker下次轮询时自动重新获取并执行
+   - 无需停止或重启Worker Deployment
+   - 对其他任务无影响
+
+4. **幂等性**
+   - 重复设置`suspended=true`不会产生副作用
+   - Controller检查当前`enabled`状态，避免重复更新PostgreSQL
 
 ---
 
@@ -1587,110 +1511,59 @@ spec:
 
 **场景描述:**
 
-CronJob Controller根据schedule定时触发，自动创建Job，K8S Scheduler调度Job Pod到Worker Node，Pod启动后执行数据采集、处理、存储流程，完成后Pod自动清理，Operator Controller watch到Job完成事件并更新CollectionTask Status。
+Worker Deployment Pod定时轮询PostgreSQL Control Center（每30秒），查询待执行任务（`next_run_time <= NOW()`），通过`FOR UPDATE SKIP LOCKED`分布式锁机制争抢任务执行权，获取锁后执行数据采集、处理、存储流程，完成后更新`task_executions`状态，Operator Controller定时从PostgreSQL同步状态到CR.Status。
 
 **参与组件:**
-- K8S CronJob Controller（K8S内置调度器）
-- K8S Job Controller（K8S内置控制器）
-- K8S Scheduler（K8S调度器）
-- Worker Node（K8S工作节点）
-- Job Pod（临时容器）
+- PostgreSQL Control Center（任务配置中心）
+- Worker Deployment Pod（常驻容器）
+- Collector Engine（采集引擎）
+- Data Processor（数据处理器）
+- Storage Engine（存储引擎）
 - Target Website/Database/API（数据源）
-- PostgreSQL（目标存储）
+- Target Database/Storage（目标存储）
 - Operator Controller（状态同步）
 
-**时序图描述:**
+**时序图:**
 
-```
-CronJob Controller   Job Controller    Scheduler      Worker Node      Job Pod         Data Source    Storage      Operator Controller
-      |                    |               |               |               |                 |             |                |
- (到达cron时间)            |               |               |               |                 |             |                |
-      |--Create Job------->|               |               |               |                 |             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |--Create Pod-->|               |               |                 |             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |--Schedule---->|               |                 |             |                |
-      |                    |               |  (select node)|               |                 |             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |--Pull Image-->|                 |             |                |
-      |                    |               |               |--Start Pod--->|                 |             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Init Container (准备环境)    |                |
-      |                    |               |               |               |--Mount ConfigMap              |                |
-      |                    |               |               |               |--Mount Secret                 |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Main Container start         |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Read Config--->|             |                |
-      |                    |               |               |               |  (from env)     |             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Collect Data-->|             |                |
-      |                    |               |               |               |  (RPA/API/DB)   |             |                |
-      |                    |               |               |               |<--Raw Data------|             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Parse Data     |             |                |
-      |                    |               |               |               |  (HTML/JSON/SQL)|             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Clean Data     |             |                |
-      |                    |               |               |               |  (validator)    |             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Store Data---->|             |                |
-      |                    |               |               |               |  (batch insert) |             |                |
-      |                    |               |               |               |                 |             |<--Success------|
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Report Metrics |             |                |
-      |                    |               |               |               |  (Prometheus)   |             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |               |               |               |--Exit 0         |             |                |
-      |                    |               |               |               | (container exit)|             |                |
-      |                    |               |               |               |                 |             |                |
-      |                    |<--Pod Completed---------------|               |                 |             |                |
-      |                    |  (status.phase=Succeeded)     |               |                 |             |                |
-      |                    |                               |               |                 |             |                |
-      |                    |--Update Job Status            |               |                 |             |                |
-      |                    |  (succeeded=1)                |               |                 |             |                |
-      |                    |                               |               |                 |             |                |
-      |                    |                               |               |                 |             |   (watch Job)  |
-      |                    |                               |               |                 |             |<--Detect-------|
-      |                    |                               |               |                 |             |   Completed    |
-      |                    |                               |               |                 |             |                |
-      |                    |                               |               |                 |             |                |--Reconcile
-      |                    |                               |               |                 |             |                |  (sync status)
-      |                    |                               |               |                 |             |                |
-      |                    |                               |               |                 |             |                |--Update CR Status
-      |                    |                               |               |                 |             |                |  lastSuccessTime
-      |                    |                               |               |                 |             |                |  lastExecutionSummary
-      |                    |                               |               |                 |             |                |
-      | (Pod自动清理, TTL 100s) |                          |               |                 |             |                |
-```
+![定时任务自动触发与执行流程](diagrams/seq_execute_task.png)
 
 **关键技术点:**
 
-1. **K8S原生调度**
-   - CronJob Controller根据cron表达式自动创建Job
-   - 无需RabbitMQ消息队列
-   - schedule更新后立即生效
+1. **轮询机制**
+   - Worker Pod通过定时器（每30秒）主动轮询PostgreSQL
+   - 查询SQL: `SELECT * FROM collection_tasks WHERE enabled=true AND next_run_time <= NOW() ORDER BY priority DESC FOR UPDATE SKIP LOCKED LIMIT 1`
+   - 使用索引优化查询性能（`idx_next_run_time`、`idx_enabled_priority`）
+   - 调度精度: 30秒（轮询间隔）
 
-2. **Job Pod生命周期**
-   - 临时容器，任务完成即销毁
-   - Init Container准备环境（下载依赖、初始化配置）
-   - Main Container执行采集任务
-   - 失败自动重试（backoffLimit控制）
+2. **分布式锁机制**
+   - 使用PostgreSQL的`FOR UPDATE SKIP LOCKED`行级锁
+   - 多个Worker并发查询，只有一个获取锁
+   - 避免重复执行，无需Redis分布式锁
+   - 锁随事务自动释放，无死锁风险
 
-3. **配置注入**
-   - ConfigMap通过EnvFrom注入环境变量
-   - Secret挂载凭证信息
-   - 无需从数据库读取配置
+3. **资源池复用**
+   - Worker常驻，浏览器池预初始化（5个实例）
+   - HTTP连接池复用（`MaxIdleConns=100`）
+   - 数据库连接池复用（`MaxOpenConns=50`）
+   - 消除容器启动开销（5-8秒）和浏览器初始化开销（3-5秒）
+   - 高频任务性能提升60-72%
 
 4. **状态同步**
-   - Operator Controller watch Job状态
-   - Job完成后自动更新CollectionTask Status
-   - 用户通过kubectl get查看任务执行结果
+   - Worker更新`task_executions`表状态（`status='running'/'success'/'failed'`）
+   - Operator定时调用`syncDBToStatus()`（每1分钟）
+   - 从PostgreSQL同步执行状态到CR.Status
+   - 包含: `lastSuccessTime`、`lastExecutionSummary`、`recordsFetched`
 
-5. **资源清理**
-   - Pod完成后保留一段时间（TTL: 100秒）
-   - 日志保留在集群日志系统
-   - 超过TTL后自动清理
+5. **Cron调度**
+   - 任务执行后更新`next_run_time = calculate_next(cron_schedule)`
+   - 基于`robfig/cron`库计算下次执行时间
+   - Worker下次轮询时自动获取到期任务
+   - 支持标准Cron表达式（含秒级）: `0 */5 * * * *`（每5分钟）
+
+6. **任务优先级**
+   - 查询时`ORDER BY priority DESC, next_run_time ASC`
+   - 手动触发任务（`priority=10`）优先于定时任务（`priority=0`）
+   - 同优先级任务按到期时间排序
 
 ---
 
@@ -1698,55 +1571,65 @@ CronJob Controller   Job Controller    Scheduler      Worker Node      Job Pod  
 
 **场景描述:**
 
-用户通过kubectl create job命令或RESTful API手动触发任务执行，直接创建Job（不经过CronJob），立即执行一次采集任务。
+用户通过RESTful API手动触发任务执行，API Adapter在PostgreSQL中插入高优先级任务记录（`priority=10`），Worker Pod轮询时优先获取高优先级任务（`ORDER BY priority DESC`），立即执行一次采集任务。
 
-**时序图描述:**
+**时序图:**
 
-```
-用户               kubectl              K8S API Server       Job Controller    Scheduler      Job Pod
- |                    |                       |                    |               |              |
- |--trigger task----->|                       |                    |               |              |
- | (create job)       |                       |                    |               |              |
- |                    |--POST /apis/batch/v1/jobs--------------->|                |              |
- |                    |  (with config from   |                    |               |              |
- |                    |   CollectionTask CR) |                    |               |              |
- |                    |                       |                    |               |              |
- |                    |                       |                    |--Create Pod-->|              |
- |                    |                       |                    |               |              |
- |                    |                       |                    |               |--Schedule--->|
- |                    |                       |                    |               |  (immediate) |
- |                    |                       |                    |               |              |
- |                    |                       |                    |               |              |--Start
- |                    |                       |                    |               |              |  (execute task)
- |                    |                       |                    |               |              |
- |                    |                       |                    |               |              |--Complete
- |                    |                       |                    |<--Pod Succeeded-------------|
- |                    |                       |                    |               |              |
- |                    |<--job created---------|                    |               |              |
- |<--Success----------|                       |                    |               |              |
-```
+![手动触发任务执行流程](diagrams/seq_manual_trigger_deployment.png)
 
 **关键技术点:**
 
 1. **手动触发方式**
    ```bash
-   # 方式1: 从CronJob创建临时Job
-   kubectl create job product-scraper-manual \
-     --from=cronjob/product-scraper-cronjob -n datafusion
+   # RESTful API触发
+   POST /api/v1/tasks/{task-id}/trigger
+   Content-Type: application/json
 
-   # 方式2: 直接创建Job YAML
-   kubectl apply -f manual-job.yaml
+   {
+     "parameters": {
+       "priority": 10
+     }
+   }
+
+   # 响应
+   {
+     "trigger_id": "trigger_xxx",
+     "status": "pending",
+     "message": "任务已提交，等待Worker执行"
+   }
    ```
 
-2. **与定时任务的区别**
-   - 手动Job不受CronJob管理
-   - 执行一次后不会再次触发
-   - 可以覆盖部分参数（如parallelism）
+2. **优先级机制**
+   - 手动触发任务设置`priority=10`（最高优先级）
+   - 定时任务默认`priority=0`
+   - Worker轮询查询SQL: `ORDER BY priority DESC, next_run_time ASC`
+   - 手动触发任务优先于所有定时任务
 
-3. **RESTful API触发**
+3. **立即执行**
+   - API Adapter插入`manual_triggers`表记录触发请求
+   - 更新`collection_tasks`表: `next_run_time = NOW()`, `priority = 10`
+   - Worker下次轮询时（最多30秒延迟）立即获取
+   - 无需等待Cron调度时间
+
+4. **与定时任务的区别**
+   - 手动触发任务执行一次后恢复默认优先级（`priority=0`）
+   - `next_run_time`重新计算为Cron调度时间
+   - `manual_triggers`表记录手动触发历史（`trigger_id`, `triggered_by`, `triggered_at`）
+   - 不影响正常的Cron调度
+
+5. **执行状态查询**
    ```bash
-   POST /api/v1/tasks/product-scraper/trigger
-   # API Adapter内部调用K8S API创建Job
+   # 查询手动触发状态
+   GET /api/v1/triggers/{trigger-id}/status
+
+   # 响应
+   {
+     "status": "success",  # pending/running/success/failed
+     "records_fetched": 1234,
+     "started_at": "2025-12-02T10:30:00Z",
+     "completed_at": "2025-12-02T10:30:45Z",
+     "duration": "45s"
+   }
    ```
 
 ---
@@ -1757,56 +1640,18 @@ CronJob Controller   Job Controller    Scheduler      Worker Node      Job Pod  
 
 **场景描述:**
 
-Job Pod在执行过程中通过Prometheus client暴露metrics端点（:8080/metrics），Prometheus通过PodMonitor自动发现并抓取指标，Grafana展示任务执行统计，Alertmanager根据规则发送告警。
+Worker Deployment Pod在执行过程中通过Prometheus client暴露metrics端点（:8080/metrics），Prometheus通过PodMonitor自动发现并抓取指标，Grafana展示任务执行统计，Alertmanager根据规则发送告警。
 
 **参与组件:**
-- Job Pod（暴露/metrics端点）
+- Worker Deployment Pod（暴露/metrics端点）
 - Prometheus（指标抓取）
 - PodMonitor（自动发现）
 - Grafana（可视化）
 - Alertmanager（告警）
 
-**时序图描述:**
+**时序图:**
 
-```
-Job Pod            Prometheus        PodMonitor        Grafana        Alertmanager      Email/Slack
-  |                    |                 |                |                |                 |
-  |--Start execution   |                 |                |                |                 |
-  |                    |                 |                |                |                 |
-  |--Expose :8080/metrics              |                |                |                 |
-  |                    |                 |                |                |                 |
-  |                    |<--Discover Pod--|                |                |                 |
-  |                    | (via PodMonitor)|                |                |                 |
-  |                    |                 |                |                |                 |
-  |                    |--Scrape /metrics>               |                |                 |
-  |                    | (every 15s)     |                |                |                 |
-  |<--GET /metrics-----|                 |                |                |                 |
-  |                    |                 |                |                |                 |
-  |--Metrics data----->|                 |                |                |                 |
-  | (records_fetched,  |                 |                |                |                 |
-  |  duration, etc.)   |                 |                |                |                 |
-  |                    |                 |                |                |                 |
-  |                    |--Store TSDB     |                |                |                 |
-  |                    |                 |                |                |                 |
-  |                    |                 |                |<--Query-------|                 |
-  |                    |                 |                | (PromQL)      |                 |
-  |                    |                 |                |                |                 |
-  |                    |--Query result-->|                |                |                 |
-  |                    |                 |                |                |                 |
-  |                    |                 |                |--Render------->|                 |
-  |                    |                 |                |  Dashboard    |                 |
-  |                    |                 |                |                |                 |
-  | (如果失败率超过阈值)   |                 |                |                |                 |
-  |                    |--Evaluate Alert Rule            |                |                 |
-  |                    |  (failure_rate > 0.5)           |                |                 |
-  |                    |                 |                |                |                 |
-  |                    |--Fire Alert---->|                |                |                 |
-  |                    |                 |                |                |                 |
-  |                    |                 |                |                |--Send Alert---->|
-  |                    |                 |                |                | (email/webhook) |
-  |                    |                 |                |                |                 |
-  |                    |                 |                |                |                 |--Notify User
-```
+![Metrics采集与监控流程](diagrams/seq_metrics_monitoring.png)
 
 **关键技术点:**
 
@@ -1815,12 +1660,15 @@ Job Pod            Prometheus        PodMonitor        Grafana        Alertmanag
    datafusion_records_fetched_total{task="product-scraper"} 1523
    datafusion_records_stored_total{task="product-scraper"} 1520
    datafusion_collection_duration_seconds{task="product-scraper"} 45.2
+   datafusion_task_execution_total{task="product-scraper",status="success"} 156
+   datafusion_worker_active_tasks{worker="rpa-collector-abc"} 2
    ```
 
 2. **自动发现**
-   - PodMonitor根据Label selector自动发现Job Pod
+   - PodMonitor根据Label selector自动发现Worker Deployment Pod
+   - Label selector: `app=rpa-collector`
    - Prometheus每15秒抓取一次metrics
-   - Pod销毁后metrics仍保留在Prometheus TSDB
+   - Worker Pod常驻运行，metrics持续暴露
 
 3. **告警规则**
    ```yaml
@@ -1831,6 +1679,12 @@ Job Pod            Prometheus        PodMonitor        Grafana        Alertmanag
      for: 10m
      annotations:
        summary: "Task {{ $labels.task }} failure rate > 50%"
+
+   - alert: WorkerPodDown
+     expr: up{job="datafusion-worker"} == 0
+     for: 1m
+     annotations:
+       summary: "Worker Pod {{ $labels.pod }} is down"
    ```
 
 ---
@@ -1839,158 +1693,119 @@ Job Pod            Prometheus        PodMonitor        Grafana        Alertmanag
 
 **场景描述:**
 
-Job Pod的stdout/stderr日志由K8S自动收集，Fluent Bit/Fluentd采集后发送到Elasticsearch，Kibana提供日志查询和分析；同时K8S Event API记录CR和Pod的关键事件，方便故障排查。
+Worker Deployment Pod的stdout/stderr日志由K8S自动收集，Fluent Bit DaemonSet采集后发送到Elasticsearch，Kibana提供日志查询和分析；同时K8S Event API记录CR和Operator操作的关键事件，方便故障排查。
 
-**时序图描述:**
+**时序图:**
 
-```
-Job Pod          K8S API Server      Fluent Bit       Elasticsearch      Kibana       Operator Controller
-  |                    |                  |                  |               |                  |
-  |--log to stdout---->|                  |                  |               |                  |
-  | "Fetched 1523..."  |                  |                  |               |                  |
-  |                    |                  |                  |               |                  |
-  |                    |<--Read logs------|                  |               |                  |
-  |                    | (from /var/log)  |                  |               |                  |
-  |                    |                  |                  |               |                  |
-  |                    |--Forward logs--->|                  |               |                  |
-  |                    |                  |                  |               |                  |
-  |                    |                  |--Index logs----->|               |                  |
-  |                    |                  | (with metadata)  |               |                  |
-  |                    |                  |                  |               |                  |
-  |                    |                  |                  |<--Search------|                  |
-  |                    |                  |                  |  "task=xxx"  |                  |
-  |                    |                  |                  |               |                  |
-  |                    |                  |                  |--Results---->|                  |
-  |                    |                  |                  |               |                  |
-  |  (重要事件)          |                  |                  |               |                  |
-  |                    |                  |                  |               |                  |--Create Event
-  |                    |<--POST /api/v1/events---------------------------------------------|
-  |                    | type=Normal      |                  |               |                  |
-  |                    | reason=CronJobCreated               |               |                  |
-  |                    | message="CronJob product-scraper-cronjob created"  |                  |
-  |                    |                  |                  |               |                  |
-  | (查看事件)          |                  |                  |               |                  |
-  |--kubectl get events>                  |                  |               |                  |
-  |<--Event list-------|                  |                  |               |                  |
-```
+![日志聚合与事件追踪流程](diagrams/seq_logging_events_deployment.png)
 
 **关键技术点:**
 
 1. **日志自动收集**
-   - K8S将容器stdout/stderr重定向到节点文件系统
+   - K8S将容器stdout/stderr重定向到节点文件系统（`/var/log/containers/*.log`）
    - Fluent Bit DaemonSet采集所有节点日志
-   - 自动添加元数据（namespace、pod、container等）
+   - 自动添加K8s元数据（namespace、pod名称、labels等）
+   - 推送到Elasticsearch按日期索引（`datafusion-logs-{date}`）
 
 2. **结构化日志**
    ```json
    {
-     "timestamp": "2025-01-15T14:05:23Z",
+     "timestamp": "2025-12-02T10:30:00Z",
      "level": "info",
-     "task": "product-scraper",
-     "message": "Fetched 1523 records",
+     "message": "开始采集任务xxx",
+     "task_id": "task-123",
+     "worker_pod": "rpa-collector-abc",
+     "records_fetched": 1234,
+     "duration": "45s",
      "kubernetes": {
        "namespace": "datafusion",
-       "pod": "product-scraper-cronjob-28434520-abcd1",
-       "container": "worker"
+       "pod": "rpa-collector-deployment-abc",
+       "container": "worker",
+       "labels": {
+         "app": "rpa-collector",
+         "version": "v2.0"
+       }
      }
    }
    ```
 
 3. **事件记录**
    ```bash
-   $ kubectl get events -n datafusion
-   LAST SEEN   TYPE     REASON            OBJECT                          MESSAGE
-   2m          Normal   CronJobCreated    collectiontask/product-scraper  CronJob created
-   1m          Normal   Scheduled         pod/...                         Successfully assigned
-   30s         Normal   Pulled            pod/...                         Container image pulled
-   25s         Normal   Created           pod/...                         Created container
-   20s         Normal   Started           pod/...                         Started container
+   $ kubectl get events -n datafusion --field-selector involvedObject.name=product-scraper
+   LAST SEEN   TYPE     REASON                OBJECT                          MESSAGE
+   2m          Normal   ConfigSyncSuccess     collectiontask/product-scraper  CR配置已同步到PostgreSQL
+   1m          Normal   TaskExecutionStart    collectiontask/product-scraper  Worker开始执行任务
+   30s         Normal   TaskExecutionSuccess  collectiontask/product-scraper  执行成功,采集1234条记录
    ```
+
+4. **日志查询功能**
+   - Kibana按task_id过滤日志
+   - 按时间范围查询（最近1小时、24小时等）
+   - 按日志级别过滤（error/warn/info）
+   - 全文搜索关键词
+   - 日志保留30天（Elasticsearch ILM策略）
 
 ---
 
 ### 3.1.4. 故障处理场景
 
-##### 3.1.4.1. Job失败自动重试流程
+##### 3.1.4.1. 任务失败自动重试流程
 
 **场景描述:**
 
-Job Pod执行失败（退出码非0），K8S Job Controller根据backoffLimit自动重启Pod，最多重试6次（可配置），重试间隔指数退避（10s, 20s, 40s...），全部失败后Job状态变为Failed，Operator Controller更新CR Status。
+Worker执行失败后，在PostgreSQL的`task_executions`表中记录失败状态和重试计数，根据重试策略计算下次重试时间（指数退避），更新`next_run_time`字段，Worker下次轮询时自动获取重试任务，最多重试6次（可配置），全部失败后Operator从PostgreSQL同步失败状态到CR.Status并触发告警。
 
-**时序图描述:**
+**时序图:**
 
-```
-Job Controller      Scheduler       Worker Node      Job Pod         Operator Controller
-      |                  |               |               |                    |
-      |--Create Pod----->|               |               |                    |
-      |  (attempt 1)     |               |               |                    |
-      |                  |--Schedule---->|               |                    |
-      |                  |               |--Start Pod--->|                    |
-      |                  |               |               |                    |
-      |                  |               |               |--Execute task      |
-      |                  |               |               |  (network error)   |
-      |                  |               |               |                    |
-      |                  |               |               |--Exit 1            |
-      |                  |               |               | (failure)          |
-      |                  |               |               |                    |
-      |<--Pod Failed----------------------|               |                    |
-      |                  |               |               |                    |
-      | (wait 10s backoff)               |               |                    |
-      |                  |               |               |                    |
-      |--Create Pod----->|               |               |                    |
-      |  (attempt 2)     |               |               |                    |
-      |                  |--Schedule---->|               |                    |
-      |                  |               |--Start Pod--->|                    |
-      |                  |               |               |--Retry task        |
-      |                  |               |               |  (still failing)   |
-      |                  |               |               |--Exit 1            |
-      |                  |               |               |                    |
-      |<--Pod Failed----------------------|               |                    |
-      |                  |               |               |                    |
-      | (重复最多backoffLimit次)          |               |                    |
-      |                  |               |               |                    |
-      | (all retries exhausted)          |               |                    |
-      |--Job Failed      |               |               |                    |
-      |  (status.failed=1)               |               |                    |
-      |                  |               |               |                    |
-      |                  |               |               |                    |   (watch Job)
-      |                  |               |               |                    |<--Detect Failed
-      |                  |               |               |                    |
-      |                  |               |               |                    |--Update CR Status
-      |                  |               |               |                    |  lastFailureTime
-      |                  |               |               |                    |  errorMessage
-      |                  |               |               |                    |
-      |                  |               |               |                    |--Send Alert
-      |                  |               |               |                    | (if configured)
-```
+![任务失败自动重试流程](diagrams/seq_retry_failure_deployment.png)
 
 **关键技术点:**
 
-1. **自动重试配置**
+1. **重试策略配置**
    ```yaml
    spec:
      retry:
-       backoffLimit: 6        # 最多重试6次
-       restartPolicy: OnFailure  # 失败时重启
+       maxRetries: 6           # 最多重试6次
+       baseDelaySeconds: 300   # 基础延迟5分钟
+       maxDelaySeconds: 3600   # 最大延迟1小时
+       backoffType: exponential # 指数退避
    ```
 
-2. **指数退避**
-   - 第1次失败: 等待10秒
-   - 第2次失败: 等待20秒
-   - 第3次失败: 等待40秒
-   - ...
-   - 最多等待6分钟
+2. **指数退避算法**
+   - 第1次失败: 等待300秒（5分钟）
+   - 第2次失败: 等待600秒（10分钟）
+   - 第3次失败: 等待1200秒（20分钟）
+   - 第4次失败: 等待2400秒（40分钟）
+   - 第5次失败: 等待3600秒（1小时，达到max_delay）
+   - 第6次失败: 等待3600秒（1小时）
+   - 算法: `delay = min(base_delay * 2^retry_count, max_delay)`
 
-3. **失败原因分类**
-   - 退出码1: 采集失败（网络错误、目标不可达）
-   - 退出码2: 处理失败（解析错误、验证失败）
-   - 退出码3: 存储失败（数据库连接失败）
-   - OOMKilled: 内存不足
+3. **重试实现机制**
+   - Worker侧实现重试逻辑，无需K8S Job Controller
+   - 失败后更新`task_executions`表: `status='failed'`, `retry_count++`
+   - 更新`collection_tasks`表: `next_run_time = NOW() + INTERVAL delay`
+   - Worker下次轮询时自动获取重试任务（`WHERE next_run_time <= NOW()`）
+   - 无需额外的重试队列，利用PostgreSQL行级锁
 
-4. **状态同步**
-   - Operator Controller更新CR Status
-   - 记录lastFailureTime和errorMessage
-   - 触发告警通知（如果配置）
+4. **失败记录**
+   - PostgreSQL的`task_executions`表记录每次执行
+   - 包含字段: `retry_count`, `error_message`, `failed_at`, `duration`
+   - Operator定时从PostgreSQL同步失败状态到CR.Status（`syncDBToStatus()`）
+   - CR.Status包含: `lastFailureTime`, `errorMessage`, `retryCount`
+
+5. **告警触发**
+   - 达到`max_retries`后，更新`task_executions.status='final_failed'`
+   - 更新`collection_tasks.status='failed'`, `next_run_time=NULL`（停止调度）
+   - Operator检测到`final_failed`，触发Critical告警
+   - 告警内容: 任务名称、失败原因、重试次数、最后成功时间
+   - 需要人工干预修复（用户通过CR重置重试计数: `spec.resetRetry=true`）
+
+6. **失败原因分类**
+   - 网络错误: `Connection timeout`, `Connection refused`
+   - 数据源错误: `Target not found`, `Authentication failed`
+   - 解析错误: `Parse error`, `Invalid data format`
+   - 存储错误: `Database connection failed`, `Insert failed`
+   - 资源错误: `Browser pool exhausted`, `Memory limit exceeded`
 
 ---
 
@@ -2633,10 +2448,11 @@ func (r *CollectionTaskReconciler) syncDBToStatus(ctx context.Context, task *dat
         errorMessage        *string
     )
     err = db.QueryRowContext(ctx, `
-        SELECT start_time, status, error_message
-        FROM task_executions
-        WHERE cr_uid = $1
-        ORDER BY start_time DESC
+        SELECT te.start_time, te.status, te.error_message
+        FROM task_executions te
+        INNER JOIN collection_tasks ct ON te.task_id = ct.id
+        WHERE ct.cr_uid = $1
+        ORDER BY te.start_time DESC
         LIMIT 1
     `, string(task.UID)).Scan(&lastExecutionTime, &lastExecutionStatus, &errorMessage)
 
@@ -2782,7 +2598,7 @@ func (r *CollectionTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 2. **幂等性**: 多次调用Reconcile应产生相同结果，支持失败重试
 3. **错误处理**: 返回错误会触发指数退避重试，返回RequeueAfter可定期重新协调
 4. **Owner Reference**: 设置OwnerReference实现级联删除，父资源删除时自动清理子资源
-5. **Finalizer机制**: 在删除CR前执行清理逻辑（删除CronJob、ConfigMap等）
+5. **Finalizer机制**: 在删除CR前执行清理逻辑（清理PostgreSQL配置记录等）
 
 ##### 3.2.1.3. Status Conditions与Phase管理
 
@@ -2847,10 +2663,10 @@ task.Status.ObservedGeneration = task.Generation
 
 // 3. 每个Condition应包含详细的Reason和Message
 condition := metav1.Condition{
-    Type:    "CronJobReady",
+    Type:    "ConfigSynced",
     Status:  metav1.ConditionTrue,
-    Reason:  "CronJobCreated",
-    Message: fmt.Sprintf("CronJob %s created successfully", cronJobName),
+    Reason:  "PostgreSQLSyncSuccess",
+    Message: fmt.Sprintf("Task configuration synced to PostgreSQL, task_id: %s", taskID),
     LastTransitionTime: metav1.Now(),
 }
 
@@ -3230,9 +3046,13 @@ Controller负责创建和管理多种K8S资源，确保声明式管理。
 
 ```
 CollectionTask CR
-    ├── ConfigMap (任务配置)
-    ├── CronJob (定时任务) 或 Job (一次性任务)
-    │   └── Pod (Worker容器)
+    ├── PostgreSQL Control Center (任务配置同步)
+    │   ├── collection_tasks表 (任务配置)
+    │   ├── task_executions表 (执行记录)
+    │   └── task_locks表 (分布式锁)
+    ├── Worker Deployment (常驻Pod，非CR直接创建)
+    │   ├── Worker Pod (数据采集容器)
+    │   └── 浏览器池/连接池 (资源复用)
     └── Secret (存储凭证，由用户预先创建)
 ```
 
@@ -3244,7 +3064,7 @@ CollectionTask CR
        return err
    }
    ```
-   - 删除CollectionTask时，K8S自动级联删除ConfigMap、CronJob等子资源
+   - 删除CollectionTask时，通过Finalizer清理PostgreSQL中的配置记录
    - `kubectl get events`可追踪资源创建/删除事件
 
 2. **Finalizer机制**: 在删除CR前执行清理逻辑
@@ -3261,16 +3081,17 @@ CollectionTask CR
    }
    ```
 
-3. **ConfigMap管理**:
-   - 将任务配置（collector config、parsing rules等）序列化为JSON存入ConfigMap
-   - Worker Pod通过EnvFrom引用ConfigMap
-   - 配置更新时重新创建ConfigMap，触发CronJob更新
+3. **PostgreSQL Control Center管理**:
+   - **配置同步**: Operator通过`syncCRToDB()`函数将CollectionTask CR的配置同步到PostgreSQL的`collection_tasks`表
+   - **任务轮询**: Worker Deployment Pod定时轮询`collection_tasks`表（每30秒），使用`FOR UPDATE SKIP LOCKED`分布式锁获取待执行任务
+   - **状态同步**: Operator通过`syncDBToStatus()`函数（每1分钟）将`task_executions`表的执行状态同步回CR.Status
+   - **架构优势**: 消除临时Pod启动开销，浏览器池/连接池复用，高频任务性能提升60-72%
 
-4. **Job/CronJob管理**:
-   - 定时任务: 创建CronJob，由K8S CronJob Controller负责按schedule创建Job
-   - 一次性任务: 直接创建Job
-   - 设置`backoffLimit`、`activeDeadlineSeconds`等参数控制重试和超时
-   - 通过Label Selector关联Job和CollectionTask
+4. **Worker Deployment管理**:
+   - Worker Deployment独立于CollectionTask CR，采用全局共享模式
+   - 通过HPA（Horizontal Pod Autoscaler）根据任务队列长度自动扩缩容
+   - Worker Pod通过轮询PostgreSQL获取任务，无需K8S Job Controller
+   - 失败重试通过Worker内部逻辑实现，更新`next_run_time`字段调度重试
 
 5. **Secret管理**:
    - 存储凭证的Secret由用户或外部系统（如Vault Operator）创建
@@ -3473,9 +3294,9 @@ Operator Controller作为控制平面核心，与其他模块的集成通过K8S�
 
 **与Worker模块集成:**
 
-1. **任务分发**: 不需要消息队列，Controller创建Job/CronJob，K8S Scheduler负责调度Worker Pod
-2. **配置传递**: Worker Pod通过EnvFrom引用ConfigMap和Secret获取配置
-3. **状态回报**: Worker执行完成后，Job状态自动更新，Controller通过watch Job状态同步到CollectionTask.status
+1. **任务分发**: Controller通过`syncCRToDB()`将任务配置同步到PostgreSQL，Worker Pod轮询获取任务（每30秒）
+2. **配置传递**: Worker通过PostgreSQL的`collection_tasks`表获取任务配置，凭证通过K8S Secret挂载
+3. **状态回报**: Worker执行完成后更新`task_executions`表，Controller通过`syncDBToStatus()`（每1分钟）同步到CR.Status
 
 **与存储模块集成:**
 
@@ -3488,8 +3309,8 @@ Operator Controller作为控制平面核心，与其他模块的集成通过K8S�
 1. **Metrics暴露**: Operator Manager暴露`/metrics`端点，Prometheus通过ServiceMonitor抓取
 2. **事件记录**: Controller使用K8S Event API记录关键事件
    ```go
-   r.Recorder.Event(task, corev1.EventTypeNormal, "CronJobCreated",
-       fmt.Sprintf("Created CronJob %s", cronJobName))
+   r.Recorder.Event(task, corev1.EventTypeNormal, "ConfigSyncSuccess",
+       fmt.Sprintf("Task configuration synced to PostgreSQL, task_id: %s", taskID))
    ```
 3. **日志集成**: 使用structured logging，日志由集群日志收集系统（如Fluent Bit）统一采集
 
@@ -3539,22 +3360,20 @@ K8S API Server: CR写入etcd
 Controller (via watch): 接收到Create事件
     ↓
 Reconcile循环:
-    1. 创建ConfigMap (product-scraper-config)
-    2. 创建CronJob (product-scraper-cronjob)
-    3. 更新Status (Phase=Active, Conditions=[...])
+    1. 调用syncCRToDB()同步配置到PostgreSQL collection_tasks表
+    2. 计算next_run_time（基于cron表达式）
+    3. 更新Status (Phase=Active, Conditions=[ConfigSynced])
     ↓
-K8S CronJob Controller: 按schedule触发，创建Job
+Worker Pod (常驻轮询): 每30秒查询collection_tasks表
     ↓
-K8S Scheduler: 调度Job Pod到Worker Node
+Worker Pod: 使用FOR UPDATE SKIP LOCKED获取待执行任务
     ↓
-Worker Pod: 启动执行数据采集
+Worker Pod: 执行数据采集，更新task_executions表
     ↓
-Worker Pod: 采集完成，Job状态变为Completed
-    ↓
-Controller (via watch Job): 检测到Job完成
+Controller (定期执行): syncDBToStatus()每1分钟同步状态
     ↓
 Reconcile循环:
-    更新CollectionTask.status.lastExecutionSummary
+    更新CollectionTask.status.lastExecutionTime和lastExecutionStatus
     ↓
 Prometheus: 抓取Operator metrics
     ↓
@@ -3563,14 +3382,14 @@ Grafana: 展示任务执行统计
 
 **模块间通信对比:**
 
-| 传统架构 | Operator架构 |
-|---------|-------------|
-| RabbitMQ消息队列 | K8S list-watch机制 |
-| Master通过MQ推送任务 | Controller创建Job，Scheduler调度 |
-| Worker从MQ拉取任务 | Worker Pod接收EnvFrom配置 |
-| Redis存储状态 | CR.status存储状态（etcd） |
-| PostgreSQL存储配置 | CR.spec存储配置（etcd） |
-| 轮询数据库获取状态 | Watch Job状态自动更新 |
+| 传统架构 | Operator架构(v2.0) |
+|---------|------------------|
+| RabbitMQ消息队列 | PostgreSQL Control Center + K8S list-watch |
+| Master通过MQ推送任务 | Controller同步配置到PostgreSQL，Worker轮询获取 |
+| Worker从MQ拉取任务 | Worker轮询PostgreSQL（FOR UPDATE SKIP LOCKED） |
+| Redis存储状态 | PostgreSQL存储状态 + CR.status同步（etcd） |
+| PostgreSQL存储配置 | PostgreSQL存储配置 + CR.spec声明（etcd） |
+| 轮询数据库获取状态 | syncDBToStatus()定期同步（每1分钟） |
 
 **架构优势总结:**
 
@@ -3743,7 +3562,7 @@ func main() {
 
 **实现原理:**
 
-使用Playwright Headless浏览器引擎，在Job Pod中启动临时浏览器实例，执行页面采集后自动清理。
+使用Playwright Headless浏览器引擎，Worker Pod从预初始化的浏览器池中获取浏览器实例，执行页面采集后归还到池中复用。
 
 **关键技术点:**
 
@@ -5557,7 +5376,7 @@ type CollectionTaskSpec struct {
     // +kubebuilder:validation:Required
     Storage StorageConfig `json:"storage"`
 
-    // JobTemplate Job Pod模板配置
+    // JobTemplate Worker Pod资源配置(v2.0架构中由Deployment管理)
     // +optional
     JobTemplate *JobTemplateSpec `json:"jobTemplate,omitempty"`
 }
@@ -5684,7 +5503,7 @@ type SecretReference struct {
     Namespace string `json:"namespace,omitempty"`
 }
 
-// JobTemplateSpec Job Pod模板配置
+// JobTemplateSpec Worker Pod资源配置(v2.0架构中由Deployment管理)
 type JobTemplateSpec struct {
     // Image Worker镜像（默认使用系统配置）
     // +optional
@@ -5974,33 +5793,9 @@ func (r *CollectionTaskReconciler) Reconcile(ctx context.Context, req ctrl.Reque
         return r.handleSuspended(ctx, task)
     }
 
-    // 4. 创建或更新ConfigMap（包含任务配置）
-    configMap, err := r.reconcileConfigMap(ctx, task)
-    if err != nil {
-        logger.Error(err, "failed to reconcile ConfigMap")
-        return ctrl.Result{}, err
-    }
-
-    // 5. 根据Schedule决定创建CronJob还是Job
-    if task.Spec.Schedule != "" {
-        // 创建或更新CronJob（定时任务）
-        if err := r.reconcileCronJob(ctx, task, configMap); err != nil {
-            logger.Error(err, "failed to reconcile CronJob")
-            return ctrl.Result{}, err
-        }
-    } else {
-        // 创建一次性Job（手动触发）
-        if err := r.reconcileJob(ctx, task, configMap); err != nil {
-            logger.Error(err, "failed to reconcile Job")
-            return ctrl.Result{}, err
-        }
-    }
-
-    // 6. 同步Job状态到CollectionTask Status
-    if err := r.syncJobStatus(ctx, task); err != nil {
-        logger.Error(err, "failed to sync Job status")
-        return ctrl.Result{}, err
-    }
+    // 注: v2.0架构不再创建CronJob/Job资源
+    // Worker通过轮询PostgreSQL Control Center获取任务配置
+    // 详见Section 3.2.7 Deployment常驻Worker架构
 
     // 7. 更新CollectionTask Status
     if err := r.updateStatus(ctx, task); err != nil {
@@ -6705,7 +6500,7 @@ PostgreSQL是DataFusion系统的业务数据存储引擎，相比其他主流数
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     应用层 (Operator + Job Pods)         │
+│                 应用层 (Operator + Worker Pods)         │
 └────────────┬────────────────────────────┬────────────────┘
              │                            │
              │ 写请求                      │ 读请求
@@ -6913,10 +6708,10 @@ datasources (1) ──< (N) task_execution_logs # 数据源被任务引用
 
 2. **任务执行流程**：
    ```
-   用户 → kubectl apply CollectionTask CR → Controller创建CronJob
-   → CronJob触发Job Pod → Job Pod读取datasource配置
-   → 执行采集 → 写入采集的业务数据 → 写入task_execution_logs
-   → 更新CollectionTask Status
+   用户 → kubectl apply CollectionTask CR → Controller同步配置到PostgreSQL
+   → Worker Pod轮询collection_tasks表 → Worker读取datasource配置
+   → 执行采集 → 写入采集的业务数据 → 写入task_executions表
+   → Controller同步状态到CR.Status
    ```
 
 3. **历史数据归档流程**：
@@ -7102,7 +6897,7 @@ CREATE TABLE task_execution_logs (
     id BIGSERIAL,
     task_id VARCHAR(100) NOT NULL,  -- CollectionTask CR的metadata.name
     task_namespace VARCHAR(100) NOT NULL DEFAULT 'datafusion',
-    instance_id VARCHAR(150) NOT NULL,  -- Job Pod的名称
+    instance_id VARCHAR(150) NOT NULL,  -- Worker Pod的名称
     level VARCHAR(10) NOT NULL,  -- 'DEBUG', 'INFO', 'WARN', 'ERROR'
     message TEXT NOT NULL,
     context JSONB,  -- 日志上下文（如HTTP请求信息、错误堆栈）
@@ -8701,7 +8496,7 @@ git push
 # 2. ArgoCD/Flux自动同步到集群
 # (自动执行 kubectl apply -f tasks/product-scraper.yaml)
 
-# 3. Operator Controller自动创建CronJob
+# 3. Operator Controller自动同步配置到PostgreSQL
 
 # 4. 查看同步状态
 kubectl get collectiontask product-scraper -n datafusion
