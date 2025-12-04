@@ -515,7 +515,215 @@ func (r *CollectionTaskReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 ```
 
-**4. 实施路线图**
+**4. Worker Pod部署模式**
+
+**采用共享Worker Pool模式:**
+
+DataFusion采用**共享Worker Pool**模式部署Worker Pod，所有CollectionTask共享同一组Worker Pod资源池，以提高资源利用率和降低运维复杂度。
+
+**架构设计:**
+
+1. **Worker Pool部署**
+   - 在`datafusion`命名空间部署3种类型的Worker Deployment:
+     * `rpa-collector-worker`: 专门处理Web RPA采集任务
+     * `api-collector-worker`: 专门处理API采集任务
+     * `db-collector-worker`: 专门处理数据库采集任务
+   - 每种Worker Deployment初始副本数为1，可根据负载自动扩缩容(HPA)
+
+2. **CollectionTask的`collector.replicas`字段含义**
+   - `collector.replicas`表示该任务的**pod并发数总数**，而非某一类任务的pod数量
+   - 例如: `replicas: 5`表示该任务最多可以有5个Worker Pod同时执行
+   - Worker Pool中的Pod通过PostgreSQL分布式锁机制争抢任务执行权
+   - 所有任务的并发执行总数不会超过`collector.replicas`设置的值，最小值是1
+
+3. **资源隔离与限制**
+   - 通过PostgreSQL的`task_executions`表记录每个任务当前的执行实例数
+   - Worker在争抢任务前，检查该任务的当前执行数是否已达到`collector.replicas`上限
+   - 如果已达上限，Worker跳过该任务，处理其他任务
+
+4. **Worker Deployment配置示例**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rpa-collector-worker
+  namespace: datafusion
+spec:
+  replicas: 3  # 初始副本数，可通过HPA自动调整
+  selector:
+    matchLabels:
+      app: datafusion-worker
+      type: rpa-collector
+  template:
+    metadata:
+      labels:
+        app: datafusion-worker
+        type: rpa-collector
+    spec:
+      containers:
+      - name: worker
+        image: datafusion-worker:v1.0.0
+        env:
+        - name: WORKER_TYPE
+          value: "rpa-collector"
+        - name: POLL_INTERVAL
+          value: "30s"
+        - name: DB_HOST
+          value: "postgresql.datafusion.svc.cluster.local"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "1"
+          limits:
+            memory: "2Gi"
+            cpu: "2"
+```
+
+5. **优势分析**
+
+| 维度 | 共享Worker Pool | 独立Worker (每任务一个Deployment) |
+|------|----------------|--------------------------------|
+| 资源利用率 | ✅ 高 (70-85%) | ❌ 低 (30-50%) |
+| 运维复杂度 | ✅ 低 (管理3个Deployment) | ❌ 高 (管理N个Deployment) |
+| 启动开销 | ✅ 无 (Pod常驻) | ❌ 高 (每次创建/销毁Pod) |
+| 任务隔离性 | ⚠️ 中等 (逻辑隔离) | ✅ 高 (物理隔离) |
+| 适用场景 | ✅ 大量小任务 | ⚠️ 少量大任务 |
+
+**结论**: 对于DataFusion的使用场景(大量周期性采集任务)，共享Worker Pool模式更加合适。
+
+**5. 任务调度机制详解**
+
+**核心原则**: Worker Pod自主轮询 + 分布式锁争抢
+
+**调度流程:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     任务调度完整流程                          │
+└─────────────────────────────────────────────────────────────┘
+
+1. Operator Controller职责:
+   ┌──────────────────────────────────────────────────────┐
+   │ CollectionTask CR (Cron: "0 2 * * *")                │
+   │         ↓                                             │
+   │ Operator监听CR变化 (list-watch)                       │
+   │         ↓                                             │
+   │ syncCRToDB(): 同步配置到PostgreSQL                    │
+   │   - 表: collection_tasks                             │
+   │   - 字段: id, name, cron, next_run_time, status...   │
+   │         ↓                                             │
+   │ 计算next_run_time (基于Cron表达式)                    │
+   │   - 使用robfig/cron库解析Cron                         │
+   │   - 更新next_run_time字段                            │
+   └──────────────────────────────────────────────────────┘
+
+2. Worker Pod职责:
+   ┌──────────────────────────────────────────────────────┐
+   │ Worker Pod启动 (常驻运行)                             │
+   │         ↓                                             │
+   │ 定时轮询 (每30秒)                                      │
+   │         ↓                                             │
+   │ 查询PostgreSQL: SELECT * FROM collection_tasks       │
+   │   WHERE next_run_time <= NOW()                       │
+   │     AND status = 'enabled'                           │
+   │     AND (SELECT COUNT(*) FROM task_executions        │
+   │          WHERE task_id = collection_tasks.id         │
+   │            AND status = 'running') < replicas        │
+   │         ↓                                             │
+   │ 争抢分布式锁 (PostgreSQL Advisory Lock)               │
+   │   - SELECT pg_try_advisory_lock(task_id)             │
+   │   - 成功: 获得执行权                                  │
+   │   - 失败: 跳过，处理下一个任务                         │
+   │         ↓                                             │
+   │ 执行任务:                                             │
+   │   1. INSERT INTO task_executions (status='running')  │
+   │   2. 执行数据采集                                     │
+   │   3. UPDATE task_executions (status='success/failed')│
+   │   4. 释放锁: SELECT pg_advisory_unlock(task_id)       │
+   │         ↓                                             │
+   │ 计算下次执行时间:                                      │
+   │   - UPDATE collection_tasks                          │
+   │     SET next_run_time = <下次执行时间>                │
+   │     WHERE id = <task_id>                             │
+   └──────────────────────────────────────────────────────┘
+
+3. Operator状态同步:
+   ┌──────────────────────────────────────────────────────┐
+   │ 定时同步 (每1分钟)                                     │
+   │         ↓                                             │
+   │ syncDBToStatus(): 从PostgreSQL读取执行状态            │
+   │         ↓                                             │
+   │ 更新CollectionTask CR的status字段                     │
+   │   - phase: Running/Succeeded/Failed                  │
+   │   - lastScheduleTime                                 │
+   │   - statistics                                       │
+   └──────────────────────────────────────────────────────┘
+```
+
+**关键设计点:**
+
+1. **Cron表达式解析**
+   - Operator Controller负责解析Cron表达式
+   - 使用`github.com/robfig/cron/v3`库
+   - 计算`next_run_time`并写入PostgreSQL
+
+2. **Worker轮询策略**
+   - 轮询间隔: 30秒 (可配置)
+   - 每次轮询查询所有到期任务
+   - 通过SQL条件过滤已达并发上限的任务
+
+3. **分布式锁机制**
+   - 使用PostgreSQL Advisory Lock
+   - 锁ID: 任务ID的哈希值
+   - 锁超时: 任务执行超时后自动释放
+
+4. **并发控制**
+   - 通过`task_executions`表记录当前执行实例
+   - Worker在争抢锁前检查并发数
+   - 保证单个任务的并发数不超过`collector.replicas`
+
+5. **容错机制**
+   - Worker异常退出: 锁自动释放，其他Worker可接管
+   - 任务执行超时: 通过`execution_timeout`字段控制
+   - 失败重试: 通过`retry_count`和`max_retries`字段控制
+
+**数据库表结构:**
+
+```sql
+-- 任务配置表
+CREATE TABLE collection_tasks (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    cron VARCHAR(100),
+    next_run_time TIMESTAMP,
+    status VARCHAR(50) DEFAULT 'enabled',
+    replicas INT DEFAULT 1,
+    execution_timeout INT DEFAULT 3600,
+    max_retries INT DEFAULT 3,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 任务执行记录表
+CREATE TABLE task_executions (
+    id BIGSERIAL PRIMARY KEY,
+    task_id BIGINT REFERENCES collection_tasks(id),
+    worker_pod VARCHAR(255),
+    status VARCHAR(50), -- running, success, failed
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    records_collected INT,
+    error_message TEXT,
+    retry_count INT DEFAULT 0
+);
+
+-- 索引
+CREATE INDEX idx_next_run_time ON collection_tasks(next_run_time);
+CREATE INDEX idx_task_executions_status ON task_executions(task_id, status);
+```
+
+**6. 实施路线图**
 
 ```
 Phase 1: 基础框架搭建 (1周)
@@ -581,7 +789,7 @@ Phase 4: 测试和优化 (2-3周)
 | **HTTP客户端** | resty (Go) | 高性能的Go HTTP客户端库，支持丰富的认证方式（API Key、OAuth2.0、Basic Auth）、请求/响应中间件、超时控制等，是实现API采集的理想选择。 |
 | **JSONPath解析** | gjson (Go) | 高性能的Go JSON解析库，支持复杂的JSONPath表达式，用于从API响应中提取目标数据。 |
 | **清洗规则引擎** | expr (Go) | 快速、安全的表达式引擎，支持自定义函数和变量，用于实现灵活的数据清洗规则DSL。 |
-| **数据库** | PostgreSQL, MongoDB | **PostgreSQL** 用于存储任务配置、调度信息、用户信息、清洗规则、字段映射等结构化数据。**MongoDB** 作为可选的数据存储目标，适合存储非结构化的采集结果。 |
+| **数据库** | PostgreSQL, MongoDB | **PostgreSQL** 作为系统的核心数据库，采用**单实例多Database**模式：<br>- `datafusion_control`: 存储系统元数据(任务配置、用户信息、清洗规则等)<br>- `datafusion_data_*`: 存储采集数据(用户可选，也可使用外部数据库)<br>**MongoDB** 作为可选的数据存储目标，适合存储非结构化的采集结果。 |
 | **任务调度** | PostgreSQL + Worker轮询 | Worker Pod轮询PostgreSQL任务配置表，通过分布式锁争抢任务执行权，无需消息队列中间件。详见[2.3.1节部署方式说明](#231-部署方式说明)。 |
 | **服务发现**| K8S Service/DNS | K8S内置服务发现机制，通过Service和DNS实现Pod间通信和负载均衡。 |
 | **配置管理** | ConfigMap/Secret | K8S原生配置管理，ConfigMap存储配置数据，Secret存储敏感凭证，支持热更新。 |
@@ -1348,6 +1556,96 @@ spec:
 *   根据CPU/内存使用率动态调整
 *   关注任务队列长度（PostgreSQL待执行任务数）和处理延迟
 *   Worker Pod资源利用率保持在70-80%最佳
+
+### 2.4 数据存储架构
+
+#### 2.4.1 PostgreSQL部署模式
+
+**采用单实例多Database模式:**
+
+DataFusion使用单个PostgreSQL实例，通过不同的Database实现逻辑隔离，平衡了运维复杂度和数据隔离性。
+
+**Database划分:**
+
+```
+PostgreSQL Instance (postgresql.datafusion.svc.cluster.local:5432)
+├── datafusion_control (系统元数据库)
+│   ├── users (用户表)
+│   ├── collection_tasks (任务配置表)
+│   ├── task_executions (任务执行记录表)
+│   ├── data_sources (数据源配置表)
+│   ├── cleaning_rules (清洗规则表)
+│   ├── field_mappings (字段映射表)
+│   └── audit_logs (审计日志表)
+│
+├── datafusion_data_default (默认采集数据库)
+│   ├── <用户创建的采集数据表>
+│   └── ...
+│
+└── datafusion_data_<custom> (用户自定义数据库，可选)
+    └── ...
+```
+
+**连接配置:**
+
+1. **Operator Controller连接**
+   - Database: `datafusion_control`
+   - 用途: 读写任务配置、同步CR状态
+
+2. **Worker Pod连接**
+   - Database: `datafusion_control` (读取任务配置)
+   - Database: `datafusion_data_*` (写入采集数据)
+
+3. **API Service连接**
+   - Database: `datafusion_control` (用户认证、任务管理)
+   - Database: `datafusion_data_*` (数据查询)
+
+**配置示例:**
+
+```yaml
+# ConfigMap: postgresql-config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgresql-config
+  namespace: datafusion
+data:
+  control-db-url: "postgresql://datafusion:password@postgresql:5432/datafusion_control"
+  data-db-url: "postgresql://datafusion:password@postgresql:5432/datafusion_data_default"
+```
+
+**优势分析:**
+
+| 维度 | 单实例多Database | 多实例 |
+|------|-----------------|--------|
+| 运维复杂度 | ✅ 低 (管理1个实例) | ❌ 高 (管理N个实例) |
+| 资源开销 | ✅ 低 | ❌ 高 |
+| 数据隔离性 | ⚠️ 中等 (Database级隔离) | ✅ 高 (实例级隔离) |
+| 备份恢复 | ✅ 简单 (统一备份) | ❌ 复杂 (分别备份) |
+| 扩展性 | ⚠️ 受单实例性能限制 | ✅ 可独立扩展 |
+
+**扩展方案:**
+
+当数据量增长到单实例瓶颈时，可采用以下扩展策略：
+1. **垂直扩展**: 增加PostgreSQL实例的CPU/内存资源
+2. **读写分离**: 配置PostgreSQL主从复制，读操作分流到从库
+3. **分库分表**: 将采集数据按任务ID或时间分片到多个Database
+4. **外部数据库**: 用户可配置将采集数据写入外部PostgreSQL/MongoDB实例
+
+**初始化脚本:**
+
+```sql
+-- 创建系统元数据库
+CREATE DATABASE datafusion_control;
+
+-- 创建默认采集数据库
+CREATE DATABASE datafusion_data_default;
+
+-- 创建用户并授权
+CREATE USER datafusion WITH PASSWORD 'your_password';
+GRANT ALL PRIVILEGES ON DATABASE datafusion_control TO datafusion;
+GRANT ALL PRIVILEGES ON DATABASE datafusion_data_default TO datafusion;
+```
 
 ## 3. 模块设计
 
@@ -7380,6 +7678,491 @@ FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
 *   `datafusion-cli health check`: 系统健康检查
 *   `datafusion-cli diagnose connectivity`: 诊断目标网站可访问性
 *   `datafusion-cli diagnose database`: 诊断数据库连接状态
+
+### 3.7 MCP协议服务模块
+
+#### 3.7.1 MCP服务架构
+
+**DataFusion MCP Server**提供标准的Model Context Protocol接口，使AI应用能够像访问本地数据源一样查询和订阅DataFusion中的采集数据。
+
+**架构设计:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MCP Server架构                            │
+└─────────────────────────────────────────────────────────────┘
+
+AI Application (MCP Client)
+        │
+        │ MCP Protocol (JSON-RPC over HTTP/WebSocket)
+        ↓
+┌──────────────────────────────────────────────────────────┐
+│  MCP Server (Go)                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  MCP Protocol Handler                               │  │
+│  │  - resources/list                                   │  │
+│  │  - resources/read                                   │  │
+│  │  - tools/list                                       │  │
+│  │  - tools/call                                       │  │
+│  └────────────────────────────────────────────────────┘  │
+│                      ↓                                    │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Resource Mapper                                    │  │
+│  │  - CollectionTask → MCP Resource                   │  │
+│  │  - DataSource → MCP Resource                       │  │
+│  └────────────────────────────────────────────────────┘  │
+│                      ↓                                    │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Query Engine                                       │  │
+│  │  - SQL Query Builder                                │  │
+│  │  - Filter/Pagination                                │  │
+│  └────────────────────────────────────────────────────┘  │
+│                      ↓                                    │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Subscription Manager                               │  │
+│  │  - WebSocket Connection Pool                        │  │
+│  │  - Event Dispatcher                                 │  │
+│  └────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+        │                           │
+        │ PostgreSQL Query          │ WebSocket Push
+        ↓                           ↓
+┌──────────────────┐        ┌──────────────────┐
+│  datafusion_     │        │  AI Application  │
+│  control DB      │        │  (Subscribed)    │
+└──────────────────┘        └──────────────────┘
+        │
+        │ PostgreSQL Query
+        ↓
+┌──────────────────┐
+│  datafusion_     │
+│  data_* DB       │
+└──────────────────┘
+```
+
+#### 3.7.2 资源发现实现
+
+**资源映射规则:**
+
+1. **CollectionTask → MCP Resource**
+   - Resource URI: `datafusion://tasks/{task_name}`
+   - Resource Type: `dataset`
+   - Metadata: 包含任务配置、数据schema、更新频率等
+
+2. **DataSource → MCP Resource**
+   - Resource URI: `datafusion://sources/{source_name}`
+   - Resource Type: `datasource`
+   - Metadata: 包含数据源类型、连接信息、字段定义等
+
+**实现代码框架:**
+
+```go
+// pkg/mcp/server.go
+type MCPServer struct {
+    db              *sql.DB
+    subscriptions   *SubscriptionManager
+    resourceMapper  *ResourceMapper
+}
+
+// 资源发现接口
+func (s *MCPServer) ListResources(ctx context.Context, req *mcp.ListResourcesRequest) (*mcp.ListResourcesResponse, error) {
+    // 1. 查询所有CollectionTask
+    tasks, err := s.queryCollectionTasks(ctx)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 2. 转换为MCP Resource
+    resources := make([]*mcp.Resource, 0, len(tasks))
+    for _, task := range tasks {
+        resource := s.resourceMapper.TaskToResource(task)
+        resources = append(resources, resource)
+    }
+    
+    return &mcp.ListResourcesResponse{
+        Resources: resources,
+    }, nil
+}
+
+// 资源映射器
+type ResourceMapper struct{}
+
+func (m *ResourceMapper) TaskToResource(task *CollectionTask) *mcp.Resource {
+    return &mcp.Resource{
+        URI:  fmt.Sprintf("datafusion://tasks/%s", task.Name),
+        Name: task.Name,
+        Type: "dataset",
+        Description: task.Description,
+        MimeType: "application/json",
+        Metadata: map[string]interface{}{
+            "update_frequency": task.Cron,
+            "last_updated":     task.LastSuccessTime,
+            "total_records":    task.TotalRecords,
+            "schema":           m.buildSchema(task),
+        },
+    }
+}
+
+func (m *ResourceMapper) buildSchema(task *CollectionTask) map[string]interface{} {
+    // 从field_mappings表查询字段定义
+    fields := []map[string]string{}
+    // ... 查询逻辑
+    return map[string]interface{}{
+        "fields": fields,
+    }
+}
+```
+
+#### 3.7.3 数据查询引擎
+
+**查询流程:**
+
+```
+MCP Query Request
+    ↓
+Parse Filters (field, operator, value)
+    ↓
+Build SQL Query
+    ↓
+Execute Query (datafusion_data_* DB)
+    ↓
+Format Response (JSON)
+    ↓
+Return to MCP Client
+```
+
+**实现代码框架:**
+
+```go
+// pkg/mcp/query_engine.go
+type QueryEngine struct {
+    db *sql.DB
+}
+
+// 数据查询接口
+func (s *MCPServer) ReadResource(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResponse, error) {
+    // 1. 解析Resource URI
+    taskName, err := s.parseResourceURI(req.URI)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 2. 查询任务配置
+    task, err := s.queryCollectionTask(ctx, taskName)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 3. 构建SQL查询
+    query := s.queryEngine.BuildQuery(task, req.Filters, req.Pagination)
+    
+    // 4. 执行查询
+    rows, err := s.db.QueryContext(ctx, query.SQL, query.Args...)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    
+    // 5. 格式化结果
+    data := s.formatRows(rows, task.Schema)
+    
+    return &mcp.ReadResourceResponse{
+        Contents: []mcp.ResourceContent{
+            {
+                URI:      req.URI,
+                MimeType: "application/json",
+                Text:     string(data),
+            },
+        },
+    }, nil
+}
+
+// SQL查询构建器
+func (e *QueryEngine) BuildQuery(task *CollectionTask, filters map[string]interface{}, pagination *Pagination) *Query {
+    sql := fmt.Sprintf("SELECT * FROM %s.%s", task.Database, task.Table)
+    args := []interface{}{}
+    
+    // 添加过滤条件
+    if len(filters) > 0 {
+        whereClauses := []string{}
+        for field, value := range filters {
+            whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", field))
+            args = append(args, value)
+        }
+        sql += " WHERE " + strings.Join(whereClauses, " AND ")
+    }
+    
+    // 添加分页
+    if pagination != nil {
+        sql += fmt.Sprintf(" LIMIT %d OFFSET %d", pagination.Limit, pagination.Offset)
+    }
+    
+    return &Query{SQL: sql, Args: args}
+}
+```
+
+#### 3.7.4 订阅管理和推送机制
+
+**订阅流程:**
+
+```
+MCP Subscribe Request
+    ↓
+Create Subscription Record
+    ↓
+Store in subscriptions table
+    ↓
+Return Subscription ID
+    ↓
+(When new data collected)
+    ↓
+Worker updates task_executions
+    ↓
+Trigger Event: data.created
+    ↓
+Subscription Manager checks subscriptions
+    ↓
+Filter by subscription conditions
+    ↓
+Push to WebSocket connections
+```
+
+**实现代码框架:**
+
+```go
+// pkg/mcp/subscription_manager.go
+type SubscriptionManager struct {
+    subscriptions sync.Map // map[string]*Subscription
+    wsConnections sync.Map // map[string]*websocket.Conn
+    db            *sql.DB
+}
+
+type Subscription struct {
+    ID         string
+    ResourceURI string
+    Filters    map[string]interface{}
+    CallbackURL string
+    WebSocketConn *websocket.Conn
+    CreatedAt  time.Time
+}
+
+// 订阅接口
+func (s *MCPServer) Subscribe(ctx context.Context, req *mcp.SubscribeRequest) (*mcp.SubscribeResponse, error) {
+    // 1. 创建订阅记录
+    sub := &Subscription{
+        ID:          uuid.New().String(),
+        ResourceURI: req.URI,
+        Filters:     req.Filters,
+        CallbackURL: req.CallbackURL,
+        CreatedAt:   time.Now(),
+    }
+    
+    // 2. 存储订阅
+    s.subscriptions.Store(sub.ID, sub)
+    
+    // 3. 持久化到数据库
+    err := s.saveSubscription(ctx, sub)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &mcp.SubscribeResponse{
+        SubscriptionID: sub.ID,
+        Status:         "active",
+    }, nil
+}
+
+// 事件推送
+func (sm *SubscriptionManager) OnDataCollected(ctx context.Context, taskName string, records []map[string]interface{}) {
+    // 1. 查询相关订阅
+    resourceURI := fmt.Sprintf("datafusion://tasks/%s", taskName)
+    subs := sm.findSubscriptionsByResource(resourceURI)
+    
+    // 2. 遍历订阅，推送数据
+    for _, sub := range subs {
+        // 过滤数据
+        filteredRecords := sm.filterRecords(records, sub.Filters)
+        if len(filteredRecords) == 0 {
+            continue
+        }
+        
+        // 推送
+        event := &mcp.Event{
+            SubscriptionID: sub.ID,
+            Type:           "data.created",
+            Data:           filteredRecords,
+            Timestamp:      time.Now(),
+        }
+        
+        if sub.WebSocketConn != nil {
+            // WebSocket推送
+            sm.pushViaWebSocket(sub.WebSocketConn, event)
+        } else if sub.CallbackURL != "" {
+            // HTTP Callback推送
+            sm.pushViaHTTP(sub.CallbackURL, event)
+        }
+    }
+}
+```
+
+**数据库表结构:**
+
+```sql
+-- MCP订阅表
+CREATE TABLE mcp_subscriptions (
+    id VARCHAR(36) PRIMARY KEY,
+    resource_uri VARCHAR(255) NOT NULL,
+    filters JSONB,
+    callback_url VARCHAR(500),
+    status VARCHAR(50) DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_mcp_subscriptions_resource ON mcp_subscriptions(resource_uri);
+```
+
+#### 3.7.5 MCP Server部署
+
+**Deployment配置:**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datafusion-mcp-server
+  namespace: datafusion
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: datafusion-mcp-server
+  template:
+    metadata:
+      labels:
+        app: datafusion-mcp-server
+    spec:
+      containers:
+      - name: mcp-server
+        image: datafusion-mcp-server:v1.0.0
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 8081
+          name: websocket
+        env:
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: postgresql-secret
+              key: control-db-url
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1"
+```
+
+**Service配置:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: datafusion-mcp-server
+  namespace: datafusion
+spec:
+  selector:
+    app: datafusion-mcp-server
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: websocket
+    port: 8081
+    targetPort: 8081
+  type: ClusterIP
+```
+
+#### 3.7.6 MCP客户端集成示例
+
+**Python客户端示例:**
+
+```python
+from mcp import Client
+
+# 创建MCP客户端
+client = Client("http://datafusion-mcp-server.datafusion.svc.cluster.local")
+
+# 1. 资源发现
+resources = client.list_resources()
+for resource in resources:
+    print(f"Resource: {resource.name}, URI: {resource.uri}")
+
+# 2. 数据查询
+data = client.read_resource(
+    uri="datafusion://tasks/medical-news",
+    filters={
+        "publish_time": {"gte": "2025-10-20"},
+        "title": {"contains": "新药研发"}
+    },
+    limit=10
+)
+print(f"查询到 {len(data)} 条记录")
+
+# 3. 数据订阅
+subscription = client.subscribe(
+    uri="datafusion://tasks/medical-news",
+    filters={"title": {"contains": "新药"}},
+    callback=lambda event: print(f"收到新数据: {event.data}")
+)
+print(f"订阅ID: {subscription.id}")
+
+# 4. 取消订阅
+client.unsubscribe(subscription.id)
+```
+
+**LangChain集成示例:**
+
+```python
+from langchain.tools import Tool
+from mcp import Client
+
+# 创建MCP客户端
+mcp_client = Client("http://datafusion-mcp-server")
+
+# 定义LangChain Tool
+def query_medical_news(query: str) -> str:
+    """查询医药行业资讯数据"""
+    data = mcp_client.read_resource(
+        uri="datafusion://tasks/medical-news",
+        filters={"title": {"contains": query}},
+        limit=5
+    )
+    return str(data)
+
+medical_news_tool = Tool(
+    name="QueryMedicalNews",
+    func=query_medical_news,
+    description="查询医药行业最新资讯，输入关键词返回相关文章"
+)
+
+# 在Agent中使用
+from langchain.agents import initialize_agent, AgentType
+from langchain.llms import OpenAI
+
+agent = initialize_agent(
+    tools=[medical_news_tool],
+    llm=OpenAI(temperature=0),
+    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True
+)
+
+response = agent.run("最近有哪些关于新药研发的新闻？")
+print(response)
+```
 
 ## 4. API 设计
 
