@@ -1,0 +1,36 @@
+# Worker 配置文件示例
+
+# Worker 类型: web-rpa, api, database
+worker_type: "web-rpa"
+
+# 轮询间隔（秒）
+poll_interval: 30s
+
+# 数据库配置（PostgreSQL Control Center）
+database:
+  host: "localhost"
+  port: 5432
+  user: "datafusion"
+  password: "datafusion123"
+  database: "datafusion_control"
+  ssl_mode: "disable"
+
+# 采集器配置
+collector:
+  rpa:
+    browser_type: "chromium"
+    headless: true
+    timeout: 30
+  api:
+    timeout: 30
+
+# 存储配置
+storage:
+  type: "postgresql"  # postgresql, file
+  database:
+    host: "localhost"
+    port: 5432
+    user: "datafusion"
+    password: "datafusion123"
+    database: "datafusion_data"
+    ssl_mode: "disable"

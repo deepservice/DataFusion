@@ -1,0 +1,58 @@
+---
+# Worker Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datafusion-worker
+  namespace: datafusion
+  labels:
+    app: datafusion-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: datafusion-worker
+  template:
+    metadata:
+      labels:
+        app: datafusion-worker
+    spec:
+      containers:
+      - name: worker
+        image: datafusion-worker:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+        - name: data
+          mountPath: /app/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "ps aux | grep worker | grep -v grep"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: config
+        configMap:
+          name: worker-config
+      - name: data
+        emptyDir: {}
