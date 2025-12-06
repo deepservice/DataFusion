@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/datafusion/worker/internal/config"
+	"github.com/datafusion/worker/internal/health"
+	"github.com/datafusion/worker/internal/metrics"
 	"github.com/datafusion/worker/internal/worker"
 )
 
@@ -30,6 +32,25 @@ func main() {
 		log.Fatalf("创建 Worker 失败: %v", err)
 	}
 
+	// 创建健康检查器
+	healthChecker := health.NewHealthChecker(w.GetDB())
+
+	// 启动健康检查服务器
+	go func() {
+		log.Println("启动健康检查服务器，端口: 8080")
+		if err := health.StartHealthServer(8080, healthChecker); err != nil {
+			log.Printf("健康检查服务器启动失败: %v", err)
+		}
+	}()
+
+	// 启动指标服务器
+	go func() {
+		log.Println("启动指标服务器，端口: 9090")
+		if err := metrics.StartMetricsServer(9090); err != nil {
+			log.Printf("指标服务器启动失败: %v", err)
+		}
+	}()
+
 	// 启动 Worker
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -47,8 +68,18 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Println("收到退出信号，正在关闭 Worker...")
+	log.Println("收到退出信号，正在优雅关闭 Worker...")
+
+	// 创建关闭超时上下文
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// 优雅关闭 Worker
+	if err := w.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Worker 关闭失败: %v", err)
+	}
+
+	// 取消主上下文
 	cancel()
-	time.Sleep(2 * time.Second)
 	log.Println("Worker 已关闭")
 }

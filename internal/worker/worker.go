@@ -43,6 +43,10 @@ func NewWorker(cfg *config.Config) (*Worker, error) {
 	// 注册 API 采集器
 	apiCollector := collector.NewAPICollector(cfg.Collector.API.Timeout)
 	collectorFactory.Register(apiCollector)
+	
+	// 注册数据库采集器
+	dbCollector := collector.NewDBCollector(cfg.Collector.API.Timeout) // 使用相同的超时配置
+	collectorFactory.Register(dbCollector)
 
 	// 创建存储工厂
 	storageFactory := storage.NewStorageFactory()
@@ -136,8 +140,10 @@ func (w *Worker) poll(ctx context.Context) {
 
 		log.Printf("成功锁定任务 %s (ID: %d)，开始执行", task.Name, task.ID)
 
-		// 执行任务
-		w.executeTask(ctx, task)
+		// 执行任务（带重试）
+		if err := w.executeWithRetry(ctx, task); err != nil {
+			log.Printf("任务执行最终失败: %v", err)
+		}
 
 		// 释放锁
 		if err := w.db.UnlockTask(ctx, task.ID); err != nil {
@@ -146,64 +152,9 @@ func (w *Worker) poll(ctx context.Context) {
 	}
 }
 
-// executeTask 执行任务
-func (w *Worker) executeTask(ctx context.Context, task *models.CollectionTask) {
-	startTime := time.Now()
-
-	// 创建执行记录
-	execution := &models.TaskExecution{
-		TaskID:     task.ID,
-		WorkerPod:  w.podName,
-		Status:     "running",
-		StartTime:  startTime,
-		RetryCount: 0,
-	}
-
-	execID, err := w.db.CreateExecution(ctx, execution)
-	if err != nil {
-		log.Printf("创建执行记录失败: %v", err)
-		return
-	}
-	execution.ID = execID
-
-	log.Printf("开始执行任务: %s (执行ID: %d)", task.Name, execID)
-
-	// 解析任务配置
-	taskConfig, err := database.ParseTaskConfig(task.Config)
-	if err != nil {
-		w.finishExecution(ctx, execution, "failed", 0, fmt.Sprintf("解析任务配置失败: %v", err))
-		return
-	}
-
-	// 1. 数据采集
-	collectedData, err := w.collectData(ctx, &taskConfig.DataSource)
-	if err != nil {
-		w.finishExecution(ctx, execution, "failed", 0, fmt.Sprintf("数据采集失败: %v", err))
-		return
-	}
-
-	// 2. 数据处理
-	processedData, err := w.processData(collectedData, &taskConfig.Processor)
-	if err != nil {
-		w.finishExecution(ctx, execution, "failed", len(collectedData), fmt.Sprintf("数据处理失败: %v", err))
-		return
-	}
-
-	// 3. 数据存储
-	if err := w.storeData(ctx, &taskConfig.Storage, processedData); err != nil {
-		w.finishExecution(ctx, execution, "failed", len(processedData), fmt.Sprintf("数据存储失败: %v", err))
-		return
-	}
-
-	// 4. 更新下次执行时间
-	if err := w.updateNextRunTime(ctx, task); err != nil {
-		log.Printf("更新下次执行时间失败: %v", err)
-	}
-
-	// 完成执行
-	w.finishExecution(ctx, execution, "success", len(processedData), "")
-	
-	log.Printf("任务执行完成: %s, 耗时: %v, 数据量: %d", task.Name, time.Since(startTime), len(processedData))
+// parseTaskConfig 解析任务配置
+func (w *Worker) parseTaskConfig(configJSON string) (*models.TaskConfig, error) {
+	return database.ParseTaskConfig(configJSON)
 }
 
 // collectData 采集数据
@@ -259,4 +210,20 @@ func (w *Worker) finishExecution(ctx context.Context, execution *models.TaskExec
 	if err := w.db.UpdateExecution(ctx, execution); err != nil {
 		log.Printf("更新执行记录失败: %v", err)
 	}
+}
+
+// GetDB 获取数据库连接（用于健康检查）
+func (w *Worker) GetDB() *database.PostgresDB {
+	return w.db
+}
+
+// Shutdown 优雅关闭 Worker
+func (w *Worker) Shutdown(ctx context.Context) error {
+	log.Println("开始优雅关闭 Worker...")
+	
+	// 这里可以添加等待正在运行的任务完成的逻辑
+	// 目前简单实现，直接返回
+	
+	log.Println("Worker 优雅关闭完成")
+	return nil
 }

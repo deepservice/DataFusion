@@ -27,22 +27,24 @@ func (p *Processor) Process(data []map[string]interface{}) ([]map[string]interfa
 
 	log.Printf("开始数据处理，共 %d 条数据", len(data))
 
+	// 使用增强清洗器
+	if len(p.config.CleaningRules) > 0 {
+		enhancedCleaner := NewEnhancedCleaner(p.config.CleaningRules)
+		cleaned, err := enhancedCleaner.Clean(data)
+		if err != nil {
+			return nil, fmt.Errorf("增强清洗失败: %w", err)
+		}
+		data = cleaned
+	}
+
+	// 应用转换规则
 	var processed []map[string]interface{}
 	for _, record := range data {
-		// 应用清洗规则
-		cleaned, err := p.applyCleaningRules(record)
-		if err != nil {
-			log.Printf("清洗数据失败: %v", err)
-			continue
-		}
-
-		// 应用转换规则
-		transformed, err := p.applyTransformRules(cleaned)
+		transformed, err := p.applyTransformRules(record)
 		if err != nil {
 			log.Printf("转换数据失败: %v", err)
 			continue
 		}
-
 		processed = append(processed, transformed)
 	}
 

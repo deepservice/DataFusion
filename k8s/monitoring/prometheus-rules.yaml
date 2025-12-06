@@ -1,0 +1,226 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-datafusion-rules
+  namespace: datafusion
+data:
+  datafusion.rules.yml: |
+    groups:
+    - name: datafusion_worker_alerts
+      interval: 30s
+      rules:
+      
+      # 任务执行告警
+      - alert: HighTaskFailureRate
+        expr: |
+          (
+            rate(datafusion_task_execution_failure_total[5m]) 
+            / 
+            rate(datafusion_task_execution_total[5m])
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "High task failure rate detected"
+          description: "Task {{ $labels.task_name }} has a failure rate of {{ $value | humanizePercentage }} over the last 5 minutes"
+      
+      - alert: TaskExecutionTooSlow
+        expr: |
+          histogram_quantile(0.95, 
+            rate(datafusion_task_duration_seconds_bucket[5m])
+          ) > 600
+        for: 10m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Task execution is too slow"
+          description: "Task {{ $labels.task_name }} p95 duration is {{ $value }}s, exceeding 10 minutes"
+      
+      - alert: NoTasksExecuted
+        expr: |
+          rate(datafusion_task_execution_total[10m]) == 0
+        for: 15m
+        labels:
+          severity: critical
+          component: worker
+        annotations:
+          summary: "No tasks executed recently"
+          description: "Worker {{ $labels.worker }} has not executed any tasks in the last 15 minutes"
+      
+      # 数据采集告警
+      - alert: LowDataCollectionRate
+        expr: |
+          rate(datafusion_data_records_collected_total[5m]) < 1
+        for: 10m
+        labels:
+          severity: warning
+          component: collector
+        annotations:
+          summary: "Low data collection rate"
+          description: "Task {{ $labels.task_name }} is collecting less than 1 record per second"
+      
+      - alert: DataCollectionFailed
+        expr: |
+          rate(datafusion_data_records_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Data storage failures detected"
+          description: "Task {{ $labels.task_name }} has {{ $value }} failed records per second"
+      
+      # 存储告警
+      - alert: HighStorageErrorRate
+        expr: |
+          rate(datafusion_storage_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "High storage error rate"
+          description: "Storage {{ $labels.storage_type }} has {{ $value }} errors per second"
+      
+      - alert: StorageOperationSlow
+        expr: |
+          histogram_quantile(0.95,
+            rate(datafusion_storage_operation_duration_seconds_bucket[5m])
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Storage operations are slow"
+          description: "Storage {{ $labels.storage_type }} {{ $labels.operation }} p95 duration is {{ $value }}s"
+      
+      # Worker 状态告警
+      - alert: WorkerDown
+        expr: up{job="datafusion-worker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: worker
+        annotations:
+          summary: "Worker is down"
+          description: "Worker {{ $labels.instance }} has been down for more than 2 minutes"
+      
+      - alert: TooManyRunningTasks
+        expr: datafusion_running_tasks > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Too many running tasks"
+          description: "Worker has {{ $value }} running tasks, which may indicate a bottleneck"
+      
+      - alert: HighTaskQueueLength
+        expr: datafusion_task_queue_length > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "High task queue length"
+          description: "Task queue has {{ $value }} pending tasks"
+      
+      # 数据库连接告警
+      - alert: HighDBConnectionUsage
+        expr: |
+          datafusion_db_connections_active / datafusion_db_connections_total > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "High database connection usage"
+          description: "Database connection usage is at {{ $value | humanizePercentage }}"
+      
+      - alert: NoIdleDBConnections
+        expr: datafusion_db_connections_idle == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "No idle database connections"
+          description: "All database connections are in use, may need to increase pool size"
+      
+      # 错误和重试告警
+      - alert: HighErrorRate
+        expr: |
+          rate(datafusion_errors_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "High error rate detected"
+          description: "Component {{ $labels.component }} has {{ $value }} errors per second"
+      
+      - alert: HighRetryRate
+        expr: |
+          rate(datafusion_retry_total[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "High retry rate"
+          description: "Task {{ $labels.task_name }} has {{ $value }} retries per second"
+      
+      - alert: RetriesExhausted
+        expr: |
+          rate(datafusion_retry_exhausted_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: worker
+        annotations:
+          summary: "Task retries exhausted"
+          description: "Task {{ $labels.task_name }} has exhausted all retry attempts"
+      
+      # 缓存告警
+      - alert: LowCacheHitRate
+        expr: |
+          rate(datafusion_cache_hits_total[5m]) 
+          / 
+          (rate(datafusion_cache_hits_total[5m]) + rate(datafusion_cache_misses_total[5m]))
+          < 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: "Low cache hit rate"
+          description: "Cache {{ $labels.cache_type }} hit rate is {{ $value | humanizePercentage }}"
+      
+      - alert: CacheSizeTooLarge
+        expr: datafusion_cache_size > 100000
+        for: 5m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: "Cache size is too large"
+          description: "Cache {{ $labels.cache_type }} size is {{ $value }}, may cause memory issues"
+      
+      # 去重告警
+      - alert: HighDuplicationRate
+        expr: |
+          rate(datafusion_data_duplicates_removed_total[5m])
+          /
+          rate(datafusion_data_records_collected_total[5m])
+          > 0.5
+        for: 10m
+        labels:
+          severity: info
+          component: processor
+        annotations:
+          summary: "High data duplication rate"
+          description: "Task {{ $labels.task_name }} has a duplication rate of {{ $value | humanizePercentage }}"

@@ -20,7 +20,7 @@ spec:
       containers:
       - name: worker
         image: datafusion-worker:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always  # 改为 Always，强制重新拉取镜像
         env:
         - name: POD_NAME
           valueFrom:
@@ -30,6 +30,13 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        ports:
+        - containerPort: 8080
+          name: health
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
         volumeMounts:
         - name: config
           mountPath: /app/config
@@ -43,13 +50,21 @@ spec:
             memory: "512Mi"
             cpu: "500m"
         livenessProbe:
-          exec:
-            command:
-            - /bin/sh
-            - -c
-            - "ps aux | grep worker | grep -v grep"
+          httpGet:
+            path: /healthz
+            port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
       volumes:
       - name: config
         configMap:

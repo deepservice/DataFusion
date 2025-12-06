@@ -1,0 +1,272 @@
+{
+  "dashboard": {
+    "title": "DataFusion Worker Monitoring",
+    "tags": ["datafusion", "worker"],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 1,
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Task Execution Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "rate(datafusion_task_execution_total[5m])",
+            "legendFormat": "{{task_name}} - {{task_type}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Executions/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Task Success Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "rate(datafusion_task_execution_success_total[5m]) / rate(datafusion_task_execution_total[5m]) * 100",
+            "legendFormat": "{{task_name}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "label": "Success Rate", "max": 100, "min": 0},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Task Duration (p95)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(datafusion_task_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{task_name}} - p95",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(datafusion_task_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{task_name}} - p99",
+            "refId": "B"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Running Tasks",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [
+          {
+            "expr": "datafusion_running_tasks",
+            "legendFormat": "Running Tasks",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Count"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Data Records Collected",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [
+          {
+            "expr": "rate(datafusion_data_records_collected_total[5m])",
+            "legendFormat": "{{task_name}} - {{source_type}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Records/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Data Records Stored",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [
+          {
+            "expr": "rate(datafusion_data_records_stored_total[5m])",
+            "legendFormat": "{{task_name}} - {{storage_type}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Records/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Deduplication Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+        "targets": [
+          {
+            "expr": "rate(datafusion_data_duplicates_removed_total[5m])",
+            "legendFormat": "{{task_name}} - {{strategy}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Duplicates/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Storage Operation Duration",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(datafusion_storage_operation_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{operation}} - {{storage_type}} - p95",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Error Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+        "targets": [
+          {
+            "expr": "rate(datafusion_errors_total[5m])",
+            "legendFormat": "{{error_type}} - {{component}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Errors/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Retry Statistics",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+        "targets": [
+          {
+            "expr": "rate(datafusion_retry_total[5m])",
+            "legendFormat": "{{task_name}} - Total",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(datafusion_retry_success_total[5m])",
+            "legendFormat": "{{task_name}} - Success",
+            "refId": "B"
+          },
+          {
+            "expr": "rate(datafusion_retry_exhausted_total[5m])",
+            "legendFormat": "{{task_name}} - Exhausted",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Retries/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 11,
+        "title": "Worker Uptime",
+        "type": "singlestat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 40},
+        "targets": [
+          {
+            "expr": "datafusion_worker_uptime_seconds",
+            "refId": "A"
+          }
+        ],
+        "format": "s",
+        "valueName": "current"
+      },
+      {
+        "id": 12,
+        "title": "DB Connections",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 6, "y": 40},
+        "targets": [
+          {
+            "expr": "datafusion_db_connections_active",
+            "legendFormat": "Active",
+            "refId": "A"
+          },
+          {
+            "expr": "datafusion_db_connections_idle",
+            "legendFormat": "Idle",
+            "refId": "B"
+          },
+          {
+            "expr": "datafusion_db_connections_total",
+            "legendFormat": "Total",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Connections"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 13,
+        "title": "Cache Hit Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 48},
+        "targets": [
+          {
+            "expr": "rate(datafusion_cache_hits_total[5m]) / (rate(datafusion_cache_hits_total[5m]) + rate(datafusion_cache_misses_total[5m])) * 100",
+            "legendFormat": "{{cache_type}} - Hit Rate",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "label": "Hit Rate", "max": 100, "min": 0},
+          {"format": "short"}
+        ]
+      },
+      {
+        "id": 14,
+        "title": "Cache Size",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 48},
+        "targets": [
+          {
+            "expr": "datafusion_cache_size",
+            "legendFormat": "{{cache_type}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Size"},
+          {"format": "short"}
+        ]
+      }
+    ]
+  }
+}
