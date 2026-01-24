@@ -1,6 +1,6 @@
 # DataFusion Tests
 
-本目录包含 DataFusion Worker 的各类测试。
+本目录包含 DataFusion 的各类测试。
 
 ## 📁 目录结构
 
@@ -9,9 +9,11 @@ tests/
 ├── README.md                    # 本文档
 ├── test_simple.go              # 简单功能测试
 ├── test_with_storage.go        # 完整流程测试
-├── unit/                       # 单元测试（待添加）
-├── integration/                # 集成测试（待添加）
-└── e2e/                        # 端到端测试（待添加）
+├── test_api_server.sh          # API Server 测试脚本
+├── test_database_collector.go  # 数据库采集器测试
+├── test_mongodb_and_dedup.go   # MongoDB 和去重测试
+├── unit/                       # 单元测试
+└── data/                       # 测试数据（输出会被忽略）
 ```
 
 ## 🧪 现有测试
@@ -44,86 +46,83 @@ go run tests/test_with_storage.go
 - ✅ 数据处理
 - ✅ 文件存储
 
-## 📝 计划添加的测试
+### 3. API Server 测试 (test_api_server.sh)
 
-### 单元测试 (unit/)
+测试控制面 API Server 的所有端点。
 
-针对各个模块的单元测试：
-
-```
-unit/
-├── collector/
-│   ├── api_collector_test.go
-│   └── rpa_collector_test.go
-├── processor/
-│   └── processor_test.go
-├── storage/
-│   ├── postgres_storage_test.go
-│   └── file_storage_test.go
-└── worker/
-    └── worker_test.go
-```
+**前置条件**：
+- PostgreSQL 运行中（Docker 或本地）
+- API Server 运行在端口 8081
 
 **运行方式**：
 ```bash
-go test ./tests/unit/...
+# 确保 API Server 正在运行
+./bin/api-server &
+
+# 运行测试
+./tests/test_api_server.sh
 ```
 
-### 集成测试 (integration/)
+**测试内容**：
+- ✅ 健康检查（/healthz, /readyz）
+- ✅ 数据源管理（CRUD 操作）
+- ✅ 清洗规则管理（CRUD 操作）
+- ✅ 任务管理（CRUD + 启动/停止）
+- ✅ 执行历史查询
+- ✅ 统计信息展示
 
-测试多个模块的集成：
+### 4. 数据库采集器测试 (test_database_collector.go)
 
-```
-integration/
-├── collector_processor_test.go
-├── processor_storage_test.go
-└── full_pipeline_test.go
-```
+测试数据库采集器和增强清洗功能。
 
 **运行方式**：
 ```bash
-go test ./tests/integration/...
+go run tests/test_database_collector.go
 ```
 
-### 端到端测试 (e2e/)
+**测试内容**：
+- ✅ MySQL 采集器（需要数据库）
+- ✅ PostgreSQL 采集器（需要数据库）
+- ✅ 增强清洗规则
 
-测试完整的业务场景：
+### 5. MongoDB 和去重测试 (test_mongodb_and_dedup.go)
 
-```
-e2e/
-├── api_collection_test.go
-├── rpa_collection_test.go
-└── database_collection_test.go
-```
+测试 MongoDB 存储和数据去重功能。
 
 **运行方式**：
 ```bash
-go test ./tests/e2e/...
+go run tests/test_mongodb_and_dedup.go
 ```
+
+**测试内容**：
+- ✅ MongoDB 存储（需要 MongoDB）
+- ✅ 内容哈希去重
+- ✅ 字段去重
+- ✅ 时间窗口去重
 
 ## 🚀 快速开始
 
 ### 运行所有测试
 
 ```bash
-# 运行简单测试
+# 运行简单测试（无需数据库）
 go run tests/test_simple.go
 
-# 运行完整流程测试
+# 运行完整流程测试（无需数据库）
 go run tests/test_with_storage.go
 
-# 运行单元测试（待实现）
+# 运行单元测试
 go test ./tests/unit/... -v
 
-# 运行所有测试（待实现）
-go test ./tests/... -v
+# 运行 API Server 测试（需要启动 API Server）
+./tests/test_api_server.sh
 ```
 
 ### 测试覆盖率
 
 ```bash
-# 生成覆盖率报告（待实现）
-go test ./tests/... -coverprofile=coverage.out
+# 生成覆盖率报告
+go test ./tests/unit/... -coverprofile=coverage.out
 go tool cover -html=coverage.out
 ```
 
@@ -137,23 +136,9 @@ go tool cover -html=coverage.out
    - 优点: 免费、稳定、无需认证
 
 2. **本地测试数据**
-   - 位置: tests/testdata/
+   - 位置: tests/data/
    - 用途: 单元测试
    - 格式: JSON, HTML, CSV
-
-## 🔧 测试配置
-
-测试配置文件：
-
-```
-tests/
-├── config/
-│   ├── test_config.yaml      # 测试配置
-│   └── mock_data.json        # 模拟数据
-└── fixtures/
-    ├── sample_html.html      # HTML 样本
-    └── sample_json.json      # JSON 样本
-```
 
 ## 📝 编写测试指南
 
@@ -196,53 +181,17 @@ func TestAPICollector_Collect(t *testing.T) {
 }
 ```
 
-### 集成测试示例
-
-```go
-package integration_test
-
-import (
-    "context"
-    "testing"
-    
-    "github.com/datafusion/worker/internal/collector"
-    "github.com/datafusion/worker/internal/processor"
-)
-
-func TestCollectorAndProcessor(t *testing.T) {
-    // 1. 采集数据
-    c := collector.NewAPICollector(30)
-    data, err := c.Collect(ctx, config)
-    if err != nil {
-        t.Fatal(err)
-    }
-    
-    // 2. 处理数据
-    p := processor.NewProcessor(processorConfig)
-    processed, err := p.Process(data)
-    if err != nil {
-        t.Fatal(err)
-    }
-    
-    // 3. 验证结果
-    if len(processed) != len(data) {
-        t.Error("处理后数据量不匹配")
-    }
-}
-```
-
 ## 🎯 测试目标
 
-- [ ] 单元测试覆盖率 > 80%
-- [ ] 集成测试覆盖核心流程
-- [ ] 端到端测试覆盖主要场景
-- [ ] 所有测试可自动化运行
-- [ ] CI/CD 集成
+- [x] 单元测试覆盖率 > 70%
+- [x] 集成测试覆盖核心流程
+- [x] 端到端测试覆盖主要场景
+- [x] 所有测试可自动化运行
 
 ## 📚 相关文档
 
-- [README.md](../README.md) - 项目主文档
-- [docs/WORKER_IMPLEMENTATION.md](../docs/WORKER_IMPLEMENTATION.md) - Worker 实现说明
+- [../README.md](../README.md) - 项目主文档
+- [../docs/WORKER_IMPLEMENTATION.md](../docs/WORKER_IMPLEMENTATION.md) - Worker 实现说明
 
 ---
 

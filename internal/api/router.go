@@ -3,12 +3,12 @@ package api
 import (
 	"database/sql"
 
+	"github.com/datafusion/worker/internal/logger"
 	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
 )
 
 // RegisterRoutes 注册所有API路由
-func RegisterRoutes(r *gin.Engine, db *sql.DB, log *zap.Logger) {
+func RegisterRoutes(r *gin.Engine, db *sql.DB, log *logger.Logger) {
 	// 健康检查
 	r.GET("/healthz", HealthCheck)
 	r.GET("/readyz", ReadyCheck(db))

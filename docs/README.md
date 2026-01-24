@@ -1,6 +1,6 @@
 # DataFusion 文档中心
 
-欢迎来到 DataFusion Worker 的文档中心！这里包含了项目的所有文档。
+欢迎来到 DataFusion 的文档中心！这里包含了项目的所有文档。
 
 ## 📚 文档导航
 
@@ -8,46 +8,66 @@
 
 | 文档 | 说明 | 适合人群 |
 |------|------|---------|
-| [QUICKSTART.md](QUICKSTART.md) | 5 分钟快速开始指南 | 新用户 |
-| [GETTING_STARTED.md](GETTING_STARTED.md) | 10 分钟详细入门指南 | 新用户 |
-| [VERIFICATION_SUCCESS.md](VERIFICATION_SUCCESS.md) | 本地验证成功报告 | 开发者 |
+| [../QUICK_START_GUIDE.md](../QUICK_START_GUIDE.md) | 5 分钟快速开始指南 | 新用户 |
 
 ### 🏗️ 架构和实现
 
 | 文档 | 说明 | 适合人群 |
 |------|------|---------|
 | [WORKER_IMPLEMENTATION.md](WORKER_IMPLEMENTATION.md) | Worker 实现说明 | 开发者 |
-| [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) | 实现总结 | 开发者 |
-| [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md) | 项目概览 | 所有人 |
-| [PROJECT_STATUS.md](PROJECT_STATUS.md) | 项目状态 | 项目管理者 |
 | [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) | 项目结构说明 | 开发者 |
 
 ### ☸️ Kubernetes 部署
 
 | 文档 | 说明 | 适合人群 |
 |------|------|---------|
-| [K8S_QUICK_START.md](K8S_QUICK_START.md) | K8S 快速部署（2 步） | 运维人员 |
 | [K8S_DEPLOYMENT_GUIDE.md](K8S_DEPLOYMENT_GUIDE.md) | K8S 完整部署指南 | 运维人员 |
-| [K8S_FILES_SUMMARY.md](K8S_FILES_SUMMARY.md) | K8S 文件清单 | 运维人员 |
+
+### 🔧 专业指南
+
+| 文档 | 说明 | 适合人群 |
+|------|------|---------|
+| [CONTROL_PLANE_API.md](CONTROL_PLANE_API.md) | 完整的 REST API 文档 | 开发者 |
+| [DATABASE_COLLECTOR_GUIDE.md](DATABASE_COLLECTOR_GUIDE.md) | 数据库采集指南 | 开发者 |
 
 ### 🐛 问题修复
 
 | 文档 | 说明 | 适合人群 |
 |------|------|---------|
-| [QUICK_FIX.md](QUICK_FIX.md) | 主键冲突快速修复 | 运维人员 |
+| [QUICK_FIX.md](QUICK_FIX.md) | 常见问题快速修复 | 运维人员 |
 | [FIX_DUPLICATE_KEY_ISSUE.md](FIX_DUPLICATE_KEY_ISSUE.md) | 主键冲突详细分析 | 开发者 |
 
-### 📊 项目信息
+### 📁 归档文档
 
-| 文档 | 说明 | 适合人群 |
-|------|------|---------|
-| [FILES_CREATED.md](FILES_CREATED.md) | 创建文件清单 | 开发者 |
-| [SUMMARY.md](SUMMARY.md) | 项目总结 | 所有人 |
-| [README_EN.md](README_EN.md) | 英文文档 | 国际用户 |
+| 目录 | 说明 |
+|------|------|
+| [archive/design/](archive/design/) | 设计阶段文档 |
+| [archive/history/](archive/history/) | 历史开发文档 |
 
 ## 🎯 按角色查找文档
 
 ### 👨‍💻 开发者
+- [WORKER_IMPLEMENTATION.md](WORKER_IMPLEMENTATION.md) - 了解 Worker 实现
+- [CONTROL_PLANE_API.md](CONTROL_PLANE_API.md) - API 接口文档
+- [DATABASE_COLLECTOR_GUIDE.md](DATABASE_COLLECTOR_GUIDE.md) - 数据库采集
+- [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) - 项目结构
+
+### 🚀 运维人员
+- [K8S_DEPLOYMENT_GUIDE.md](K8S_DEPLOYMENT_GUIDE.md) - K8S 部署
+- [QUICK_FIX.md](QUICK_FIX.md) - 问题修复
+
+### 👤 新用户
+- [../QUICK_START_GUIDE.md](../QUICK_START_GUIDE.md) - 快速开始
+- [../README.md](../README.md) - 项目概览
+
+## 📖 文档维护
+
+本文档中心定期更新，确保信息的准确性和完整性。如果发现问题或需要补充，请提交 Issue。
+
+---
+
+**文档总数**: 8 个核心文档  
+**最后更新**: 2025-01-25
 
 **第一次使用**：
 1. [QUICKSTART.md](QUICKSTART.md) - 快速开始

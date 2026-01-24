@@ -1,12 +1,53 @@
-# DataFusion Worker v2.0
+# DataFusion v2.0
 
-DataFusion 数据采集系统的 Worker 组件，负责执行数据采集、处理和存储任务。
+DataFusion 是一个完整的数据采集和处理系统，包含控制面（API Server）和数据面（Worker）两大组件。
 
-**🎉 4 周开发计划已完成！所有功能已实现并生产就绪！**
+**🎉 控制面 + 数据面全部完成！系统生产就绪！**
+
+## 🏗️ 系统架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   控制面 (Control Plane)                  │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  API Server - RESTful API 管理服务                │  │
+│  │  - 任务管理  - 数据源管理  - 清洗规则管理         │  │
+│  │  - 执行历史  - 统计信息    - 系统配置             │  │
+│  └──────────────────────────────────────────────────┘  │
+│                          ↓                              │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  PostgreSQL - 控制面数据库                         │  │
+│  │  - 任务配置  - 数据源  - 规则  - 执行记录         │  │
+│  └──────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────┐
+│                   数据面 (Data Plane)                     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
+│  │ Worker 1 │  │ Worker 2 │  │ Worker N │             │
+│  │ RPA采集  │  │ API采集  │  │ DB采集   │             │
+│  └──────────┘  └──────────┘  └──────────┘             │
+│                          ↓                              │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  数据存储 - PostgreSQL / MongoDB / File           │  │
+│  └──────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
 
 ## ✨ 功能特性
 
-### 数据采集 (3 种)
+### 控制面 (API Server)
+- ✅ **任务管理** - 创建、更新、删除、启动、停止采集任务
+- ✅ **数据源管理** - 管理 Web、API、Database 数据源
+- ✅ **清洗规则管理** - 配置和复用数据清洗规则
+- ✅ **执行历史** - 查看任务执行记录和统计
+- ✅ **系统监控** - 实时监控系统状态和性能
+- ✅ **RESTful API** - 完整的 REST API 接口
+- ✅ **健康检查** - /healthz 和 /readyz 端点
+
+### 数据面 (Worker)
+
+#### 数据采集 (3 种)
 - ✅ **Web RPA 采集器** - 基于 Chromium 的网页数据抓取
 - ✅ **API 采集器** - REST API 数据采集
 - ✅ **数据库采集器** - MySQL + PostgreSQL 数据采集
@@ -36,6 +77,51 @@ DataFusion 数据采集系统的 Worker 组件，负责执行数据采集、处�
 - ✅ **告警规则** - 20+ 条智能告警规则
 
 ## 快速开始
+
+### 方式 1: 使用 Docker（推荐）
+
+```bash
+# 1. 启动 PostgreSQL 容器
+docker run -d --name datafusion-postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -p 5432:5432 postgres:14
+
+# 2. 初始化数据库
+docker exec -i datafusion-postgres psql -U postgres -c "CREATE DATABASE datafusion_control;"
+docker exec -i datafusion-postgres psql -U postgres -c "CREATE DATABASE datafusion_data;"
+docker exec -i datafusion-postgres psql -U postgres -d datafusion_control < scripts/init_control_db.sql
+
+# 3. 启动 API Server
+go build -o bin/api-server ./cmd/api-server
+./bin/api-server
+
+# 4. 测试 API
+curl http://localhost:8081/healthz
+curl http://localhost:8081/api/v1/tasks
+
+# 5. 运行完整测试
+./tests/test_api_server.sh
+```
+
+### 方式 2: 使用本地 PostgreSQL
+
+```bash
+# 1. 初始化数据库
+createdb datafusion_control
+psql -U postgres -d datafusion_control -f scripts/init_control_db.sql
+
+# 2. 启动 API Server
+go build -o bin/api-server ./cmd/api-server
+./bin/api-server
+
+# 3. 测试 API
+curl http://localhost:8081/healthz
+
+# 4. 运行完整测试
+./tests/test_api_server.sh
+```
+
+### 方式 3: 启动 Worker
 
 ### 1. 环境准备
 
@@ -78,12 +164,21 @@ poll_interval: 30s
 database:
   host: "localhost"
   port: 5432
-  user: "datafusion"
-  password: "datafusion123"
+  user: "postgres"
+  password: "postgres"
   database: "datafusion_control"
   ssl_mode: "disable"
 
 storage:
+  type: "postgresql"
+  database:
+    host: "localhost"
+    port: 5432
+    user: "postgres"
+    password: "postgres"
+    database: "datafusion_data"
+    ssl_mode: "disable"
+```
   type: "postgresql"
   database:
     host: "localhost"
@@ -122,45 +217,84 @@ docker run -v $(pwd)/config:/app/config datafusion-worker:latest
 ## 项目结构
 
 ```
-datafusion-worker/
+datafusion/
 ├── cmd/
+│   ├── api-server/              # API Server 主程序入口
+│   │   └── main.go
 │   └── worker/                  # Worker 主程序入口
 │       └── main.go
 ├── internal/                    # 内部包（核心业务逻辑）
+│   ├── api/                    # API Server 处理器
+│   │   ├── router.go           # 路由注册
+│   │   ├── middleware.go       # 中间件
+│   │   ├── health.go           # 健康检查
+│   │   ├── task_handler.go     # 任务管理
+│   │   ├── datasource_handler.go # 数据源管理
+│   │   ├── cleaning_rule_handler.go # 清洗规则管理
+│   │   ├── execution_handler.go # 执行历史
+│   │   └── stats_handler.go    # 统计信息
 │   ├── collector/              # 数据采集器
 │   │   ├── collector.go        # 采集器接口
 │   │   ├── rpa_collector.go    # RPA 采集器
-│   │   └── api_collector.go    # API 采集器
+│   │   ├── api_collector.go    # API 采集器
+│   │   └── db_collector.go     # 数据库采集器
 │   ├── processor/              # 数据处理器
-│   │   └── processor.go        # 数据清洗和转换
+│   │   ├── processor.go        # 数据清洗和转换
+│   │   ├── enhanced_cleaner.go # 增强清洗规则
+│   │   └── deduplicator.go     # 数据去重
 │   ├── storage/                # 数据存储
 │   │   ├── storage.go          # 存储接口
 │   │   ├── postgres_storage.go # PostgreSQL 存储
-│   │   └── file_storage.go     # 文件存储
+│   │   ├── file_storage.go     # 文件存储
+│   │   └── mongodb/            # MongoDB 存储
+│   │       ├── config.go
+│   │       ├── pool.go
+│   │       └── mongodb_storage.go
 │   ├── database/               # 数据库操作
 │   │   └── postgres.go         # PostgreSQL 客户端
 │   ├── models/                 # 数据模型
 │   │   └── task.go             # 任务模型
 │   ├── config/                 # 配置管理
-│   │   └── config.go           # 配置加载
+│   │   ├── config.go           # Worker 配置
+│   │   └── api_config.go       # API Server 配置
+│   ├── logger/                 # 日志管理
+│   │   └── logger.go           # 结构化日志
+│   ├── metrics/                # 监控指标
+│   │   └── metrics.go          # Prometheus 指标
+│   ├── health/                 # 健康检查
+│   │   └── health.go           # 健康检查处理
 │   └── worker/                 # Worker 核心逻辑
-│       └── worker.go           # 任务调度和执行
+│       ├── worker.go           # 任务调度和执行
+│       └── retry.go            # 重试机制
 ├── config/                      # 配置文件
+│   ├── api-server.yaml         # API Server 配置
 │   └── worker.yaml             # Worker 配置
 ├── k8s/                        # Kubernetes 部署文件
 │   ├── namespace.yaml          # 命名空间
 │   ├── postgresql.yaml         # PostgreSQL 部署
 │   ├── postgres-init-scripts.yaml # 数据库初始化
+│   ├── api-server-deployment.yaml # API Server 部署
 │   ├── worker-config.yaml      # Worker 配置
-│   └── worker.yaml             # Worker 部署
+│   ├── worker.yaml             # Worker 部署
+│   └── monitoring/             # 监控配置
+│       ├── grafana-dashboard.json
+│       └── prometheus-rules.yaml
 ├── scripts/                     # 脚本工具
-│   ├── init_db.sql             # 数据库初始化
+│   ├── init_db.sql             # Worker 数据库初始化
+│   ├── init_control_db.sql     # 控制面数据库初始化
 │   ├── insert_test_task.sql    # 测试任务
 │   └── quick_start.sh          # 快速启动
 ├── tests/                       # 测试文件
+│   ├── unit/                   # 单元测试
+│   │   ├── collector_test.go
+│   │   ├── processor_test.go
+│   │   └── storage_test.go
 │   ├── test_simple.go          # 简单测试
 │   ├── test_with_storage.go    # 完整流程测试
 │   └── README.md               # 测试说明
+├── test_api_server.sh          # API Server 测试脚本
+├── test_database_collector.go  # 数据库采集器测试
+├── test_mongodb_and_dedup.go   # MongoDB 和去重测试
 ├── docs/                        # 文档中心
 │   ├── README.md               # 文档索引
 │   ├── QUICKSTART.md           # 快速开始
@@ -173,8 +307,12 @@ datafusion-worker/
 │   └── DataFusion产品需求分析文档.md
 ├── go.mod                       # Go 模块定义
 ├── Makefile                     # 构建脚本
-├── Dockerfile                   # Docker 镜像
+├── Dockerfile                   # Worker Docker 镜像
+├── Dockerfile.api-server        # API Server Docker 镜像
+├── deploy-api-server.sh         # API Server 部署脚本
+├── deploy-k8s-worker.sh         # Worker 部署脚本
 ├── README.md                    # 项目主文档（本文档）
+├── FINAL_CHECKLIST.md           # 最终检查清单
 └── TODO.md                      # 待办事项
 ```
 
@@ -337,12 +475,22 @@ apk add chromium nss freetype harfbuzz
 
 完整文档请查看 [docs/](docs/) 目录：
 
+### 控制面文档
+- **API 文档**: [docs/CONTROL_PLANE_API.md](docs/CONTROL_PLANE_API.md) - 完整的 REST API 文档
+- **控制面总结**: [docs/CONTROL_PLANE_SUMMARY.md](docs/CONTROL_PLANE_SUMMARY.md) - 控制面实现总结
+
+### Worker 文档
 - **快速开始**: [docs/QUICKSTART.md](docs/QUICKSTART.md) - 5 分钟快速上手
 - **详细入门**: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) - 10 分钟详细指南
 - **K8S 部署**: [docs/K8S_QUICK_START.md](docs/K8S_QUICK_START.md) - Kubernetes 快速部署
 - **实现说明**: [docs/WORKER_IMPLEMENTATION.md](docs/WORKER_IMPLEMENTATION.md) - Worker 实现细节
+- **数据库采集器**: [docs/DATABASE_COLLECTOR_GUIDE.md](docs/DATABASE_COLLECTOR_GUIDE.md) - 数据库采集指南
+
+### 项目文档
 - **问题修复**: [docs/QUICK_FIX.md](docs/QUICK_FIX.md) - 常见问题快速修复
 - **文档索引**: [docs/README.md](docs/README.md) - 完整文档列表
+- **项目总结**: [docs/PROJECT_COMPLETION_SUMMARY.md](docs/PROJECT_COMPLETION_SUMMARY.md) - 项目完成总结
+- **最终总结**: [docs/FINAL_SUMMARY.md](docs/FINAL_SUMMARY.md) - 最终总结报告
 
 ## 🧪 测试
 
@@ -387,8 +535,15 @@ go run tests/test_with_storage.go
 
 ## 📊 项目统计
 
-- **代码行数**: 4255 行
-- **Go 文件数**: 29 个
+### 代码统计
+- **总代码行数**: ~6000 行
+- **Go 文件数**: 40+ 个
+- **控制面代码**: ~1000 行
+- **数据面代码**: ~4000 行
+- **配置和脚本**: ~1000 行
+
+### 功能统计
+- **API 端点**: 25+ 个
 - **采集器**: 3 个
 - **清洗规则**: 15 种
 - **去重策略**: 3 种
@@ -396,11 +551,30 @@ go run tests/test_with_storage.go
 - **监控指标**: 28 个
 - **单元测试**: 19 个
 - **测试覆盖率**: ~70%
-- **技术文档**: 9 份
 
-## 🎯 4 周开发完成
+### 文档统计
+- **技术文档**: 15+ 份
+- **API 文档**: 1 份
+- **部署脚本**: 5+ 个
+- **测试脚本**: 3+ 个
 
-### Week 1: 生产必需功能 ✅
+## 🎯 开发完成情况
+
+### 控制面 (Control Plane) ✅
+- ✅ RESTful API Server
+- ✅ 任务管理 (CRUD + 启动/停止)
+- ✅ 数据源管理 (CRUD + 连接测试)
+- ✅ 清洗规则管理 (CRUD)
+- ✅ 执行历史查询
+- ✅ 统计信息展示
+- ✅ 健康检查端点
+- ✅ 结构化日志
+- ✅ K8S 部署配置
+- ✅ 完整 API 文档
+
+### 数据面 (Data Plane) ✅
+
+#### Week 1: 生产必需功能 ✅
 - ✅ 错误重试机制
 - ✅ 超时控制
 - ✅ 健康检查
@@ -447,25 +621,46 @@ go run tests/test_with_storage.go
 
 ## 🚀 快速部署
 
-### 方式 1: 快速更新（推荐）
+### 方式 1: 部署控制面 API Server
 ```bash
-# 下载依赖、运行测试、编译
+# 1. 初始化数据库
+psql -U postgres -f scripts/init_control_db.sql
+
+# 2. 本地运行
+go build -o bin/api-server ./cmd/api-server
+./bin/api-server
+
+# 3. K8S 部署
+./deploy-api-server.sh
+
+# 4. 测试 API
+./test_api_server.sh
+```
+
+### 方式 2: 部署 Worker
+```bash
+# 1. 快速更新（推荐）
 ./quick-update.sh
+
+# 2. K8S 完整部署
+./deploy-k8s-worker.sh
+
+# 3. 本地运行
+go build -o bin/worker ./cmd/worker
+./bin/worker -config config/worker.yaml
 ```
 
-### 方式 2: K8S 完整部署
+### 方式 3: 完整系统部署
 ```bash
-# 构建镜像并部署到 K8S
-./update-k8s-worker.sh
-```
+# 1. 部署控制面
+./deploy-api-server.sh
 
-### 方式 3: 本地运行
-```bash
-# 编译
-go build -o worker cmd/worker/main.go
+# 2. 部署 Worker
+./deploy-k8s-worker.sh
 
-# 运行
-./worker -config config/worker.yaml
+# 3. 验证部署
+kubectl get pods -n datafusion
+kubectl get svc -n datafusion
 ```
 
 ## 🔍 监控端点

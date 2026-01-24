@@ -19,14 +19,22 @@ import (
 
 func main() {
 	// 加载配置
-	cfg, err := config.LoadConfig("config/api-server.yaml")
+	cfg, err := config.LoadAPIServerConfig("config/api-server.yaml")
 	if err != nil {
 		fmt.Printf("加载配置失败: %v\n", err)
 		os.Exit(1)
 	}
 
 	// 初始化日志
-	log := logger.NewLogger(cfg.Log.Level, cfg.Log.Format)
+	logCfg := &logger.Config{
+		Level:  cfg.Log.Level,
+		Format: cfg.Log.Format,
+	}
+	log, err := logger.NewLogger(logCfg)
+	if err != nil {
+		fmt.Printf("初始化日志失败: %v\n", err)
+		os.Exit(1)
+	}
 	defer log.Sync()
 
 	log.Info("启动 DataFusion API Server", zap.String("version", "v1.0.0"))

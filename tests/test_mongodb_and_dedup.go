@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/datafusion/worker/internal/processor"
@@ -141,7 +140,7 @@ func testContentHashDedup() {
 		fmt.Printf("   ✅ 去重成功\n")
 		fmt.Printf("   输入: %d 条，输出: %d 条，去除重复: %d 条\n",
 			len(testData), len(result), len(testData)-len(result))
-		
+
 		stats := dedup.GetStats()
 		fmt.Printf("   统计: 总处理 %d，重复 %d，唯一 %d，重复率 %.2f%%\n",
 			stats.TotalProcessed, stats.Duplicates, stats.Unique, stats.GetDuplicationRate())
@@ -180,7 +179,7 @@ func testFieldBasedDedup() {
 		fmt.Printf("   ✅ 去重成功\n")
 		fmt.Printf("   输入: %d 条，输出: %d 条，去除重复: %d 条\n",
 			len(testData), len(result), len(testData)-len(result))
-		
+
 		stats := dedup.GetStats()
 		fmt.Printf("   统计: 总处理 %d，重复 %d，唯一 %d，重复率 %.2f%%\n",
 			stats.TotalProcessed, stats.Duplicates, stats.Unique, stats.GetDuplicationRate())

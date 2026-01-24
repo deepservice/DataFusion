@@ -145,7 +145,7 @@ func (w *Worker) executeTaskOnce(ctx context.Context, task *models.CollectionTas
 		RetryCount: retryCount,
 	}
 
-	execID, err := w.db.CreateExecution(taskCtx, execution)
+	execID, err := w.db.CreateExecution(task.ID, w.podName)
 	if err != nil {
 		return fmt.Errorf("创建执行记录失败: %w", err)
 	}

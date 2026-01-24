@@ -21,10 +21,7 @@ go.work
 # Data directories
 data/
 exports/
-
-# Reorganization tracking (temporary)
-DIRECTORY_REORGANIZATION.md
-REORGANIZATION_SUMMARY.md
+tests/data/test_output/
 
 # Config files with sensitive data
 config/worker.local.yaml

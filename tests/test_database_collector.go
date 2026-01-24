@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 
 	"github.com/datafusion/worker/internal/collector"
 	"github.com/datafusion/worker/internal/models"
@@ -185,7 +184,7 @@ func testEnhancedCleaning() {
 		fmt.Println("\n原始数据:")
 		jsonData, _ := json.MarshalIndent(testData[0], "", "  ")
 		fmt.Println(string(jsonData))
-		
+
 		fmt.Println("\n清洗后数据:")
 		jsonData, _ = json.MarshalIndent(cleaned[0], "", "  ")
 		fmt.Println(string(jsonData))

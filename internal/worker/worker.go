@@ -28,7 +28,7 @@ type Worker struct {
 // NewWorker 创建 Worker
 func NewWorker(cfg *config.Config) (*Worker, error) {
 	// 连接数据库
-	db, err := database.NewPostgresDB(cfg.Database)
+	db, err := database.NewPostgresDBFromConfig(cfg.Database)
 	if err != nil {
 		return nil, fmt.Errorf("连接数据库失败: %w", err)
 	}
@@ -111,7 +111,7 @@ func (w *Worker) Start(ctx context.Context) error {
 // poll 轮询待执行任务
 func (w *Worker) poll(ctx context.Context) {
 	// 查询待执行任务
-	tasks, err := w.db.GetPendingTasks(ctx, w.config.WorkerType)
+	tasks, err := w.db.GetPendingTasks(w.config.WorkerType)
 	if err != nil {
 		log.Printf("查询待执行任务失败: %v", err)
 		return
@@ -127,7 +127,7 @@ func (w *Worker) poll(ctx context.Context) {
 	// 处理每个任务
 	for _, task := range tasks {
 		// 尝试获取任务锁
-		locked, err := w.db.TryLockTask(ctx, task.ID)
+		locked, err := w.db.TryLockTask(task.ID, w.podName)
 		if err != nil {
 			log.Printf("获取任务锁失败: %v", err)
 			continue
@@ -141,12 +141,12 @@ func (w *Worker) poll(ctx context.Context) {
 		log.Printf("成功锁定任务 %s (ID: %d)，开始执行", task.Name, task.ID)
 
 		// 执行任务（带重试）
-		if err := w.executeWithRetry(ctx, task); err != nil {
+		if err := w.executeWithRetry(ctx, &task); err != nil {
 			log.Printf("任务执行最终失败: %v", err)
 		}
 
 		// 释放锁
-		if err := w.db.UnlockTask(ctx, task.ID); err != nil {
+		if err := w.db.UnlockTask(task.ID); err != nil {
 			log.Printf("释放任务锁失败: %v", err)
 		}
 	}
@@ -196,7 +196,7 @@ func (w *Worker) updateNextRunTime(ctx context.Context, task *models.CollectionT
 	}
 
 	nextRunTime := schedule.Next(time.Now())
-	return w.db.UpdateTaskNextRunTime(ctx, task.ID, nextRunTime)
+	return w.db.UpdateTaskNextRunTime(task.ID, nextRunTime.Format("2006-01-02 15:04:05"))
 }
 
 // finishExecution 完成执行
