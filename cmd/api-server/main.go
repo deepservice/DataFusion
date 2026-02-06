@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/datafusion/worker/internal/api"
+	"github.com/datafusion/worker/internal/cache"
 	"github.com/datafusion/worker/internal/config"
 	"github.com/datafusion/worker/internal/database"
 	"github.com/datafusion/worker/internal/logger"
@@ -46,6 +47,13 @@ func main() {
 	}
 	defer db.Close()
 
+	// 初始化缓存系统
+	cacheFactory := cache.NewCacheFactory(log)
+	cacheInstance := cacheFactory.CreateCacheWithFallback(&cfg.Cache)
+	defer cacheInstance.Close()
+
+	log.Info("缓存系统初始化完成", zap.String("type", cfg.Cache.Type))
+
 	// 初始化路由
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
@@ -56,7 +64,7 @@ func main() {
 	router.Use(api.CORSMiddleware())
 
 	// 注册路由
-	api.RegisterRoutes(router, db, log)
+	api.RegisterRoutes(router, db, log, cfg, cacheInstance)
 
 	// 创建HTTP服务器
 	srv := &http.Server{
