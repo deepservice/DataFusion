@@ -168,6 +168,17 @@ npm start
 # 默认账户: admin / admin123
 ```
 
+**生产部署**:
+```bash
+# 使用 deploy.sh 一键部署 Web 前端
+./deploy.sh web
+
+# 或手动部署
+cd web
+docker build -t datafusion-web:latest .
+docker run -d -p 80:80 datafusion-web:latest
+```
+
 ## 项目结构
 
 ```
@@ -632,15 +643,21 @@ go build -o bin/worker ./cmd/worker
 
 ### 方式 3: 完整系统部署
 ```bash
-# 1. 部署控制面
-./deploy-api-server.sh
+# 使用 deploy.sh 一键部署所有组件
+./deploy.sh all
 
-# 2. 部署 Worker
-./deploy-k8s-worker.sh
+# 或分别部署各组件
+./deploy.sh api-server  # 部署 API Server
+./deploy.sh worker      # 部署 Worker
+./deploy.sh web         # 部署 Web 前端
 
-# 3. 验证部署
+# 验证部署
 kubectl get pods -n datafusion
 kubectl get svc -n datafusion
+
+# 访问 Web 界面
+kubectl port-forward -n datafusion svc/web-service 3000:80
+# 浏览器访问 http://localhost:3000
 ```
 
 ## 🔍 监控端点

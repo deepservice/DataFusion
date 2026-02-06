@@ -83,6 +83,8 @@
 - [x] **用户登录** - JWT 认证
 - [x] **仪表板** - 系统概览
 - [x] **响应式设计** - 支持多设备
+- [x] **React + TypeScript** - 现代化前端技术栈
+- [x] **Ant Design** - 企业级 UI 组件库
 
 #### 管理界面
 - [x] **任务管理** - 任务 CRUD 操作
@@ -91,6 +93,12 @@
 - [x] **系统配置** - 配置管理界面
 - [x] **备份管理** - 备份操作界面
 - [x] **个人资料** - 用户信息管理
+
+#### 部署配置
+- [x] **Dockerfile** - 多阶段构建
+- [x] **Nginx 配置** - 反向代理和静态文件服务
+- [x] **K8S 部署配置** - Kubernetes Deployment
+- [x] **部署脚本** - deploy.sh 支持 Web 部署
 
 ### 1.4 性能优化
 
@@ -164,9 +172,11 @@
 - [x] **PostgreSQL** - StatefulSet 部署
 - [x] **API Server** - Deployment 部署
 - [x] **Worker** - Deployment 部署
+- [x] **Web 前端** - Deployment 部署
 - [x] **Service** - 服务暴露
 - [x] **ConfigMap** - 配置管理
 - [x] **Secret** - 敏感信息管理
+- [x] **部署脚本** - deploy.sh 一键部署
 
 ### 4.3 监控系统
 - [x] **Prometheus** - 指标采集

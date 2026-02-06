@@ -21,7 +21,8 @@ show_help() {
     echo "组件:"
     echo "  api-server    部署 API Server"
     echo "  worker        部署 Worker"
-    echo "  all           部署完整系统（API Server + Worker）"
+    echo "  web           部署 Web 前端"
+    echo "  all           部署完整系统（API Server + Worker + Web）"
     echo ""
     echo "选项:"
     echo "  -h, --help    显示帮助信息"
@@ -31,6 +32,7 @@ show_help() {
     echo "  $0 all                # 部署完整系统"
     echo "  $0 api-server         # 只部署 API Server"
     echo "  $0 worker             # 只部署 Worker"
+    echo "  $0 web                # 只部署 Web 前端"
     echo "  $0 --clean all        # 清理后部署完整系统"
 }
 
@@ -50,6 +52,42 @@ check_dependencies() {
     
     echo -e "${GREEN}✅ 依赖检查通过${NC}"
     echo ""
+}
+
+# 检测 Kubernetes 环境类型
+detect_k8s_env() {
+    if kubectl config current-context | grep -q "kind"; then
+        echo "kind"
+    elif kubectl config current-context | grep -q "minikube"; then
+        echo "minikube"
+    else
+        echo "other"
+    fi
+}
+
+# 加载镜像到 Kubernetes 集群
+load_image_to_cluster() {
+    local IMAGE_NAME=$1
+    local K8S_ENV=$(detect_k8s_env)
+    
+    echo -e "${YELLOW}检测到 Kubernetes 环境: ${K8S_ENV}${NC}"
+    
+    case $K8S_ENV in
+        kind)
+            echo -e "${YELLOW}加载镜像到 kind 集群...${NC}"
+            kind load docker-image "$IMAGE_NAME"
+            echo -e "${GREEN}✅ 镜像已加载到 kind 集群${NC}"
+            ;;
+        minikube)
+            echo -e "${YELLOW}加载镜像到 minikube...${NC}"
+            minikube image load "$IMAGE_NAME"
+            echo -e "${GREEN}✅ 镜像已加载到 minikube${NC}"
+            ;;
+        *)
+            echo -e "${YELLOW}⚠️  非 kind/minikube 环境，跳过镜像加载${NC}"
+            echo -e "${YELLOW}   如需使用本地镜像，请手动推送到镜像仓库${NC}"
+            ;;
+    esac
 }
 
 # 清理资源
@@ -86,6 +124,9 @@ deploy_api_server() {
     docker build -f Dockerfile.api-server -t datafusion/api-server:latest .
     echo -e "${GREEN}✅ API Server 镜像构建完成${NC}"
     
+    # 加载镜像到集群
+    load_image_to_cluster "datafusion/api-server:latest"
+    
     echo -e "${YELLOW}部署 API Server...${NC}"
     kubectl apply -f k8s/api-server-deployment.yaml
     
@@ -101,6 +142,9 @@ deploy_worker() {
     docker build -t datafusion-worker:latest .
     echo -e "${GREEN}✅ Worker 镜像构建完成${NC}"
     
+    # 加载镜像到集群
+    load_image_to_cluster "datafusion-worker:latest"
+    
     echo -e "${YELLOW}部署 Worker...${NC}"
     kubectl apply -f k8s/worker-config.yaml
     kubectl apply -f k8s/worker.yaml
@@ -108,6 +152,24 @@ deploy_worker() {
     echo -e "${YELLOW}等待 Worker 启动...${NC}"
     kubectl wait --for=condition=ready pod -l app=datafusion-worker -n datafusion --timeout=120s
     echo -e "${GREEN}✅ Worker 部署成功${NC}"
+    echo ""
+}
+
+# 部署 Web 前端
+deploy_web() {
+    echo -e "${YELLOW}构建 Web 前端镜像...${NC}"
+    docker build -t datafusion/web:latest ./web
+    echo -e "${GREEN}✅ Web 前端镜像构建完成${NC}"
+    
+    # 加载镜像到集群
+    load_image_to_cluster "datafusion/web:latest"
+    
+    echo -e "${YELLOW}部署 Web 前端...${NC}"
+    kubectl apply -f k8s/web-deployment.yaml
+    
+    echo -e "${YELLOW}等待 Web 前端启动...${NC}"
+    kubectl wait --for=condition=ready pod -l app=datafusion-web -n datafusion --timeout=120s
+    echo -e "${GREEN}✅ Web 前端部署成功${NC}"
     echo ""
 }
 
@@ -140,6 +202,15 @@ show_access_info() {
     echo "=========================================="
     echo ""
     
+    if [[ "$DEPLOY_WEB" == "true" ]]; then
+        echo "🌐 Web 管理界面:"
+        echo "  内部访问: http://datafusion-web-service.datafusion.svc.cluster.local"
+        echo "  端口转发: kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80"
+        echo "  然后访问: http://localhost:3000"
+        echo "  默认账户: admin / admin123"
+        echo ""
+    fi
+    
     if [[ "$DEPLOY_API_SERVER" == "true" ]]; then
         echo "🔗 API Server:"
         echo "  内部访问: http://api-server-service.datafusion.svc.cluster.local:8080"
@@ -149,6 +220,9 @@ show_access_info() {
     fi
     
     echo "📝 常用命令:"
+    if [[ "$DEPLOY_WEB" == "true" ]]; then
+        echo "  查看 Web 日志: kubectl logs -f -l app=datafusion-web -n datafusion"
+    fi
     echo "  查看 Worker 日志: kubectl logs -f -l app=datafusion-worker -n datafusion"
     echo "  查看 API Server 日志: kubectl logs -f -l app=api-server -n datafusion"
     echo "  查看 PostgreSQL 日志: kubectl logs -f -l app=postgresql -n datafusion"
@@ -183,6 +257,7 @@ main() {
     local CLEAN=false
     local DEPLOY_API_SERVER=false
     local DEPLOY_WORKER=false
+    local DEPLOY_WEB=false
     
     # 解析参数
     while [[ $# -gt 0 ]]; do
@@ -203,9 +278,14 @@ main() {
                 DEPLOY_WORKER=true
                 shift
                 ;;
+            web)
+                DEPLOY_WEB=true
+                shift
+                ;;
             all)
                 DEPLOY_API_SERVER=true
                 DEPLOY_WORKER=true
+                DEPLOY_WEB=true
                 shift
                 ;;
             *)
@@ -217,7 +297,7 @@ main() {
     done
     
     # 检查是否指定了组件
-    if [[ "$DEPLOY_API_SERVER" == "false" && "$DEPLOY_WORKER" == "false" ]]; then
+    if [[ "$DEPLOY_API_SERVER" == "false" && "$DEPLOY_WORKER" == "false" && "$DEPLOY_WEB" == "false" ]]; then
         echo -e "${RED}请指定要部署的组件${NC}"
         show_help
         exit 1
@@ -252,6 +332,11 @@ main() {
     # 部署 Worker
     if [[ "$DEPLOY_WORKER" == "true" ]]; then
         deploy_worker
+    fi
+    
+    # 部署 Web 前端
+    if [[ "$DEPLOY_WEB" == "true" ]]; then
+        deploy_web
     fi
     
     # 显示状态

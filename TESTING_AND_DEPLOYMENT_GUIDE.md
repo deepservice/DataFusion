@@ -647,7 +647,74 @@ kubectl get pods -n datafusion -l app=datafusion-worker
 kubectl logs -n datafusion -l app=datafusion-worker --tail=50 -f
 ```
 
-### 4.5 部署监控系统
+### 4.5 部署 Web 前端
+
+#### 4.5.1 构建 Web 镜像
+
+```bash
+# 构建 Web 前端镜像
+cd web
+docker build -t datafusion-web:v2.0.0 .
+
+# 推送到镜像仓库
+docker tag datafusion-web:v2.0.0 your-registry/datafusion-web:v2.0.0
+docker push your-registry/datafusion-web:v2.0.0
+cd ..
+```
+
+#### 4.5.2 部署 Web 前端
+
+```bash
+# 部署 Web 前端
+kubectl apply -f k8s/web-deployment.yaml
+
+# 查看 Web 前端状态
+kubectl get pods -n datafusion -l app=datafusion-web
+
+# 查看 Web 前端日志
+kubectl logs -n datafusion -l app=datafusion-web --tail=50
+```
+
+#### 4.5.3 配置 Web 访问
+
+```bash
+# 方式1: 端口转发（开发/测试）
+kubectl port-forward -n datafusion svc/web-service 3000:80
+
+# 方式2: NodePort（测试环境）
+kubectl patch svc web-service -n datafusion -p '{"spec":{"type":"NodePort"}}'
+kubectl get svc web-service -n datafusion
+
+# 方式3: Ingress（生产环境）
+# 创建 Ingress 配置
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: datafusion-web-ingress
+  namespace: datafusion
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: datafusion.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-service
+            port:
+              number: 80
+EOF
+
+# 访问 Web 界面
+# 浏览器访问 http://localhost:3000 (端口转发)
+# 或 http://datafusion.example.com (Ingress)
+```
+
+### 4.6 部署监控系统
 
 #### 4.5.1 部署 Prometheus
 
@@ -679,7 +746,7 @@ kubectl port-forward -n datafusion-monitor \
 # 密码: (上面获取的密码)
 ```
 
-#### 4.5.3 导入 Grafana Dashboard
+#### 4.6.3 导入 Grafana Dashboard
 
 ```bash
 # 导入预定义的 Dashboard
@@ -722,7 +789,25 @@ curl -X POST https://$API_URL/api/v1/auth/login \
   -d '{"username":"admin","password":"admin123"}'
 ```
 
-#### 5.2.2 Worker 功能测试
+#### 5.2.2 Web 界面测试
+
+```bash
+# 端口转发 Web 服务
+kubectl port-forward -n datafusion svc/web-service 3000:80 &
+
+# 浏览器访问 http://localhost:3000
+# 使用默认账户登录: admin / admin123
+
+# 功能验证清单:
+# - [ ] 能够成功登录
+# - [ ] 仪表板显示正常
+# - [ ] 任务管理功能正常
+# - [ ] 数据源管理功能正常
+# - [ ] 用户管理功能正常
+# - [ ] 系统配置功能正常
+```
+
+#### 5.2.3 Worker 功能测试
 
 ```bash
 # 插入测试任务
@@ -879,7 +964,44 @@ kubectl exec -n datafusion $POSTGRES_POD -- \
 - 启用 Redis 缓存
 - 调整资源限制
 
-### 6.5 数据丢失
+### 6.5 Web 界面无法访问
+
+**症状**: 无法访问 Web 界面或页面加载失败
+
+**排查步骤**:
+```bash
+# 1. 检查 Web Pod 状态
+kubectl get pods -n datafusion -l app=datafusion-web
+
+# 2. 查看 Web Pod 日志
+kubectl logs -n datafusion -l app=datafusion-web --tail=100
+
+# 3. 检查 Service
+kubectl get svc -n datafusion web-service
+
+# 4. 测试 Service 连接
+kubectl run -n datafusion test-web --image=curlimages/curl --rm -it --restart=Never -- \
+  curl http://web-service:80
+
+# 5. 检查 Nginx 配置
+kubectl exec -n datafusion -it \
+  $(kubectl get pod -n datafusion -l app=datafusion-web -o jsonpath='{.items[0].metadata.name}') \
+  -- cat /etc/nginx/nginx.conf
+```
+
+**常见原因**:
+- Web Pod 未就绪
+- Service 配置错误
+- Nginx 配置问题
+- API Server 连接失败
+
+**解决方案**:
+- 检查 Web Pod 日志
+- 验证 Service 端口配置
+- 确认 API Server 地址正确
+- 检查网络策略
+
+### 6.6 数据丢失
 
 **症状**: 采集的数据未保存或丢失
 

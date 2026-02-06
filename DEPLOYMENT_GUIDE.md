@@ -13,6 +13,7 @@
 4. [本地开发部署](#4-本地开发部署)
 5. [验证部署](#5-验证部署)
 6. [常见问题](#6-常见问题)
+7. [kind 环境特别说明](#7-kind-环境特别说明)
 
 ---
 
@@ -57,12 +58,22 @@ kubectl cluster-info
 kubectl auth can-i create deployments --namespace=datafusion
 ```
 
+**支持的 Kubernetes 环境**:
+- ✅ **kind** - 自动检测并使用 `kind load docker-image` 加载镜像
+- ✅ **minikube** - 自动检测并使用 `minikube image load` 加载镜像
+- ✅ **其他 K8S 集群** - 需要手动推送镜像到镜像仓库
+
+**kind 环境说明**:
+- deploy.sh 会自动检测 kind 环境
+- 构建镜像后会自动使用 `kind load docker-image` 加载到集群
+- 无需手动导入镜像或配置镜像仓库
+
 ### 2.3 快速部署
 
 #### 方式 1: 部署完整系统（推荐）
 
 ```bash
-# 部署 API Server + Worker + PostgreSQL
+# 部署 API Server + Worker + PostgreSQL + Web 前端
 ./deploy.sh all
 ```
 
@@ -74,22 +85,24 @@ kubectl auth can-i create deployments --namespace=datafusion
 5. ✅ 部署 API Server
 6. ✅ 构建 Worker 镜像
 7. ✅ 部署 Worker
-8. ✅ 等待所有 Pod 就绪
-9. ✅ 执行健康检查
-10. ✅ 显示访问信息
+8. ✅ 构建 Web 前端镜像
+9. ✅ 部署 Web 前端
+10. ✅ 等待所有 Pod 就绪
+11. ✅ 执行健康检查
+12. ✅ 显示访问信息
 
 **预计时间**: 5-10 分钟
 
 #### 方式 2: 只部署 API Server
 
 ```bash
-# 只部署 API Server（不包含 Worker）
+# 只部署 API Server（不包含 Worker 和 Web）
 ./deploy.sh api-server
 ```
 
 适用场景：
 - 只需要 API 服务
-- Worker 单独部署
+- Worker 和 Web 单独部署
 - 测试 API 功能
 
 #### 方式 3: 只部署 Worker
@@ -104,7 +117,19 @@ kubectl auth can-i create deployments --namespace=datafusion
 - 扩展 Worker 实例
 - 测试 Worker 功能
 
-#### 方式 4: 清理后重新部署
+#### 方式 4: 只部署 Web 前端
+
+```bash
+# 只部署 Web 前端
+./deploy.sh web
+```
+
+适用场景：
+- API Server 已部署
+- 只更新前端
+- 测试前端功能
+
+#### 方式 5: 清理后重新部署
 
 ```bash
 # 清理现有资源后重新部署
@@ -207,8 +232,12 @@ postgresql            ClusterIP   10.96.xxx.xxx   <none>        5432/TCP   3m
 kubectl get pods -n datafusion
 
 # 预期输出: 所有 Pod 状态为 Running
+# - api-server-xxx
+# - datafusion-worker-xxx
+# - datafusion-web-xxx (如果部署了 Web)
+# - postgresql-xxx
 
-# 2. 端口转发
+# 2. 端口转发 API Server
 kubectl port-forward -n datafusion svc/api-server-service 8081:8080 &
 
 # 3. 测试 API
@@ -216,7 +245,14 @@ curl http://localhost:8081/healthz
 
 # 预期输出: {"status":"ok"}
 
-# 4. 查看 Worker 日志
+# 4. 端口转发 Web 前端（如果部署了）
+kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80 &
+
+# 5. 访问 Web 界面
+# 打开浏览器访问: http://localhost:3000
+# 默认账户: admin / admin123
+
+# 6. 查看 Worker 日志
 kubectl logs -f -l app=datafusion-worker -n datafusion
 
 # 预期看到: Worker 启动日志和任务轮询日志
@@ -277,7 +313,7 @@ kubectl get pods -n datafusion -l app=postgresql
 
 ### 3.4 步骤 3: 构建 Docker 镜像
 
-#### 方式 A: 本地构建（推荐用于开发）
+#### 方式 A: 本地构建（kind/minikube 环境）
 
 ```bash
 # 1. 构建 API Server 镜像
@@ -286,10 +322,27 @@ docker build -f Dockerfile.api-server -t datafusion/api-server:latest .
 # 2. 构建 Worker 镜像
 docker build -t datafusion-worker:latest .
 
-# 3. 如果使用 Minikube，加载镜像
+# 3. 构建 Web 前端镜像
+cd web
+docker build -t datafusion/web:latest .
+cd ..
+
+# 4. 加载镜像到集群
+# 如果使用 kind:
+kind load docker-image datafusion/api-server:latest
+kind load docker-image datafusion-worker:latest
+kind load docker-image datafusion/web:latest
+
+# 如果使用 minikube:
 minikube image load datafusion/api-server:latest
 minikube image load datafusion-worker:latest
+minikube image load datafusion/web:latest
 ```
+
+**kind 环境说明**:
+- kind 使用 containerd 作为容器运行时
+- 需要使用 `kind load docker-image` 将 Docker 镜像导入到 kind 集群
+- 镜像导入后，Pod 的 `imagePullPolicy` 应设置为 `IfNotPresent` 或 `Never`
 
 #### 方式 B: 推送到镜像仓库（推荐用于生产）
 
@@ -346,16 +399,62 @@ kubectl wait --for=condition=ready pod \
 kubectl get pods -n datafusion -l app=datafusion-worker
 ```
 
-### 3.7 步骤 6: 配置访问
+### 3.7 步骤 6: 部署 Web 前端（可选）
+
+#### 构建 Web 前端镜像
+
+```bash
+# 1. 进入 web 目录
+cd web
+
+# 2. 构建镜像
+docker build -t datafusion/web:latest .
+
+# 3. 加载镜像到集群
+# 如果使用 kind:
+kind load docker-image datafusion/web:latest
+
+# 如果使用 minikube:
+minikube image load datafusion/web:latest
+
+# 4. 返回项目根目录
+cd ..
+```
+
+#### 部署 Web 前端
+
+```bash
+# 1. 部署 Web 前端
+kubectl apply -f k8s/web-deployment.yaml
+
+# 2. 等待 Web 前端就绪
+kubectl wait --for=condition=ready pod \
+  -l app=datafusion-web \
+  -n datafusion \
+  --timeout=120s
+
+# 3. 验证
+kubectl get pods -n datafusion -l app=datafusion-web
+kubectl get svc -n datafusion datafusion-web-service
+```
+
+### 3.8 步骤 7: 配置访问
 
 #### 方式 A: 端口转发（开发/测试）
 
 ```bash
 # 转发 API Server 端口
-kubectl port-forward -n datafusion svc/api-server-service 8081:8080
+kubectl port-forward -n datafusion svc/api-server-service 8081:8080 &
 
 # 访问 API
 curl http://localhost:8081/healthz
+
+# 转发 Web 前端端口（如果部署了）
+kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80 &
+
+# 访问 Web 界面
+# 打开浏览器: http://localhost:3000
+# 默认账户: admin / admin123
 ```
 
 #### 方式 B: Ingress（生产）
@@ -422,6 +521,26 @@ psql -U postgres -d datafusion_data -f scripts/init_db.sql
 ./bin/worker -config config/worker.yaml
 ```
 
+### 4.3 启动 Web 前端（本地开发）
+
+```bash
+# 1. 进入 web 目录
+cd web
+
+# 2. 安装依赖（首次运行）
+npm install
+
+# 3. 启动开发服务器
+npm start
+
+# 4. 访问 Web 界面
+# 自动打开浏览器: http://localhost:3000
+# 默认账户: admin / admin123
+
+# 注意: 确保 API Server 已在 8080 端口运行
+# Web 前端会自动代理 API 请求到 http://localhost:8080
+```
+
 ---
 
 ## 5. 验证部署
@@ -454,7 +573,24 @@ curl -H "Authorization: Bearer $TOKEN" \
   http://localhost:8081/api/v1/stats
 ```
 
-### 5.3 Worker 验证
+### 5.3 Web 界面测试
+
+```bash
+# 1. 访问 Web 界面
+# 浏览器打开: http://localhost:3000
+
+# 2. 登录
+# 用户名: admin
+# 密码: admin123
+
+# 3. 验证功能
+# - 仪表板显示正常
+# - 任务管理功能可用
+# - 数据源管理功能可用
+# - 用户管理功能可用
+```
+
+### 5.4 Worker 验证
 
 ```bash
 # 1. 插入测试任务
@@ -599,6 +735,66 @@ kubectl exec -n datafusion -it \
   -- psql -U postgres -d datafusion_control -c "UPDATE collection_tasks SET next_run_time = NOW() WHERE id = 1;"
 ```
 
+### 6.6 Web 前端无法访问
+
+**问题**: 无法访问 Web 界面或页面显示错误
+
+**解决**:
+```bash
+# 1. 检查 Web Pod 状态
+kubectl get pods -n datafusion -l app=datafusion-web
+
+# 2. 查看 Web Pod 日志
+kubectl logs -n datafusion -l app=datafusion-web --tail=100
+
+# 3. 检查 Service
+kubectl get svc -n datafusion datafusion-web-service
+
+# 4. 测试 Service 连接
+kubectl run -n datafusion test-web --image=curlimages/curl --rm -it --restart=Never -- \
+  curl http://datafusion-web-service:80
+
+# 5. 重新端口转发
+kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80
+```
+
+**问题**: Web 界面无法连接到 API
+
+**解决**:
+```bash
+# 1. 检查 Nginx 配置中的 API 代理设置
+kubectl exec -n datafusion -it \
+  $(kubectl get pod -n datafusion -l app=datafusion-web -o jsonpath='{.items[0].metadata.name}') \
+  -- cat /etc/nginx/nginx.conf
+
+# 2. 确认 API Server Service 地址
+kubectl get svc -n datafusion api-server-service
+
+# 3. 测试从 Web Pod 到 API Server 的连接
+kubectl exec -n datafusion -it \
+  $(kubectl get pod -n datafusion -l app=datafusion-web -o jsonpath='{.items[0].metadata.name}') \
+  -- wget -O- http://api-server-service:8080/healthz
+```
+
+**问题**: 本地开发时 Web 前端无法启动
+
+**解决**:
+```bash
+# 1. 检查 Node.js 版本
+node --version  # 应该 >= 16
+
+# 2. 清理并重新安装依赖
+cd web
+rm -rf node_modules package-lock.json
+npm install
+
+# 3. 检查端口占用
+lsof -i :3000
+
+# 4. 使用其他端口
+PORT=3001 npm start
+```
+
 ---
 
 ## 7. 清理部署
@@ -606,10 +802,11 @@ kubectl exec -n datafusion -it \
 ### 7.1 清理 Kubernetes 部署
 
 ```bash
-# 方式 1: 删除命名空间（推荐）
+# 方式 1: 删除命名空间（推荐，会删除所有资源）
 kubectl delete namespace datafusion
 
 # 方式 2: 逐个删除资源
+kubectl delete -f k8s/web-deployment.yaml
 kubectl delete -f k8s/worker.yaml
 kubectl delete -f k8s/worker-config.yaml
 kubectl delete -f k8s/api-server-deployment.yaml
@@ -624,6 +821,9 @@ kubectl delete -f k8s/namespace.yaml
 # 停止进程
 pkill -f api-server
 pkill -f worker
+
+# 停止 Web 开发服务器（如果在运行）
+pkill -f "npm start"
 
 # 删除 Docker 容器
 docker stop datafusion-postgres
@@ -640,10 +840,217 @@ dropdb datafusion_data
 
 部署成功后，你可以：
 
-1. **查看 API 文档**: [docs/CONTROL_PLANE_API.md](docs/CONTROL_PLANE_API.md)
-2. **运行测试**: [TESTING_AND_DEPLOYMENT_GUIDE.md](TESTING_AND_DEPLOYMENT_GUIDE.md)
-3. **配置监控**: [k8s/monitoring/](k8s/monitoring/)
-4. **启动 Web 界面**: [web/README.md](web/README.md)
+1. **使用 Web 界面**: 访问 http://localhost:3000 进行可视化管理
+2. **查看 API 文档**: [docs/CONTROL_PLANE_API.md](docs/CONTROL_PLANE_API.md)
+3. **运行测试**: [TESTING_AND_DEPLOYMENT_GUIDE.md](TESTING_AND_DEPLOYMENT_GUIDE.md)
+4. **配置监控**: [k8s/monitoring/](k8s/monitoring/)
+5. **创建采集任务**: 通过 Web 界面或 API 创建数据采集任务
+
+---
+
+## 9. kind 环境特别说明
+
+### 9.1 kind 简介
+
+kind (Kubernetes IN Docker) 是一个使用 Docker 容器运行本地 Kubernetes 集群的工具，非常适合本地开发和测试。
+
+**kind 的特点**:
+- ✅ 使用 containerd 作为容器运行时
+- ✅ 轻量级，启动快速
+- ✅ 完全兼容 Kubernetes API
+- ✅ 支持多节点集群
+
+### 9.2 kind 环境下的镜像管理
+
+#### 问题说明
+
+在 kind 环境中，由于使用 containerd 作为容器运行时，而不是 Docker，因此：
+
+1. **Docker 构建的镜像不会自动在 kind 集群中可用**
+2. **需要手动将镜像从 Docker 导入到 kind 集群**
+3. **直接拉取远程镜像可能很慢或失败**
+
+#### 解决方案
+
+deploy.sh 脚本已经自动处理了这个问题：
+
+```bash
+# deploy.sh 会自动检测 kind 环境
+# 构建镜像后自动使用 kind load docker-image 加载
+./deploy.sh all
+```
+
+**自动化流程**:
+1. 检测当前 kubectl context 是否为 kind
+2. 使用 Docker 构建镜像
+3. 自动执行 `kind load docker-image <镜像名>`
+4. 部署到 Kubernetes
+
+### 9.3 手动加载镜像到 kind
+
+如果需要手动操作：
+
+```bash
+# 1. 构建镜像
+docker build -f Dockerfile.api-server -t datafusion/api-server:latest .
+docker build -t datafusion-worker:latest .
+docker build -t datafusion/web:latest ./web
+
+# 2. 加载镜像到 kind 集群
+kind load docker-image datafusion/api-server:latest
+kind load docker-image datafusion-worker:latest
+kind load docker-image datafusion/web:latest
+
+# 3. 验证镜像已加载
+docker exec -it <kind-node-name> crictl images | grep datafusion
+
+# 获取 kind 节点名称
+kubectl get nodes
+```
+
+### 9.4 kind 集群创建
+
+如果还没有 kind 集群：
+
+```bash
+# 1. 安装 kind
+# macOS
+brew install kind
+
+# Linux
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+chmod +x ./kind
+sudo mv ./kind /usr/local/bin/kind
+
+# 2. 创建集群
+kind create cluster --name datafusion
+
+# 3. 验证集群
+kubectl cluster-info --context kind-datafusion
+
+# 4. 设置当前 context
+kubectl config use-context kind-datafusion
+```
+
+### 9.5 kind 集群配置（高级）
+
+创建支持 Ingress 的 kind 集群：
+
+```bash
+# 创建配置文件
+cat <<EOF > kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 443
+    protocol: TCP
+EOF
+
+# 使用配置创建集群
+kind create cluster --name datafusion --config kind-config.yaml
+
+# 安装 Ingress Controller
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+```
+
+### 9.6 kind 环境常见问题
+
+#### 问题 1: ImagePullBackOff
+
+**原因**: 镜像未加载到 kind 集群
+
+**解决**:
+```bash
+# 检查镜像是否在 Docker 中
+docker images | grep datafusion
+
+# 加载镜像到 kind
+kind load docker-image datafusion/api-server:latest
+
+# 或使用 deploy.sh 自动处理
+./deploy.sh all
+```
+
+#### 问题 2: 镜像拉取策略
+
+**问题**: Pod 尝试从远程仓库拉取镜像
+
+**解决**: 确保 K8S 配置文件中的 `imagePullPolicy` 设置正确
+
+```yaml
+# k8s/api-server-deployment.yaml
+spec:
+  containers:
+  - name: api-server
+    image: datafusion/api-server:latest
+    imagePullPolicy: IfNotPresent  # 或 Never
+```
+
+#### 问题 3: 查看 kind 节点中的镜像
+
+```bash
+# 1. 获取 kind 节点名称
+kubectl get nodes
+
+# 2. 进入 kind 节点
+docker exec -it <node-name> bash
+
+# 3. 查看镜像（使用 crictl）
+crictl images
+
+# 或直接执行
+docker exec -it <node-name> crictl images | grep datafusion
+```
+
+#### 问题 4: 清理 kind 集群
+
+```bash
+# 删除集群
+kind delete cluster --name datafusion
+
+# 重新创建
+kind create cluster --name datafusion
+```
+
+### 9.7 kind vs minikube vs 生产环境
+
+| 特性 | kind | minikube | 生产环境 |
+|-----|------|----------|---------|
+| 容器运行时 | containerd | Docker/containerd | containerd/CRI-O |
+| 镜像加载 | `kind load docker-image` | `minikube image load` | 镜像仓库 |
+| 启动速度 | 快 | 中等 | N/A |
+| 资源占用 | 低 | 中等 | 高 |
+| 多节点支持 | ✅ | ✅ | ✅ |
+| 适用场景 | 本地开发/CI | 本地开发 | 生产部署 |
+
+### 9.8 kind 环境最佳实践
+
+1. **使用 deploy.sh**: 自动处理镜像加载
+2. **设置 imagePullPolicy**: 使用 `IfNotPresent` 或 `Never`
+3. **定期清理**: 删除不用的镜像和集群
+4. **使用标签**: 为镜像打标签便于管理
+5. **监控资源**: 注意 Docker Desktop 的资源限制
+
+```bash
+# 查看 kind 集群资源使用
+kubectl top nodes
+kubectl top pods -n datafusion
+
+# 清理未使用的镜像
+docker system prune -a
+```
 
 ---
 

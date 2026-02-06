@@ -1,0 +1,95 @@
+---
+# Web 前端 Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datafusion-web
+  namespace: datafusion
+  labels:
+    app: datafusion-web
+    component: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: datafusion-web
+  template:
+    metadata:
+      labels:
+        app: datafusion-web
+        component: frontend
+    spec:
+      containers:
+      - name: web
+        image: datafusion/web:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+          name: http
+          protocol: TCP
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+---
+# Web 前端 Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: datafusion-web-service
+  namespace: datafusion
+  labels:
+    app: datafusion-web
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: datafusion-web
+
+---
+# Web 前端 Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: datafusion-web-ingress
+  namespace: datafusion
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: datafusion.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: datafusion-web-service
+            port:
+              number: 80

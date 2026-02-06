@@ -286,6 +286,32 @@ docker rm -f datafusion-postgres
 curl http://localhost:8080/api/v1/stats/overview
 ```
 
+### 启动 Web 界面
+
+```bash
+# 进入 web 目录
+cd web
+
+# 安装依赖
+npm install
+
+# 启动开发服务器
+npm start
+
+# 访问 http://localhost:3000
+# 默认账户: admin / admin123
+```
+
+**生产部署**:
+```bash
+# 使用 deploy.sh 一键部署
+./deploy.sh web
+
+# 访问 Web 界面
+kubectl port-forward -n datafusion svc/web-service 3000:80
+# 浏览器访问 http://localhost:3000
+```
+
 ---
 
 ## 10 分钟完整体验
@@ -425,35 +451,42 @@ docker rm postgres
 ### 一键部署
 
 ```bash
-# 1. 部署控制面
-./deploy-api-server.sh
+# 1. 部署所有组件（推荐）
+./deploy.sh all
 
-# 2. 部署 Worker
-./deploy-k8s-worker.sh
+# 或分别部署
+./deploy.sh api-server  # 部署 API Server
+./deploy.sh worker      # 部署 Worker
+./deploy.sh web         # 部署 Web 前端
 
-# 3. 查看状态
+# 2. 查看状态
 kubectl get pods -n datafusion
 kubectl get svc -n datafusion
 
-# 4. 端口转发
+# 3. 端口转发
 kubectl port-forward -n datafusion svc/api-server-service 8080:8080 &
+kubectl port-forward -n datafusion svc/web-service 3000:80 &
 
-# 5. 测试 API
+# 4. 测试服务
 curl http://localhost:8080/healthz
+# 浏览器访问 http://localhost:3000
 ```
 
 ### 访问服务
 
 ```bash
-# 方式 1: 端口转发
+# 方式 1: 端口转发（开发/测试）
 kubectl port-forward -n datafusion svc/api-server-service 8080:8080
+kubectl port-forward -n datafusion svc/web-service 3000:80
 
-# 方式 2: Ingress (需要配置 DNS)
-# 访问 http://api.datafusion.local
+# 方式 2: Ingress (生产环境，需要配置 DNS)
+# API: http://api.datafusion.local
+# Web: http://datafusion.local
 
-# 方式 3: NodePort (修改 Service 类型)
+# 方式 3: NodePort (测试环境)
 kubectl patch svc api-server-service -n datafusion -p '{"spec":{"type":"NodePort"}}'
-kubectl get svc api-server-service -n datafusion
+kubectl patch svc web-service -n datafusion -p '{"spec":{"type":"NodePort"}}'
+kubectl get svc -n datafusion
 ```
 
 ---
