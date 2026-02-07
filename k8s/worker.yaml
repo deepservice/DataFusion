@@ -20,7 +20,7 @@ spec:
       containers:
       - name: worker
         image: datafusion-worker:latest
-        imagePullPolicy: Always  # 改为 Always，强制重新拉取镜像
+        imagePullPolicy: IfNotPresent  # 优先使用本地镜像，若本地没有则拉取
         env:
         - name: POD_NAME
           valueFrom:
