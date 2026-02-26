@@ -60,6 +60,7 @@ export interface Task {
 export interface TaskExecution {
   id: number;
   task_id: number;
+  task_name?: string;
   worker_pod: string;
   status: string;
   start_time: string;

@@ -80,7 +80,7 @@ get_auth_token() {
     # 尝试登录获取令牌
     local login_response=$(curl -s -X POST "${API_SERVER_URL}/api/v1/auth/login" \
         -H "Content-Type: application/json" \
-        -d '{"username":"admin","password":"admin123"}' || echo "")
+        -d '{"username":"admin","password":"Admin@123"}' || echo "")
     
     if [ -n "$login_response" ] && command -v jq &> /dev/null; then
         AUTH_TOKEN=$(echo "$login_response" | jq -r '.data.token // empty')

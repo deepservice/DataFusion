@@ -2,19 +2,44 @@ package api
 
 import (
 	"database/sql"
+	"fmt"
 
 	"github.com/datafusion/worker/internal/auth"
 	"github.com/datafusion/worker/internal/cache"
 	"github.com/datafusion/worker/internal/config"
 	"github.com/datafusion/worker/internal/logger"
 	"github.com/gin-gonic/gin"
+	_ "github.com/lib/pq"
 )
+
+// connectDataDB 连接数据存储数据库（datafusion_data）
+func connectDataDB(cfg config.PostgreSQLConfig, log *logger.Logger) *sql.DB {
+	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.User, cfg.Password, "datafusion_data", cfg.SSLMode)
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		log.Warn("无法连接数据存储数据库 datafusion_data: " + err.Error())
+		return nil
+	}
+	if err := db.Ping(); err != nil {
+		log.Warn("数据存储数据库 datafusion_data 连接测试失败: " + err.Error())
+		return nil
+	}
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	log.Info("数据存储数据库 datafusion_data 连接成功")
+	return db
+}
 
 // RegisterRoutes 注册所有API路由
 func RegisterRoutes(r *gin.Engine, db *sql.DB, log *logger.Logger, cfg *config.APIServerConfig, cacheInstance cache.Cache) {
 	// 创建JWT管理器和RBAC
 	jwtManager := auth.NewJWTManager(cfg.Auth.JWT.SecretKey, cfg.Auth.GetJWTDuration())
 	rbac := auth.NewRBAC()
+
+	// 连接数据存储数据库（用于数据预览）
+	dataDB := connectDataDB(cfg.Database.PostgreSQL, log)
 
 	// 健康检查（无需认证）
 	r.GET("/healthz", HealthCheck)
@@ -70,9 +95,10 @@ func RegisterRoutes(r *gin.Engine, db *sql.DB, log *logger.Logger, cfg *config.A
 			tasks := authenticated.Group("/tasks")
 			tasks.Use(auth.RequirePermission(rbac, "tasks", "read"))
 			{
-				taskHandler := NewTaskHandler(db, log)
+				taskHandler := NewTaskHandler(db, dataDB, log)
 				tasks.GET("", taskHandler.List)
 				tasks.GET("/:id", taskHandler.Get)
+				tasks.GET("/:id/data", taskHandler.PreviewData)
 
 				// 写操作需要写权限
 				writeGroup := tasks.Group("")
@@ -82,6 +108,7 @@ func RegisterRoutes(r *gin.Engine, db *sql.DB, log *logger.Logger, cfg *config.A
 					writeGroup.PUT("/:id", taskHandler.Update)
 					writeGroup.POST("/:id/run", taskHandler.Run)
 					writeGroup.POST("/:id/stop", taskHandler.Stop)
+					writeGroup.POST("/:id/execute", taskHandler.Execute)
 				}
 
 				// 删除操作需要删除权限
@@ -107,6 +134,7 @@ func RegisterRoutes(r *gin.Engine, db *sql.DB, log *logger.Logger, cfg *config.A
 					writeGroup.POST("", dsHandler.Create)
 					writeGroup.PUT("/:id", dsHandler.Update)
 					writeGroup.POST("/:id/test", dsHandler.TestConnection)
+				writeGroup.POST("/:id/preview", dsHandler.PreviewPageStructure)
 				}
 
 				// 删除操作需要删除权限

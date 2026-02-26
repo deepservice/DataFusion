@@ -4,26 +4,77 @@ metadata:
   name: postgres-init-scripts
   namespace: datafusion
 data:
-  01-init-databases.sql: |
-    -- 创建数据库
-    CREATE DATABASE datafusion_data;
+  00-create-databases.sql: |
+    -- 创建 datafusion_data 数据库 (同一用户)
+    -- PostgreSQL 不支持 CREATE DATABASE IF NOT EXISTS，需要使用 DO 块
+    DO
+    $$
+    BEGIN
+       IF NOT EXISTS (SELECT FROM pg_database WHERE datname = 'datafusion_data') THEN
+          CREATE DATABASE datafusion_data;
+       END IF;
+    END
+    $$;
     
-  02-init-tables.sql: |
-    -- 连接到 datafusion_control 数据库
-    \c datafusion_control;
+  01-init-tables.sql: |
+    -- 该脚本在 datafusion_control 数据库中执行 (在 Deployment 中指定)
+    -- 创建用户表
+    CREATE TABLE IF NOT EXISTS users (
+        id BIGSERIAL PRIMARY KEY,
+        username VARCHAR(100) NOT NULL UNIQUE,
+        password_hash VARCHAR(255),
+        email VARCHAR(255),
+        role VARCHAR(50) DEFAULT 'user',
+        auth_type VARCHAR(50) DEFAULT 'local',
+        oauth_provider VARCHAR(50),
+        oauth_id VARCHAR(255),
+        status VARCHAR(50) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+    
+    -- 创建数据源表
+    CREATE TABLE IF NOT EXISTS data_sources (
+        id BIGSERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        type VARCHAR(50) NOT NULL,
+        config JSONB NOT NULL,
+        description TEXT,
+        status VARCHAR(50) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_data_sources_type ON data_sources(type);
+    
+    -- 创建清洗规则表
+    CREATE TABLE IF NOT EXISTS cleaning_rules (
+        id BIGSERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        description TEXT,
+        rule_type VARCHAR(50) NOT NULL,
+        config JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
     
     -- 创建任务配置表
     CREATE TABLE IF NOT EXISTS collection_tasks (
         id BIGSERIAL PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        description TEXT,
         type VARCHAR(50) NOT NULL,
-        status VARCHAR(50) DEFAULT 'enabled',
+        data_source_id BIGINT REFERENCES data_sources(id) ON DELETE CASCADE,
         cron VARCHAR(100),
         next_run_time TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'enabled',
         replicas INT DEFAULT 1,
         execution_timeout INT DEFAULT 3600,
         max_retries INT DEFAULT 3,
-        config TEXT NOT NULL,
+        config JSONB,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
     );
@@ -31,66 +82,234 @@ data:
     -- 创建任务执行记录表
     CREATE TABLE IF NOT EXISTS task_executions (
         id BIGSERIAL PRIMARY KEY,
-        task_id BIGINT REFERENCES collection_tasks(id),
+        task_id BIGINT REFERENCES collection_tasks(id) ON DELETE CASCADE,
         worker_pod VARCHAR(255),
         status VARCHAR(50),
         start_time TIMESTAMP,
         end_time TIMESTAMP,
         records_collected INT DEFAULT 0,
         error_message TEXT,
-        retry_count INT DEFAULT 0
+        retry_count INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    
+    -- 创建任务-清洗规则关联表
+    CREATE TABLE IF NOT EXISTS task_cleaning_rules (
+        id BIGSERIAL PRIMARY KEY,
+        task_id BIGINT REFERENCES collection_tasks(id) ON DELETE CASCADE,
+        cleaning_rule_id BIGINT REFERENCES cleaning_rules(id) ON DELETE CASCADE,
+        field_name VARCHAR(255),
+        order_index INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(task_id, cleaning_rule_id, field_name)
+    );
+    
+    -- 创建API密钥表
+    CREATE TABLE IF NOT EXISTS api_keys (
+        id BIGSERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+        key_hash VARCHAR(255) NOT NULL UNIQUE,
+        name VARCHAR(255),
+        description TEXT,
+        permissions JSONB,
+        expires_at TIMESTAMP,
+        last_used_at TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+    
+    -- 创建系统配置表
+    CREATE TABLE IF NOT EXISTS system_configs (
+        id BIGSERIAL PRIMARY KEY,
+        key VARCHAR(255) NOT NULL UNIQUE,
+        value JSONB NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
     );
     
     -- 创建索引
     CREATE INDEX IF NOT EXISTS idx_next_run_time ON collection_tasks(next_run_time);
+    CREATE INDEX IF NOT EXISTS idx_collection_tasks_status ON collection_tasks(status);
+    CREATE INDEX IF NOT EXISTS idx_task_executions_status ON task_executions(task_id, status);
+    CREATE INDEX IF NOT EXISTS idx_task_executions_start_time ON task_executions(start_time DESC);
+    
+  02-insert-test-data.sql: |
+    -- 插入默认管理员用户
+    -- 密码: Admin@123
+    -- 注意: 此密码哈希生成方式: bcrypt.hashpw(b'Admin@123', bcrypt.gensalt(rounds=10))
+    INSERT INTO users (username, password_hash, email, role, auth_type, status)
+    VALUES ('admin', '$2b$10$mjFXgjXTcdPx5WdmWv8GMuPWUfz4JB5d84eVznTE9IwvsyckcEsAK', 'admin@datafusion.io', 'admin', 'local', 'active')
+    ON CONFLICT (username) DO NOTHING;
+    
+    -- 插入示例数据源
+    INSERT INTO data_sources (name, type, config, description, status)
+    VALUES 
+        ('示例网页数据源', 'web', '{"url": "https://example.com", "method": "GET"}', '示例网页数据源', 'active'),
+        ('示例API数据源', 'api', '{"url": "https://api.example.com/data", "method": "GET"}', '示例API数据源', 'active')
+    ON CONFLICT (name) DO NOTHING;
+    
+    -- 插入示例清洗规则
+    INSERT INTO cleaning_rules (name, description, rule_type, config)
+    VALUES 
+        ('去除空白', '去除字符串首尾空白', 'trim', '{}'),
+        ('移除HTML标签', '移除HTML标签', 'remove_html', '{}')
+    ON CONFLICT (name) DO NOTHING;
+    
+  03-create-data-tables.sql: |
+    -- 该脚本在 datafusion_data 数据库中执行 (需要在 PostgreSQL deployment 中配置)
+    -- 创建测试数据表
+    CREATE TABLE IF NOT EXISTS test_posts (
+        id INT PRIMARY KEY,
+        title VARCHAR(500),
+        body TEXT,
+        user_id INT,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS users (
+        id BIGSERIAL PRIMARY KEY,
+        username VARCHAR(100) NOT NULL UNIQUE,
+        password_hash VARCHAR(255),
+        email VARCHAR(255),
+        role VARCHAR(50) DEFAULT 'user',
+        auth_type VARCHAR(50) DEFAULT 'local',
+        oauth_provider VARCHAR(50),
+        oauth_id VARCHAR(255),
+        status VARCHAR(50) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+    
+    -- 创建数据源表
+    CREATE TABLE IF NOT EXISTS data_sources (
+        id BIGSERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        type VARCHAR(50) NOT NULL,
+        config JSONB NOT NULL,
+        description TEXT,
+        status VARCHAR(50) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_data_sources_type ON data_sources(type);
+    
+    -- 创建清洗规则表
+    CREATE TABLE IF NOT EXISTS cleaning_rules (
+        id BIGSERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        description TEXT,
+        rule_type VARCHAR(50) NOT NULL,
+        config JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+    
+    -- 创建任务配置表
+    CREATE TABLE IF NOT EXISTS collection_tasks (
+        id BIGSERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        description TEXT,
+        type VARCHAR(50) NOT NULL,
+        data_source_id BIGINT REFERENCES data_sources(id) ON DELETE CASCADE,
+        cron VARCHAR(100),
+        next_run_time TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'enabled',
+        replicas INT DEFAULT 1,
+        execution_timeout INT DEFAULT 3600,
+        max_retries INT DEFAULT 3,
+        config JSONB,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+    
+    -- 创建任务执行记录表
+    CREATE TABLE IF NOT EXISTS task_executions (
+        id BIGSERIAL PRIMARY KEY,
+        task_id BIGINT REFERENCES collection_tasks(id) ON DELETE CASCADE,
+        worker_pod VARCHAR(255),
+        status VARCHAR(50),
+        start_time TIMESTAMP,
+        end_time TIMESTAMP,
+        records_collected INT DEFAULT 0,
+        error_message TEXT,
+        retry_count INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    
+    -- 创建任务-清洗规则关联表
+    CREATE TABLE IF NOT EXISTS task_cleaning_rules (
+        id BIGSERIAL PRIMARY KEY,
+        task_id BIGINT REFERENCES collection_tasks(id) ON DELETE CASCADE,
+        cleaning_rule_id BIGINT REFERENCES cleaning_rules(id) ON DELETE CASCADE,
+        field_name VARCHAR(255),
+        order_index INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(task_id, cleaning_rule_id, field_name)
+    );
+    
+    -- 创建API密钥表
+    CREATE TABLE IF NOT EXISTS api_keys (
+        id BIGSERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+        key_hash VARCHAR(255) NOT NULL UNIQUE,
+        name VARCHAR(255),
+        description TEXT,
+        permissions JSONB,
+        expires_at TIMESTAMP,
+        last_used_at TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+    
+    -- 创建系统配置表
+    CREATE TABLE IF NOT EXISTS system_configs (
+        id BIGSERIAL PRIMARY KEY,
+        key VARCHAR(255) NOT NULL UNIQUE,
+        value JSONB NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+    
+    -- 创建索引
+    CREATE INDEX IF NOT EXISTS idx_next_run_time ON collection_tasks(next_run_time);
+    CREATE INDEX IF NOT EXISTS idx_collection_tasks_status ON collection_tasks(status);
     CREATE INDEX IF NOT EXISTS idx_task_executions_status ON task_executions(task_id, status);
     CREATE INDEX IF NOT EXISTS idx_task_executions_start_time ON task_executions(start_time DESC);
     
   03-insert-test-task.sql: |
     \c datafusion_control;
     
-    -- 插入测试任务（API 采集，存储到 PostgreSQL）
-    INSERT INTO collection_tasks (name, type, status, cron, next_run_time, replicas, config)
-    VALUES (
-        'K8S测试-API采集',
-        'api',
-        'enabled',
-        '*/2 * * * *',
-        NOW(),
-        1,
-        '{
-            "data_source": {
-                "type": "api",
-                "url": "https://jsonplaceholder.typicode.com/posts?_limit=5",
-                "method": "GET",
-                "headers": {},
-                "selectors": {
-                    "id": "id",
-                    "title": "title",
-                    "body": "body",
-                    "userId": "userId"
-                }
-            },
-            "processor": {
-                "cleaning_rules": [
-                    {"field": "title", "type": "trim"},
-                    {"field": "body", "type": "trim"}
-                ],
-                "transform_rules": []
-            },
-            "storage": {
-                "target": "postgresql",
-                "database": "datafusion_data",
-                "table": "test_posts",
-                "mapping": {
-                    "id": "id",
-                    "title": "title",
-                    "body": "body",
-                    "userId": "user_id"
-                }
-            }
-        }'
-    );
+    -- 插入默认管理员用户
+    -- 密码: Admin@123
+    -- 注意: 此密码哈希生成方式: bcrypt.hashpw(b'Admin@123', bcrypt.gensalt(rounds=10))
+    INSERT INTO users (username, password_hash, email, role, auth_type, status)
+    VALUES ('admin', '$2b$10$mjFXgjXTcdPx5WdmWv8GMuPWUfz4JB5d84eVznTE9IwvsyckcEsAK', 'admin@datafusion.io', 'admin', 'local', 'active')
+    ON CONFLICT (username) DO NOTHING;
+    
+    -- 插入示例数据源
+    INSERT INTO data_sources (name, type, config, description, status)
+    VALUES 
+        ('示例网页数据源', 'web', '{"url": "https://example.com", "method": "GET"}', '示例网页数据源', 'active'),
+        ('示例API数据源', 'api', '{"url": "https://api.example.com/data", "method": "GET"}', '示例API数据源', 'active')
+    ON CONFLICT (name) DO NOTHING;
+    
+    -- 插入示例清洗规则
+    INSERT INTO cleaning_rules (name, description, rule_type, config)
+    VALUES 
+        ('去除空白', '去除字符串首尾空白', 'trim', '{}'),
+        ('移除HTML标签', '移除HTML标签', 'remove_html', '{}')
+    ON CONFLICT (name) DO NOTHING;
     
   04-create-data-tables.sql: |
     \c datafusion_data;

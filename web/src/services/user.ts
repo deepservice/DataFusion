@@ -1,5 +1,5 @@
 import { BaseAPI } from './api';
-import { User, PaginatedResponse, Role } from '@/types';
+import { User, PaginatedResponse, Role } from '../types';
 
 interface CreateUserRequest {
   username: string;

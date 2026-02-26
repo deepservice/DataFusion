@@ -22,9 +22,10 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   BellOutlined,
+  HistoryOutlined,
 } from '@ant-design/icons';
-import { authService } from '@/services/auth';
-import { User } from '@/types';
+import { authService } from '../../services/auth';
+import { User } from '../../types';
 
 const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
@@ -53,6 +54,11 @@ const MainLayout: React.FC = () => {
       key: '/tasks',
       icon: <ScheduleOutlined />,
       label: '任务管理',
+    },
+    {
+      key: '/executions',
+      icon: <HistoryOutlined />,
+      label: '执行历史',
     },
     {
       key: '/datasources',

@@ -5,6 +5,21 @@
 
 ---
 
+## ⚠️ 重要：默认账户信息
+
+部署完成后，使用以下默认账户登录：
+
+| 项目 | 值 |
+|------|-----|
+| **用户名** | `admin` |
+| **密码** | `Admin@123` |
+| **Web UI** | http://localhost:3000 |
+| **API** | http://localhost:8081 |
+
+> 💡 **首次登录后，请立即修改默认密码**
+
+---
+
 ## 📋 目录
 
 1. [部署方式概览](#1-部署方式概览)
@@ -250,7 +265,7 @@ kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80 &
 
 # 5. 访问 Web 界面
 # 打开浏览器访问: http://localhost:3000
-# 默认账户: admin / admin123
+# 默认账户: admin / Admin@123
 
 # 6. 查看 Worker 日志
 kubectl logs -f -l app=datafusion-worker -n datafusion
@@ -454,7 +469,7 @@ kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80 &
 
 # 访问 Web 界面
 # 打开浏览器: http://localhost:3000
-# 默认账户: admin / admin123
+# 默认账户: admin / Admin@123
 ```
 
 #### 方式 B: Ingress（生产）
@@ -535,7 +550,7 @@ npm start
 
 # 4. 访问 Web 界面
 # 自动打开浏览器: http://localhost:3000
-# 默认账户: admin / admin123
+# 默认账户: admin / Admin@123
 
 # 注意: 确保 API Server 已在 8080 端口运行
 # Web 前端会自动代理 API 请求到 http://localhost:8080
@@ -561,7 +576,7 @@ curl http://localhost:8081/healthz
 # 1. 登录获取 Token
 TOKEN=$(curl -X POST http://localhost:8081/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}' \
+  -d '{"username":"admin","password":"Admin@123"}' \
   | jq -r '.token')
 
 # 2. 获取任务列表
@@ -581,7 +596,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 # 2. 登录
 # 用户名: admin
-# 密码: admin123
+# 密码: Admin@123 （需要包含大小写字母、数字）
 
 # 3. 验证功能
 # - 仪表板显示正常

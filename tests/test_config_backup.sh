@@ -72,7 +72,7 @@ test_endpoint() {
 get_admin_token() {
     echo -e "\n${YELLOW}获取管理员Token...${NC}"
     
-    login_data='{"username":"admin","password":"admin123"}'
+    login_data='{"username":"admin","password":"Admin@123"}'
     login_response=$(curl -s -X POST \
         -H "Content-Type: application/json" \
         -d "$login_data" \

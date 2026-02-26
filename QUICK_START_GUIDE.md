@@ -299,7 +299,9 @@ npm install
 npm start
 
 # 访问 http://localhost:3000
-# 默认账户: admin / admin123
+# 默认账户:
+#   用户名: admin
+#   密码: Admin@123
 ```
 
 **生产部署**:
@@ -308,8 +310,11 @@ npm start
 ./deploy.sh web
 
 # 访问 Web 界面
-kubectl port-forward -n datafusion svc/web-service 3000:80
+kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80
 # 浏览器访问 http://localhost:3000
+# 默认账户:
+#   用户名: admin
+#   密码: Admin@123
 ```
 
 ---
@@ -375,12 +380,24 @@ WORKER_PID=$!
 sleep 3
 ```
 
-#### 4. 配置采集任务
+#### 4. 获取访问令牌
+
+```bash
+# 使用默认账户登录
+TOKEN=$(curl -s -X POST http://localhost:8081/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"Admin@123"}' | jq -r '.token')
+
+echo "访问令牌: $TOKEN"
+```
+
+#### 5. 配置采集任务
 
 ```bash
 # 创建数据源
-DS_ID=$(curl -s -X POST http://localhost:8080/api/v1/datasources \
+DS_ID=$(curl -s -X POST http://localhost:8081/api/v1/datasources \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{
     "name": "技术博客",
     "type": "web",
@@ -392,8 +409,9 @@ DS_ID=$(curl -s -X POST http://localhost:8080/api/v1/datasources \
 echo "数据源 ID: $DS_ID"
 
 # 创建采集任务
-TASK_ID=$(curl -s -X POST http://localhost:8080/api/v1/tasks \
+TASK_ID=$(curl -s -X POST http://localhost:8081/api/v1/tasks \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d "{
     \"name\": \"采集技术文章\",
     \"description\": \"每天采集技术博客文章\",
@@ -407,22 +425,24 @@ TASK_ID=$(curl -s -X POST http://localhost:8080/api/v1/tasks \
 echo "任务 ID: $TASK_ID"
 ```
 
-#### 5. 手动触发任务
+#### 6. 手动触发任务
 
 ```bash
 # 立即执行任务
-curl -X POST http://localhost:8080/api/v1/tasks/$TASK_ID/run
+curl -s -X POST http://localhost:8081/api/v1/tasks/$TASK_ID/run \
+  -H "Authorization: Bearer $TOKEN"
 
 echo "任务已触发，等待执行..."
 sleep 10
 ```
 
-#### 6. 查看结果
+#### 7. 查看结果
 
 ```bash
 # 查看执行历史
 echo "=== 执行历史 ==="
-curl -s http://localhost:8080/api/v1/executions/task/$TASK_ID | jq '.'
+curl -s http://localhost:8081/api/v1/executions/task/$TASK_ID \
+  -H "Authorization: Bearer $TOKEN" | jq '.'
 
 # 查看采集的数据
 echo "=== 采集的数据 ==="
@@ -430,7 +450,8 @@ docker exec -i postgres psql -U postgres -d datafusion_data -c "SELECT * FROM ar
 
 # 查看统计信息
 echo "=== 统计信息 ==="
-curl -s http://localhost:8080/api/v1/stats/overview | jq '.'
+curl -s http://localhost:8081/api/v1/stats/overview \
+  -H "Authorization: Bearer $TOKEN" | jq '.'
 ```
 
 #### 7. 清理
@@ -526,11 +547,91 @@ curl http://localhost:8080/api/v1/datasources
 # 测试连接
 curl -X POST http://localhost:8080/api/v1/datasources/1/test
 
+# 预览页面结构（返回可用的 CSS 选择器列表）
+curl -X POST http://localhost:8080/api/v1/datasources/1/preview
+
 # 更新数据源
 curl -X PUT http://localhost:8080/api/v1/datasources/1 \
   -H "Content-Type: application/json" \
   -d '{"status":"inactive"}'
 ```
+
+### Web RPA 采集器高级配置
+
+Web 数据源的 `config` 字段支持以下高级功能：
+
+**基础采集（自动提取正文）**：
+```json
+{
+  "url": "https://example.com/article",
+  "method": "GET"
+}
+```
+
+**精确字段提取（CSS 选择器）**：
+```json
+{
+  "url": "https://example.com/news",
+  "selectors": {
+    "_list": ".article-item",
+    "title": ".article-title",
+    "content": ".article-body"
+  }
+}
+```
+> `_list` 为列表容器选择器，其余 key 为存入数据库的字段名，value 为 CSS 选择器。
+
+**需要登录的页面**：
+```json
+{
+  "url": "https://example.com/protected",
+  "rpa_config": {
+    "login": {
+      "url": "https://example.com/login",
+      "username_selector": "#email",
+      "password_selector": "#password",
+      "submit_selector": "button[type='submit']",
+      "username": "user@example.com",
+      "password": "your-password",
+      "wait_after": ".user-menu",
+      "check_selector": ".user-menu"
+    }
+  }
+}
+```
+- Cookie 在 Worker 进程内存中保存 24 小时，自动复用
+- `check_selector` 指定的元素不存在时，自动重新登录
+
+**短信验证码/扫码登录（Cookie 注入）**：
+```json
+{
+  "url": "https://example.com/protected",
+  "rpa_config": {
+    "cookie_string": "session_id=xxx; token=yyy",
+    "check_selector": ".user-menu"
+  }
+}
+```
+- 适用于无法自动填表的登录方式（短信验证码、扫码、第三方登录等）
+- 从浏览器 DevTools (F12) → Network → 任意请求 → Headers → Cookie 复制
+- `check_selector` 指定的元素不存在时，任务报错并提示重新复制 Cookie
+
+**动态交互（搜索/筛选）**：
+```json
+{
+  "url": "https://example.com/list",
+  "rpa_config": {
+    "actions": [
+      {"type": "input",  "selector": "#keyword", "value": "关键词"},
+      {"type": "click",  "selector": "#search",  "wait_for": ".results"},
+      {"type": "select", "selector": "#sort",     "value": "newest"},
+      {"type": "wait",   "wait_ms": 500}
+    ]
+  }
+}
+```
+- 可同时配置 `login` 和 `actions`
+- `wait_for` 等待目标元素出现后再继续下一步
 
 ### 监控和日志
 

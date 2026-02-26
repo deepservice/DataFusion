@@ -1,15 +1,16 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import { authService } from '@/services/auth';
-import MainLayout from '@/components/Layout/MainLayout';
-import LoginPage from '@/pages/Login';
-import DashboardPage from '@/pages/Dashboard';
-import TasksPage from '@/pages/Tasks';
-import DataSourcesPage from '@/pages/DataSources';
-import UsersPage from '@/pages/Users';
-import ConfigPage from '@/pages/Config';
-import BackupPage from '@/pages/Backup';
-import ProfilePage from '@/pages/Profile';
+import { authService } from './services/auth';
+import MainLayout from './components/Layout/MainLayout';
+import LoginPage from './pages/Login';
+import DashboardPage from './pages/Dashboard';
+import TasksPage from './pages/Tasks';
+import DataSourcesPage from './pages/DataSources';
+import UsersPage from './pages/Users';
+import ConfigPage from './pages/Config';
+import BackupPage from './pages/Backup';
+import ProfilePage from './pages/Profile';
+import ExecutionsPage from './pages/Executions';
 
 // 路由保护组件
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -60,6 +61,9 @@ const App: React.FC = () => {
           {/* 任务管理 */}
           <Route path="tasks" element={<TasksPage />} />
           
+          {/* 执行历史 */}
+          <Route path="executions" element={<ExecutionsPage />} />
+
           {/* 数据源管理 */}
           <Route path="datasources" element={<DataSourcesPage />} />
           

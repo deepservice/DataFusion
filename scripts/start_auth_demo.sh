@@ -102,7 +102,7 @@ start_api_server() {
     echo ""
     echo -e "${BLUE}默认管理员账户:${NC}"
     echo "  用户名: admin"
-    echo "  密码: admin123"
+    echo "  密码: Admin@123"
     echo ""
     echo -e "${YELLOW}按 Ctrl+C 停止服务器${NC}"
     echo "=================================================="
@@ -121,7 +121,7 @@ show_test_commands() {
     echo "2. 用户登录:"
     echo '   curl -X POST http://localhost:8080/api/v1/auth/login \'
     echo '        -H "Content-Type: application/json" \'
-    echo '        -d '"'"'{"username":"admin","password":"admin123"}'"'"
+    echo '        -d '"'"'{"username":"admin","password":"Admin@123"}'"'"
     echo ""
     echo "3. 运行完整测试:"
     echo "   ./tests/test_auth_system.sh"

@@ -1,28 +1,29 @@
 import React, { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Row, Col, Card, Statistic, Table, Tag, Space, Button, Typography, Spin } from 'antd';
 import {
   ScheduleOutlined,
-  DatabaseOutlined,
-  UserOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
   ExclamationCircleOutlined,
   ReloadOutlined,
 } from '@ant-design/icons';
-import { SystemStats, Task, TaskExecution } from '@/types';
-import { taskService } from '@/services/task';
+import { Task, TaskExecution } from '../../types';
+import { taskService } from '../../services/task';
 
 const { Title, Text } = Typography;
 
 const DashboardPage: React.FC = () => {
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
-  const [stats, setStats] = useState<SystemStats>({
+  const [statsData, setStatsData] = useState({
     total_tasks: 0,
-    active_tasks: 0,
+    enabled_tasks: 0,
     total_executions: 0,
-    success_rate: 0,
-    total_data_sources: 0,
-    total_users: 0,
+    success_executions: 0,
+    failed_executions: 0,
+    running_executions: 0,
+    total_records: 0,
   });
   const [recentTasks, setRecentTasks] = useState<Task[]>([]);
   const [recentExecutions, setRecentExecutions] = useState<TaskExecution[]>([]);
@@ -34,36 +35,25 @@ const DashboardPage: React.FC = () => {
   const loadDashboardData = async () => {
     setLoading(true);
     try {
-      // 并行加载数据
-      const [tasksResponse, executionsResponse] = await Promise.all([
+      const [statsResponse, tasksResponse, executionsResponse] = await Promise.all([
+        taskService.getStats(),
         taskService.getTasks({ limit: 5 }),
         taskService.getExecutions({ limit: 10 }),
       ]);
 
+      setStatsData(statsResponse);
       setRecentTasks(tasksResponse.items || []);
       setRecentExecutions(executionsResponse.items || []);
-
-      // 计算统计数据
-      const totalTasks = tasksResponse.pagination?.total || 0;
-      const activeTasks = (tasksResponse.items || []).filter(task => task.status === 'enabled').length;
-      const totalExecutions = executionsResponse.pagination?.total || 0;
-      const successfulExecutions = (executionsResponse.items || []).filter(exec => exec.status === 'success').length;
-      const successRate = totalExecutions > 0 ? (successfulExecutions / totalExecutions) * 100 : 0;
-
-      setStats({
-        total_tasks: totalTasks,
-        active_tasks: activeTasks,
-        total_executions: totalExecutions,
-        success_rate: Math.round(successRate),
-        total_data_sources: 0, // TODO: 从数据源API获取
-        total_users: 0, // TODO: 从用户API获取
-      });
     } catch (error) {
       console.error('加载仪表板数据失败:', error);
     } finally {
       setLoading(false);
     }
   };
+
+  const successRate = statsData.total_executions > 0
+    ? Math.round((statsData.success_executions / statsData.total_executions) * 100)
+    : 0;
 
   // 任务状态标签
   const getTaskStatusTag = (status: string) => {
@@ -121,9 +111,10 @@ const DashboardPage: React.FC = () => {
   // 执行历史表格列配置
   const executionColumns = [
     {
-      title: '任务ID',
-      dataIndex: 'task_id',
-      key: 'task_id',
+      title: '任务名称',
+      dataIndex: 'task_name',
+      key: 'task_name',
+      render: (text: string) => text || '-',
     },
     {
       title: '状态',
@@ -135,18 +126,13 @@ const DashboardPage: React.FC = () => {
       title: '开始时间',
       dataIndex: 'start_time',
       key: 'start_time',
-      render: (text: string) => new Date(text).toLocaleString(),
+      render: (text: string) => text ? new Date(text).toLocaleString() : '-',
     },
     {
       title: '采集记录数',
       dataIndex: 'records_collected',
       key: 'records_collected',
-      render: (num: number) => num.toLocaleString(),
-    },
-    {
-      title: '重试次数',
-      dataIndex: 'retry_count',
-      key: 'retry_count',
+      render: (num: number) => (num || 0).toLocaleString(),
     },
   ];
 
@@ -179,7 +165,7 @@ const DashboardPage: React.FC = () => {
           <Card>
             <Statistic
               title="总任务数"
-              value={stats.total_tasks}
+              value={statsData.total_tasks}
               prefix={<ScheduleOutlined />}
               valueStyle={{ color: '#1890ff' }}
             />
@@ -189,7 +175,7 @@ const DashboardPage: React.FC = () => {
           <Card>
             <Statistic
               title="活跃任务"
-              value={stats.active_tasks}
+              value={statsData.enabled_tasks}
               prefix={<CheckCircleOutlined />}
               valueStyle={{ color: '#52c41a' }}
             />
@@ -199,7 +185,7 @@ const DashboardPage: React.FC = () => {
           <Card>
             <Statistic
               title="总执行次数"
-              value={stats.total_executions}
+              value={statsData.total_executions}
               prefix={<ClockCircleOutlined />}
               valueStyle={{ color: '#722ed1' }}
             />
@@ -209,10 +195,10 @@ const DashboardPage: React.FC = () => {
           <Card>
             <Statistic
               title="成功率"
-              value={stats.success_rate}
+              value={successRate}
               suffix="%"
               prefix={<CheckCircleOutlined />}
-              valueStyle={{ color: stats.success_rate >= 90 ? '#52c41a' : stats.success_rate >= 70 ? '#faad14' : '#ff4d4f' }}
+              valueStyle={{ color: successRate >= 90 ? '#52c41a' : successRate >= 70 ? '#faad14' : '#ff4d4f' }}
             />
           </Card>
         </Col>
@@ -222,7 +208,7 @@ const DashboardPage: React.FC = () => {
       <Row gutter={[16, 16]}>
         {/* 最近任务 */}
         <Col xs={24} lg={12}>
-          <Card title="最近任务" extra={<Button type="link">查看全部</Button>}>
+          <Card title="最近任务" extra={<Button type="link" onClick={() => navigate('/tasks')}>查看全部</Button>}>
             <Table
               dataSource={recentTasks}
               columns={taskColumns}
@@ -235,7 +221,7 @@ const DashboardPage: React.FC = () => {
 
         {/* 最近执行 */}
         <Col xs={24} lg={12}>
-          <Card title="最近执行" extra={<Button type="link">查看全部</Button>}>
+          <Card title="最近执行" extra={<Button type="link" onClick={() => navigate('/executions')}>查看全部</Button>}>
             <Table
               dataSource={recentExecutions}
               columns={executionColumns}

@@ -28,6 +28,7 @@
 | 文档 | 说明 | 适合人群 |
 |------|------|---------|
 | [CONTROL_PLANE_API.md](CONTROL_PLANE_API.md) | 完整的 REST API 文档 | 开发者 |
+| [WEB_RPA_GUIDE.md](WEB_RPA_GUIDE.md) | Web RPA 采集器配置指南（含登录/会话/动态交互） | 用户/开发者 |
 | [DATABASE_COLLECTOR_GUIDE.md](DATABASE_COLLECTOR_GUIDE.md) | 数据库采集指南 | 开发者 |
 
 ### 🐛 问题修复
@@ -49,6 +50,7 @@
 ### 👨‍💻 开发者
 - [WORKER_IMPLEMENTATION.md](WORKER_IMPLEMENTATION.md) - 了解 Worker 实现
 - [CONTROL_PLANE_API.md](CONTROL_PLANE_API.md) - API 接口文档
+- [WEB_RPA_GUIDE.md](WEB_RPA_GUIDE.md) - Web RPA 采集配置（登录/会话/动态交互）
 - [DATABASE_COLLECTOR_GUIDE.md](DATABASE_COLLECTOR_GUIDE.md) - 数据库采集
 - [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) - 项目结构
 
@@ -154,6 +156,9 @@
 
 | 日期 | 文档 | 更新内容 |
 |------|------|---------|
+| 2026-02-25 | WEB_RPA_GUIDE.md | 新增 Cookie 注入章节（短信/扫码验证场景） |
+| 2026-02-25 | WEB_RPA_GUIDE.md | 新增 Web RPA 采集配置指南（登录/会话/动态交互） |
+| 2026-02-25 | WORKER_IMPLEMENTATION.md | 更新 RPA 采集器能力说明 |
 | 2025-12-04 | FIX_DUPLICATE_KEY_ISSUE.md | 新增主键冲突修复文档 |
 | 2025-12-04 | QUICK_FIX.md | 新增快速修复指南 |
 | 2025-12-04 | K8S_*.md | 新增 K8S 部署文档 |

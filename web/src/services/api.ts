@@ -47,7 +47,7 @@ class TokenManager {
 
 // 请求拦截器
 apiClient.interceptors.request.use(
-  (config: AxiosRequestConfig) => {
+  (config: any) => {
     const token = TokenManager.getToken();
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`;
@@ -113,7 +113,7 @@ class BaseAPI {
   protected async request<T = any>(config: AxiosRequestConfig): Promise<T> {
     try {
       const response = await this.client.request<ApiResponse<T>>(config);
-      return response.data.data || response.data;
+      return (response.data.data || response.data) as unknown as T;
     } catch (error) {
       throw error;
     }

@@ -285,7 +285,7 @@ curl http://localhost:8080/readyz
 # 1. 用户登录
 TOKEN=$(curl -X POST http://localhost:8080/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}' \
+  -d '{"username":"admin","password":"Admin@123"}' \
   | jq -r '.token')
 
 echo "Token: $TOKEN"
@@ -446,7 +446,7 @@ open http://localhost:3000
 
 # 使用默认账户登录
 # 用户名: admin
-# 密码: admin123
+# 密码: Admin@123
 ```
 
 #### 3.3.3 功能验证清单
@@ -786,7 +786,7 @@ curl https://$API_URL/healthz
 # 测试登录
 curl -X POST https://$API_URL/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}'
+  -d '{"username":"admin","password":"Admin@123"}'
 ```
 
 #### 5.2.2 Web 界面测试
@@ -796,7 +796,7 @@ curl -X POST https://$API_URL/api/v1/auth/login \
 kubectl port-forward -n datafusion svc/web-service 3000:80 &
 
 # 浏览器访问 http://localhost:3000
-# 使用默认账户登录: admin / admin123
+# 使用默认账户登录: admin / Admin@123
 
 # 功能验证清单:
 # - [ ] 能够成功登录

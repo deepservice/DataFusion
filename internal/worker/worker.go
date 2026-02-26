@@ -2,9 +2,11 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -145,9 +147,10 @@ func (w *Worker) poll(ctx context.Context) {
 			log.Printf("任务执行最终失败: %v", err)
 		}
 
-		// 释放锁
-		if err := w.db.UnlockTask(task.ID); err != nil {
-			log.Printf("释放任务锁失败: %v", err)
+		// 无论成功或失败，都更新下次执行时间，避免重复轮询
+		// 注意：不调用 UnlockTask（它会将 next_run_time 设为 NOW()，导致立即重新拾取）
+		if err := w.updateNextRunTime(ctx, &task); err != nil {
+			log.Printf("更新下次执行时间失败: %v", err)
 		}
 	}
 }
@@ -155,6 +158,102 @@ func (w *Worker) poll(ctx context.Context) {
 // parseTaskConfig 解析任务配置
 func (w *Worker) parseTaskConfig(configJSON string) (*models.TaskConfig, error) {
 	return database.ParseTaskConfig(configJSON)
+}
+
+// resolveTaskConfig 解析任务配置：优先使用 task.Config，为空时从数据源自动构建
+func (w *Worker) resolveTaskConfig(task *models.CollectionTask) (*models.TaskConfig, error) {
+	// 如果任务有完整配置，直接使用
+	if task.Config != nil && *task.Config != "" {
+		return w.parseTaskConfig(*task.Config)
+	}
+
+	// 从关联的数据源自动构建配置
+	if task.DataSourceID == 0 {
+		return nil, fmt.Errorf("任务没有配置且未关联数据源")
+	}
+
+	dsType, dsConfigJSON, err := w.db.GetDataSourceConfig(task.DataSourceID)
+	if err != nil {
+		return nil, fmt.Errorf("获取数据源配置失败: %w", err)
+	}
+
+	// 解析数据源配置JSON
+	var dsConfig map[string]interface{}
+	if err := json.Unmarshal([]byte(dsConfigJSON), &dsConfig); err != nil {
+		return nil, fmt.Errorf("解析数据源配置JSON失败: %w", err)
+	}
+
+	// 构建 DataSourceConfig
+	url, _ := dsConfig["url"].(string)
+	if url == "" {
+		url, _ = dsConfig["endpoint"].(string) // 兼容旧数据源配置（使用 endpoint 字段）
+	}
+	method, _ := dsConfig["method"].(string)
+	if method == "" {
+		method = "GET"
+	}
+
+	// 转换 headers
+	headers := map[string]string{}
+	if h, ok := dsConfig["headers"].(map[string]interface{}); ok {
+		for k, v := range h {
+			if s, ok := v.(string); ok {
+				headers[k] = s
+			}
+		}
+	}
+
+	// 转换 selectors
+	selectors := map[string]string{}
+	if s, ok := dsConfig["selectors"].(map[string]interface{}); ok {
+		for k, v := range s {
+			if str, ok := v.(string); ok {
+				selectors[k] = str
+			}
+		}
+	}
+
+	// 转换 rpa_config（登录配置、动态动作等）
+	var rpaConf *models.RPAConfig
+	if rpaRaw, ok := dsConfig["rpa_config"].(map[string]interface{}); ok {
+		rpaBytes, _ := json.Marshal(rpaRaw)
+		var rc models.RPAConfig
+		if err := json.Unmarshal(rpaBytes, &rc); err == nil {
+			rpaConf = &rc
+		}
+	}
+
+	// 根据任务类型映射到采集器类型
+	collectorType := dsType
+	if task.Type == "web-rpa" {
+		collectorType = "web-rpa"
+	} else if task.Type == "api" {
+		collectorType = "api"
+	} else if task.Type == "database" {
+		collectorType = "database"
+	}
+
+	taskConfig := &models.TaskConfig{
+		DataSource: models.DataSourceConfig{
+			Type:      collectorType,
+			URL:       url,
+			Method:    method,
+			Headers:   headers,
+			Selectors: selectors,
+			RPAConfig: rpaConf,
+		},
+		Processor: models.ProcessorConfig{},
+		Storage: models.StorageConfig{
+			Target:   "postgresql",
+			Database: "datafusion_data",
+			Table:    fmt.Sprintf("collected_%s_%d", strings.ReplaceAll(task.Type, "-", "_"), task.ID),
+		},
+	}
+
+	log.Printf("自动构建任务配置: 数据源=%s, URL=%s, 存储表=%s",
+		collectorType, url, taskConfig.Storage.Table)
+
+	return taskConfig, nil
 }
 
 // collectData 采集数据
@@ -185,14 +284,24 @@ func (w *Worker) storeData(ctx context.Context, config *models.StorageConfig, da
 
 // updateNextRunTime 更新下次执行时间
 func (w *Worker) updateNextRunTime(ctx context.Context, task *models.CollectionTask) error {
-	if task.Cron == "" {
-		return nil
+	if task.Cron == nil || *task.Cron == "" {
+		// 没有cron表达式的一次性任务，清空next_run_time防止重复执行
+		return w.db.ClearTaskNextRunTime(task.ID)
 	}
 
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	schedule, err := parser.Parse(task.Cron)
+	cronExpr := strings.TrimSpace(*task.Cron)
+	// 移除 Quartz 风格的 '?' 字符（替换为 '*'）
+	cronExpr = strings.ReplaceAll(cronExpr, "?", "*")
+
+	// 尝试6字段（含秒）解析，失败则回退到5字段
+	parser6 := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	schedule, err := parser6.Parse(cronExpr)
 	if err != nil {
-		return fmt.Errorf("解析 Cron 表达式失败: %w", err)
+		parser5 := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		schedule, err = parser5.Parse(cronExpr)
+		if err != nil {
+			return fmt.Errorf("解析 Cron 表达式失败: %w", err)
+		}
 	}
 
 	nextRunTime := schedule.Next(time.Now())

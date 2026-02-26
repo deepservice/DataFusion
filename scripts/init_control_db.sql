@@ -135,9 +135,9 @@ CREATE TABLE IF NOT EXISTS system_configs (
     updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- 插入默认管理员用户（密码: admin123）
+-- 插入默认管理员用户（密码: Admin@123）
 INSERT INTO users (username, password_hash, email, role, auth_type, status)
-VALUES ('admin', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'admin@datafusion.io', 'admin', 'local', 'active')
+VALUES ('admin', '$2b$10$mjFXgjXTcdPx5WdmWv8GMuPWUfz4JB5d84eVznTE9IwvsyckcEsAK', 'admin@datafusion.io', 'admin', 'local', 'active')
 ON CONFLICT (username) DO NOTHING;
 
 -- 插入示例数据源

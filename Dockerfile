@@ -6,6 +6,9 @@ RUN apk add --no-cache git make
 
 WORKDIR /app
 
+ENV GOPROXY=https://goproxy.cn
+ENV GOSUMDB=sum.golang.google.cn
+
 # 复制依赖文件
 COPY go.mod go.sum ./
 RUN go mod download

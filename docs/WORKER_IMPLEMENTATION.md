@@ -16,8 +16,13 @@
 2. **数据采集器** (`internal/collector/`)
    - ✅ RPA 采集器（基于 Chromedp）
      - 支持无头浏览器模式
-     - CSS 选择器数据提取
-     - 列表数据批量采集
+     - CSS 选择器精确提取指定字段
+     - 无选择器时智能提取页面主要正文
+     - 列表数据批量采集（`_list` 选择器）
+     - **登录支持**：`rpa_config.login` — 自动填写账号密码并提交
+     - **会话保持**：Cookie 内存缓存（24h TTL），按 URL host 索引，失效自动重新登录
+     - **动态交互**：`rpa_config.actions` — 支持 input/click/select/wait 页面动作序列
+     - DOMContentLoaded 导航策略，避免重型页面超时
    - ✅ API 采集器（基于 Resty）
      - 支持 GET/POST 请求
      - 自定义请求头

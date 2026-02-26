@@ -56,6 +56,12 @@ DataFusion 是一个完整的企业级数据采集和处理系统，包含控制
 
 #### 数据采集 (3 种)
 - ✅ **Web RPA 采集器** - 基于 Chromium 的网页数据抓取
+  - 智能内容提取（无选择器时自动识别正文）
+  - CSS 选择器精确提取指定字段
+  - **账号密码登录** — 自动模拟登录（填表 + 点击提交），Cookie 内存缓存 24h 自动复用
+  - **Cookie 注入** — 从浏览器复制 Cookie 直接配置，适用于短信验证码/扫码等无法自动模拟的登录
+  - **动态交互** — 支持搜索、过滤、点击、等待等页面动作序列
+  - DOMContentLoaded 快速加载，兼容微信文章、MSN 等重型页面
 - ✅ **API 采集器** - REST API 数据采集
 - ✅ **数据库采集器** - MySQL + PostgreSQL 数据采集
 
@@ -165,7 +171,7 @@ npm install
 npm start
 
 # 访问 http://localhost:3000
-# 默认账户: admin / admin123
+# 默认账户: admin / Admin@123
 ```
 
 **生产部署**:
@@ -285,40 +291,98 @@ datafusion/
 
 ## 使用示例
 
-### 创建 RPA 采集任务
+### 创建 RPA 采集任务（普通页面）
 
-```sql
-INSERT INTO collection_tasks (name, type, status, cron, next_run_time, replicas, config)
-VALUES (
-    '新闻文章采集',
-    'web-rpa',
-    'enabled',
-    '0 */1 * * *',  -- 每小时执行
-    NOW(),
-    1,
-    '{
-        "data_source": {
-            "type": "web-rpa",
-            "url": "https://example.com/news",
-            "selectors": {
-                "_list": ".article-item",
-                "title": ".article-title",
-                "content": ".article-content"
-            }
-        },
-        "processor": {
-            "cleaning_rules": [
-                {"field": "title", "type": "trim"},
-                {"field": "content", "type": "remove_html"}
-            ]
-        },
-        "storage": {
-            "target": "postgresql",
-            "table": "articles",
-            "mapping": {"title": "title", "content": "content"}
-        }
-    }'
-);
+通过 Web 界面在数据源管理中创建数据源，config 示例：
+
+```json
+{
+  "url": "https://example.com/news",
+  "method": "GET",
+  "selectors": {
+    "_list": ".article-item",
+    "title": ".article-title",
+    "content": ".article-content"
+  }
+}
+```
+
+> 不配置 `selectors` 时，系统自动智能提取页面主要内容。
+
+### 需要登录的页面
+
+在数据源 config 中加入 `rpa_config.login`：
+
+```json
+{
+  "url": "https://www.dxy.cn/board/articles",
+  "selectors": {
+    "title": "h3.post-title",
+    "content": ".article-body"
+  },
+  "rpa_config": {
+    "login": {
+      "url": "https://www.dxy.cn/login",
+      "username_selector": "#username",
+      "password_selector": "#password",
+      "submit_selector": "button[type='submit']",
+      "username": "your-username",
+      "password": "your-password",
+      "wait_after": ".nav-user-avatar",
+      "check_selector": ".nav-user-avatar"
+    }
+  }
+}
+```
+
+- `wait_after`：登录成功后等待出现的元素，用于确认登录完成
+- `check_selector`：每次采集前检查是否已登录，元素不存在则自动重新登录
+- Cookie 在内存中保存 24 小时，同一 Worker 进程内复用，无需每次重新登录
+
+### 短信验证码/扫码登录（Cookie 注入）
+
+对于无法自动模拟的登录方式，从浏览器复制 Cookie 直接配置：
+
+```json
+{
+  "url": "https://www.dxy.cn/board/articles",
+  "rpa_config": {
+    "cookie_string": "session_id=xxx; token=yyy; user_id=123",
+    "check_selector": ".nav-user-avatar"
+  }
+}
+```
+
+1. 浏览器手动登录 → DevTools (F12) → Network → 任意请求 → Headers → Cookie
+2. 复制 Cookie 值填入 `cookie_string`
+3. `check_selector` 指定登录后才存在的元素，Cookie 失效时任务报错提示重新复制
+
+### 搜索/筛选后采集
+
+配置 `rpa_config.actions` 执行页面交互再采集：
+
+```json
+{
+  "url": "https://example.com/list",
+  "rpa_config": {
+    "login": { "...": "..." },
+    "actions": [
+      {"type": "input",  "selector": "#search-input", "value": "关键词"},
+      {"type": "click",  "selector": "#search-btn", "wait_for": ".result-list"},
+      {"type": "select", "selector": "#sort-by",    "value": "latest"},
+      {"type": "wait",   "wait_ms": 1000}
+    ]
+  }
+}
+```
+
+支持的动作类型：
+- `input` — 在输入框中输入文本（WaitVisible → Clear → SendKeys）
+- `click` — 点击按钮或链接（WaitVisible → Click）
+- `select` — 选择下拉选项（WaitVisible → SetValue）
+- `wait` — 等待指定毫秒数
+
+每个动作可加 `wait_for` 字段，等待目标元素出现后再执行下一个动作。
 ```
 
 ### 创建 API 采集任务
@@ -543,7 +607,7 @@ go run tests/test_with_storage.go
 ### 数据面 (Data Plane) ✅ 100%
 
 #### 数据采集 (3 种)
-- ✅ **Web RPA 采集器** - 基于 Chromium 的网页数据抓取
+- ✅ **Web RPA 采集器** - 基于 Chromium 的网页数据抓取（含登录/会话/动态交互）
 - ✅ **API 采集器** - REST API 数据采集
 - ✅ **数据库采集器** - MySQL + PostgreSQL 数据采集
 

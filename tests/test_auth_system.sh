@@ -104,7 +104,7 @@ main() {
     test_endpoint "GET" "/tasks" "" "401" "未认证访问任务列表"
     
     echo -e "\n${YELLOW}=== 3. 用户登录测试 ===${NC}"
-    login_data='{"username":"admin","password":"admin123"}'
+    login_data='{"username":"admin","password":"Admin@123"}'
     test_endpoint "POST" "/auth/login" "$login_data" "200" "管理员登录"
     
     # 提取 token

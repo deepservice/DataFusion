@@ -45,7 +45,12 @@ func (p *PostgresStorage) Store(ctx context.Context, config *models.StorageConfi
 		return nil
 	}
 
-	log.Printf("开始存储数据到 PostgreSQL，表: %s.%s，数据量: %d", config.Database, config.Table, len(data))
+	log.Printf("开始存储数据到 PostgreSQL，表: %s，数据量: %d", config.Table, len(data))
+
+	// 自动创建表（如果不存在）
+	if err := p.ensureTable(ctx, config.Table, data[0]); err != nil {
+		return fmt.Errorf("自动创建表失败: %w", err)
+	}
 
 	// 构建插入语句
 	fields := make([]string, 0)
@@ -135,6 +140,34 @@ func (p *PostgresStorage) Store(ctx context.Context, config *models.StorageConfi
 		return fmt.Errorf("所有数据插入失败")
 	}
 	
+	return nil
+}
+
+// ensureTable 确保目标表存在，不存在则根据数据字段自动创建
+func (p *PostgresStorage) ensureTable(ctx context.Context, table string, sample map[string]interface{}) error {
+	// 检查表是否存在
+	var exists bool
+	err := p.db.QueryRowContext(ctx,
+		"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)", table).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("检查表是否存在失败: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	// 构建 CREATE TABLE 语句，所有字段用 TEXT 类型
+	cols := []string{"id SERIAL PRIMARY KEY", "collected_at TIMESTAMP DEFAULT NOW()"}
+	for field := range sample {
+		cols = append(cols, fmt.Sprintf("%s TEXT", field))
+	}
+
+	query := fmt.Sprintf("CREATE TABLE %s (%s)", table, strings.Join(cols, ", "))
+	log.Printf("自动创建表: %s", query)
+
+	if _, err := p.db.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("创建表失败: %w", err)
+	}
 	return nil
 }
 

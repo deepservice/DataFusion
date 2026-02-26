@@ -2,8 +2,8 @@ import React, { useState } from 'react';
 import { useNavigate, Navigate } from 'react-router-dom';
 import { Form, Input, Button, Card, Typography, message, Space } from 'antd';
 import { UserOutlined, LockOutlined, LoginOutlined } from '@ant-design/icons';
-import { authService } from '@/services/auth';
-import { LoginRequest } from '@/types';
+import { authService } from '../../services/auth';
+import { LoginRequest } from '../../types';
 
 const { Title, Text } = Typography;
 
@@ -101,7 +101,11 @@ const LoginPage: React.FC = () => {
             <br />
             用户名：admin
             <br />
-            密码：admin123
+            密码：Admin@123
+            <br />
+            <span style={{ fontSize: 11, color: '#999' }}>
+              (密码需要包含大小写字母、数字)
+            </span>
           </Text>
         </div>
 

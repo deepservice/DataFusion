@@ -23,10 +23,11 @@ show_help() {
     echo "  worker        部署 Worker"
     echo "  web           部署 Web 前端"
     echo "  all           部署完整系统（API Server + Worker + Web）"
+    echo "  port-forward  启动服务端口转发"
     echo ""
     echo "选项:"
     echo "  -h, --help    显示帮助信息"
-    echo "  --clean       部署前清理现有资源"
+    echo "  --clean       部署前清理现有资源（包括删除本地镜像）"
     echo ""
     echo "示例:"
     echo "  $0 all                # 部署完整系统"
@@ -34,6 +35,7 @@ show_help() {
     echo "  $0 worker             # 只部署 Worker"
     echo "  $0 web                # 只部署 Web 前端"
     echo "  $0 --clean all        # 清理后部署完整系统"
+    echo "  $0 port-forward       # 启动端口转发（环境就绪时）"
 }
 
 # 检查依赖
@@ -68,14 +70,15 @@ detect_k8s_env() {
 # 加载镜像到 Kubernetes 集群
 load_image_to_cluster() {
     local IMAGE_NAME=$1
-    local K8S_ENV=$(detect_k8s_env)
+    local K8S_ENV
+    K8S_ENV=$(detect_k8s_env)
     
     echo -e "${YELLOW}检测到 Kubernetes 环境: ${K8S_ENV}${NC}"
     
     case $K8S_ENV in
         kind)
             echo -e "${YELLOW}加载镜像到 kind 集群...${NC}"
-            kind load docker-image "$IMAGE_NAME"
+            kind load docker-image "$IMAGE_NAME" --name dev
             echo -e "${GREEN}✅ 镜像已加载到 kind 集群${NC}"
             ;;
         minikube)
@@ -93,7 +96,38 @@ load_image_to_cluster() {
 # 清理资源
 clean_resources() {
     echo -e "${YELLOW}清理现有资源...${NC}"
-    kubectl delete namespace datafusion --ignore-not-found=true
+
+    # 删除 Kubernetes 命名空间
+    if kubectl get namespace datafusion &>/dev/null; then
+        echo -e "${YELLOW}删除命名空间 datafusion...${NC}"
+        kubectl delete namespace datafusion --ignore-not-found=true
+
+        # 等待命名空间完全删除
+        echo -e "${YELLOW}等待命名空间删除完成...${NC}"
+        local TIMEOUT=60
+        local ELAPSED=0
+        while kubectl get namespace datafusion &>/dev/null && [ $ELAPSED -lt $TIMEOUT ]; do
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+            echo -n "."
+        done
+        echo ""
+
+        if kubectl get namespace datafusion &>/dev/null; then
+            echo -e "${YELLOW}⚠️  命名空间删除超时，继续执行...${NC}"
+        else
+            echo -e "${GREEN}✅ 命名空间已删除${NC}"
+        fi
+    else
+        echo -e "${GREEN}✅ 命名空间不存在，跳过删除${NC}"
+    fi
+
+    # 删除本地 Docker 镜像
+    echo -e "${YELLOW}删除本地 Docker 镜像...${NC}"
+    docker rmi datafusion/api-server:latest 2>/dev/null || true
+    docker rmi datafusion-worker:latest 2>/dev/null || true
+    docker rmi datafusion/web:latest 2>/dev/null || true
+
     echo -e "${GREEN}✅ 清理完成${NC}"
     echo ""
 }
@@ -109,13 +143,100 @@ create_namespace() {
 # 部署 PostgreSQL
 deploy_postgresql() {
     echo -e "${YELLOW}部署 PostgreSQL...${NC}"
+
+    # 检查并加载 PostgreSQL 镜像
+    local POSTGRES_IMAGE="postgres:14-alpine"
+    echo -e "${YELLOW}检查 PostgreSQL 镜像...${NC}"
+
+    if ! docker image inspect "$POSTGRES_IMAGE" &>/dev/null; then
+        echo -e "${YELLOW}本地未找到 PostgreSQL 镜像，正在拉取...${NC}"
+        docker pull "$POSTGRES_IMAGE"
+        echo -e "${GREEN}✅ PostgreSQL 镜像拉取完成${NC}"
+    else
+        echo -e "${GREEN}✅ PostgreSQL 镜像已存在${NC}"
+    fi
+
+    # 加载镜像到集群
+    load_image_to_cluster "$POSTGRES_IMAGE"
+
     kubectl apply -f k8s/postgres-init-scripts.yaml
     kubectl apply -f k8s/postgresql.yaml
-    
+
     echo -e "${YELLOW}等待 PostgreSQL 启动...${NC}"
     kubectl wait --for=condition=ready pod -l app=postgresql -n datafusion --timeout=120s
     echo -e "${GREEN}✅ PostgreSQL 部署成功${NC}"
+
+    # 初始化数据库
+    init_database
     echo ""
+}
+
+# 初始化数据库
+init_database() {
+    echo -e "${YELLOW}检查并初始化数据库...${NC}"
+
+    local POSTGRES_POD
+    POSTGRES_POD=$(kubectl get pod -n datafusion -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
+
+    if [ -z "$POSTGRES_POD" ]; then
+        echo -e "${RED}❌ 找不到 PostgreSQL Pod${NC}"
+        return 1
+    fi
+
+    # 1. 检查并创建 datafusion_data 数据库
+    echo -e "${YELLOW}检查数据面数据库 (datafusion_data)...${NC}"
+    local DATA_DB_EXISTS
+    DATA_DB_EXISTS=$(kubectl exec -n datafusion "$POSTGRES_POD" -- psql -U datafusion -d postgres -tAc "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'datafusion_data');" 2>/dev/null || echo "f")
+
+    if [ "$DATA_DB_EXISTS" = "f" ]; then
+        echo -e "${YELLOW}创建 datafusion_data 数据库...${NC}"
+        if kubectl exec -n datafusion "$POSTGRES_POD" -- psql -U datafusion -d postgres -c "CREATE DATABASE datafusion_data;" > /dev/null 2>&1; then
+            echo -e "${GREEN}✅ datafusion_data 数据库创建成功${NC}"
+        else
+            echo -e "${RED}❌ datafusion_data 数据库创建失败${NC}"
+            return 1
+        fi
+    else
+        echo -e "${GREEN}✅ datafusion_data 数据库已存在${NC}"
+    fi
+
+    # 2. 检查并初始化控制面数据库 (datafusion_control)
+    echo -e "${YELLOW}检查控制面数据库表 (datafusion_control)...${NC}"
+    local TABLE_EXISTS
+    TABLE_EXISTS=$(kubectl exec -n datafusion "$POSTGRES_POD" -- psql -U datafusion -d datafusion_control -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'collection_tasks');" 2>/dev/null || echo "false")
+
+    if [ "$TABLE_EXISTS" = "t" ]; then
+        echo -e "${GREEN}✅ 控制面数据库表已存在，跳过初始化${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}控制面数据库表不存在，执行初始化脚本...${NC}"
+
+    # 执行初始化脚本
+    if kubectl exec -n datafusion "$POSTGRES_POD" -- psql -U datafusion -d datafusion_control -f /docker-entrypoint-initdb.d/01-init-tables.sql > /dev/null 2>&1; then
+        echo -e "${GREEN}✅ 表结构创建成功${NC}"
+    else
+        echo -e "${RED}❌ 表结构创建失败${NC}"
+        return 1
+    fi
+
+    # 插入测试数据
+    if kubectl exec -n datafusion "$POSTGRES_POD" -- psql -U datafusion -d datafusion_control -f /docker-entrypoint-initdb.d/02-insert-test-data.sql > /dev/null 2>&1; then
+        echo -e "${GREEN}✅ 测试数据插入成功${NC}"
+    else
+        echo -e "${YELLOW}⚠️  测试数据插入失败（可能已存在）${NC}"
+    fi
+
+    # 验证表是否创建成功
+    local TABLES_COUNT
+    TABLES_COUNT=$(kubectl exec -n datafusion "$POSTGRES_POD" -- psql -U datafusion -d datafusion_control -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null || echo "0")
+
+    if [ "$TABLES_COUNT" -gt 0 ]; then
+        echo -e "${GREEN}✅ 数据库初始化完成（共 $TABLES_COUNT 个表）${NC}"
+    else
+        echo -e "${RED}❌ 数据库初始化失败${NC}"
+        return 1
+    fi
 }
 
 # 部署 API Server
@@ -207,7 +328,7 @@ show_access_info() {
         echo "  内部访问: http://datafusion-web-service.datafusion.svc.cluster.local"
         echo "  端口转发: kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80"
         echo "  然后访问: http://localhost:3000"
-        echo "  默认账户: admin / admin123"
+        echo "  默认账户: admin / Admin@123"
         echo ""
     fi
     
@@ -230,6 +351,84 @@ show_access_info() {
     
     echo "🗑️  清理部署:"
     echo "  kubectl delete namespace datafusion"
+    echo ""
+}
+
+# 启动端口转发
+start_port_forward() {
+    echo "========================================="
+    echo -e "${BLUE}启动服务端口转发${NC}"
+    echo "========================================="
+    echo ""
+    
+    # 检查命名空间是否存在
+    if ! kubectl get namespace datafusion &>/dev/null; then
+        echo -e "${RED}❌ 命名空间 'datafusion' 不存在，请先部署服务${NC}"
+        return 1
+    fi
+    
+    # PostgreSQL 端口转发
+    if kubectl get svc postgres-service -n datafusion &>/dev/null; then
+        echo -e "${YELLOW}启动 PostgreSQL 端口转发 (localhost:5432 -> postgres-service:5432)...${NC}"
+        kubectl port-forward -n datafusion svc/postgres-service 5432:5432 &
+        PF_PID_PG=$!
+        echo -e "${GREEN}✅ PostgreSQL 已发布到 localhost:5432${NC}"
+        echo ""
+    fi
+    
+    # API Server 端口转发
+    if kubectl get svc api-server-service -n datafusion &>/dev/null; then
+        echo -e "${YELLOW}启动 API Server 端口转发 (localhost:8081 -> api-server-service:8080)...${NC}"
+        kubectl port-forward -n datafusion svc/api-server-service 8081:8080 &
+        PF_PID_API=$!
+        echo -e "${GREEN}✅ API Server 已发布到 localhost:8081${NC}"
+        echo ""
+    fi
+    
+    # Worker 端口转发（查找 worker 服务）
+    WORKER_SERVICE=$(kubectl get svc -n datafusion 2>/dev/null | grep -i worker | awk '{print $1}' | head -1)
+    if [[ -n "$WORKER_SERVICE" ]]; then
+        # 获取 worker 服务的第一个端口
+        WORKER_PORT=$(kubectl get svc "$WORKER_SERVICE" -n datafusion -o jsonpath='{.spec.ports[0].port}' 2>/dev/null)
+        if [[ -n "$WORKER_PORT" ]]; then
+            echo -e "${YELLOW}启动 Worker 端口转发 (localhost:9090 -> $WORKER_SERVICE:$WORKER_PORT)...${NC}"
+            kubectl port-forward -n datafusion svc/"$WORKER_SERVICE" 9090:"$WORKER_PORT" &
+            PF_PID_WORKER=$!
+            echo -e "${GREEN}✅ Worker 已发布到 localhost:9090${NC}"
+            echo ""
+        fi
+    fi
+    
+    # Web 前端端口转发
+    if kubectl get svc datafusion-web-service -n datafusion &>/dev/null; then
+        echo -e "${YELLOW}启动 Web 前端端口转发 (localhost:3000 -> datafusion-web-service:80)...${NC}"
+        kubectl port-forward -n datafusion svc/datafusion-web-service 3000:80 &
+        PF_PID_WEB=$!
+        echo -e "${GREEN}✅ Web 前端已发布到 localhost:3000${NC}"
+        echo ""
+    fi
+    
+    echo "========================================="
+    echo -e "${GREEN}✅ 端口转发已启动${NC}"
+    echo "========================================="
+    echo ""
+    echo -e "${BLUE}访问地址：${NC}"
+    if [[ -n "${PF_PID_WEB}" ]]; then
+        echo "  🌐 Web 管理界面: http://localhost:3000"
+        echo "     默认账户: admin / Admin@123"
+    fi
+    if [[ -n "${PF_PID_API}" ]]; then
+        echo "  🔗 API Server: http://localhost:8081"
+    fi
+    if [[ -n "${PF_PID_WORKER}" ]]; then
+        echo "  ⚙️  Worker 服务: localhost:9090"
+    fi
+    if [[ -n "${PF_PID_PG}" ]]; then
+        echo "  🗄️  PostgreSQL: localhost:5432"
+    fi
+    echo ""
+    echo -e "${YELLOW}提示：${NC}端口转发将在后台运行。要停止转发，请按 Ctrl+C 或执行："
+    echo "  kill \$PF_PID_PG \$PF_PID_API \$PF_PID_WORKER \$PF_PID_WEB 2>/dev/null"
     echo ""
 }
 
@@ -258,6 +457,8 @@ main() {
     local DEPLOY_API_SERVER=false
     local DEPLOY_WORKER=false
     local DEPLOY_WEB=false
+    local START_PORT_FORWARD=false
+    local ONLY_PORT_FORWARD=false
     
     # 解析参数
     while [[ $# -gt 0 ]]; do
@@ -286,6 +487,11 @@ main() {
                 DEPLOY_API_SERVER=true
                 DEPLOY_WORKER=true
                 DEPLOY_WEB=true
+                START_PORT_FORWARD=true
+                shift
+                ;;
+            port-forward)
+                ONLY_PORT_FORWARD=true
                 shift
                 ;;
             *)
@@ -295,6 +501,28 @@ main() {
                 ;;
         esac
     done
+    
+    # 处理仅启动端口转发的情况
+    if [[ "$ONLY_PORT_FORWARD" == "true" ]]; then
+        start_port_forward
+        return
+    fi
+    
+    # 处理仅清理资源的情况
+    if [[ "$CLEAN" == "true" && "$DEPLOY_API_SERVER" == "false" && "$DEPLOY_WORKER" == "false" && "$DEPLOY_WEB" == "false" ]]; then
+        echo "=========================================="
+        echo "DataFusion Kubernetes 清理"
+        echo "=========================================="
+        echo ""
+        
+        check_dependencies
+        clean_resources
+        
+        echo "=========================================="
+        echo -e "${GREEN}✅ 清理完成！${NC}"
+        echo "=========================================="
+        return
+    fi
     
     # 检查是否指定了组件
     if [[ "$DEPLOY_API_SERVER" == "false" && "$DEPLOY_WORKER" == "false" && "$DEPLOY_WEB" == "false" ]]; then
@@ -351,6 +579,12 @@ main() {
     echo "=========================================="
     echo -e "${GREEN}✅ 部署完成！${NC}"
     echo "=========================================="
+    echo ""
+    
+    # 自动启动端口转发（all 部署时）
+    if [[ "$START_PORT_FORWARD" == "true" ]]; then
+        start_port_forward
+    fi
 }
 
 # 执行主函数

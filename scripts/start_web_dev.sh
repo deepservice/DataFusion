@@ -85,7 +85,7 @@ start_dev_server() {
     echo ""
     echo -e "${BLUE}默认登录信息:${NC}"
     echo "  用户名: admin"
-    echo "  密码: admin123"
+    echo "  密码: Admin@123"
     echo ""
     echo -e "${YELLOW}按 Ctrl+C 停止开发服务器${NC}"
     echo "=================================================="

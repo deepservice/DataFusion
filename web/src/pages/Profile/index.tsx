@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Card, Form, Input, Button, message, Typography, Space, Avatar } from 'antd';
 import { UserOutlined, LockOutlined } from '@ant-design/icons';
-import { authService } from '@/services/auth';
-import { User } from '@/types';
+import { authService } from '../../services/auth';
+import { User } from '../../types';
 
 const { Title, Text } = Typography;
 

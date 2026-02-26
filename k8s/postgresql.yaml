@@ -55,6 +55,8 @@ spec:
             - pg_isready
             - -U
             - datafusion
+            - -d
+            - datafusion_control
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
@@ -63,6 +65,8 @@ spec:
             - pg_isready
             - -U
             - datafusion
+            - -d
+            - datafusion_control
           initialDelaySeconds: 5
           periodSeconds: 5
       volumes:
@@ -77,7 +81,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: postgresql
+  name: postgres-service
   namespace: datafusion
 spec:
   type: ClusterIP

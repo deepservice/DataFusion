@@ -6,6 +6,8 @@ bin/
 *.so
 *.dylib
 
+deploy.sh
+
 # Test binary
 *.test
 

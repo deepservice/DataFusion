@@ -1,5 +1,5 @@
 import { BaseAPI, TokenManager } from './api';
-import { LoginRequest, LoginResponse, User } from '@/types';
+import { LoginRequest, LoginResponse, User } from '../types';
 
 class AuthService extends BaseAPI {
   // 用户登录

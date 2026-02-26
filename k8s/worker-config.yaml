@@ -6,14 +6,14 @@ metadata:
 data:
   worker.yaml: |
     # Worker 类型
-    worker_type: "api"
+    worker_type: "all"
     
     # 轮询间隔
     poll_interval: 30s
     
     # 控制数据库配置
     database:
-      host: "postgresql.datafusion.svc.cluster.local"
+      host: "postgres-service.datafusion.svc.cluster.local"
       port: 5432
       user: "datafusion"
       password: "datafusion123"
@@ -25,7 +25,7 @@ data:
       rpa:
         browser_type: "chromium"
         headless: true
-        timeout: 30
+        timeout: 60
       api:
         timeout: 30
     
@@ -33,7 +33,7 @@ data:
     storage:
       type: "postgresql"
       database:
-        host: "postgresql.datafusion.svc.cluster.local"
+        host: "postgres-service.datafusion.svc.cluster.local"
         port: 5432
         user: "datafusion"
         password: "datafusion123"

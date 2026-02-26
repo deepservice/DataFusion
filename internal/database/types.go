@@ -48,18 +48,33 @@ func ParseTaskConfig(configJSON string) (*models.TaskConfig, error) {
 
 // GetPendingTasks 获取待执行的任务
 func (db *PostgresDB) GetPendingTasks(workerType string) ([]models.CollectionTask, error) {
-	query := `
-		SELECT id, name, type, status, cron, next_run_time, replicas, 
-		       execution_timeout, max_retries, config, created_at, updated_at
-		FROM collection_tasks 
-		WHERE status = 'enabled' 
-		AND type = $1 
-		AND (next_run_time IS NULL OR next_run_time <= NOW())
-		ORDER BY next_run_time ASC
-		LIMIT 10
-	`
-	
-	rows, err := db.Query(query, workerType)
+	var rows *sql.Rows
+	var err error
+
+	if workerType == "" || workerType == "all" {
+		query := `
+			SELECT id, name, type, status, data_source_id, cron, next_run_time, replicas,
+			       execution_timeout, max_retries, config, created_at, updated_at
+			FROM collection_tasks
+			WHERE status = 'enabled'
+			AND (next_run_time IS NULL OR next_run_time <= NOW())
+			ORDER BY next_run_time ASC
+			LIMIT 10
+		`
+		rows, err = db.Query(query)
+	} else {
+		query := `
+			SELECT id, name, type, status, data_source_id, cron, next_run_time, replicas,
+			       execution_timeout, max_retries, config, created_at, updated_at
+			FROM collection_tasks
+			WHERE status = 'enabled'
+			AND type = $1
+			AND (next_run_time IS NULL OR next_run_time <= NOW())
+			ORDER BY next_run_time ASC
+			LIMIT 10
+		`
+		rows, err = db.Query(query, workerType)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("查询待执行任务失败: %w", err)
 	}
@@ -69,7 +84,7 @@ func (db *PostgresDB) GetPendingTasks(workerType string) ([]models.CollectionTas
 	for rows.Next() {
 		var task models.CollectionTask
 		err := rows.Scan(
-			&task.ID, &task.Name, &task.Type, &task.Status, &task.Cron,
+			&task.ID, &task.Name, &task.Type, &task.Status, &task.DataSourceID, &task.Cron,
 			&task.NextRunTime, &task.Replicas, &task.ExecutionTimeout,
 			&task.MaxRetries, &task.Config, &task.CreatedAt, &task.UpdatedAt,
 		)
@@ -150,6 +165,24 @@ func (db *PostgresDB) UnlockTask(taskID int64) error {
 	}
 	
 	return nil
+}
+
+// ClearTaskNextRunTime 清空任务下次执行时间（一次性任务执行后调用）
+func (db *PostgresDB) ClearTaskNextRunTime(taskID int64) error {
+	_, err := db.Exec("UPDATE collection_tasks SET next_run_time = NULL WHERE id = $1", taskID)
+	if err != nil {
+		return fmt.Errorf("清空任务执行时间失败: %w", err)
+	}
+	return nil
+}
+
+// GetDataSourceConfig 获取数据源配置
+func (db *PostgresDB) GetDataSourceConfig(dataSourceID int64) (dsType string, config string, err error) {
+	err = db.QueryRow("SELECT type, config FROM data_sources WHERE id = $1", dataSourceID).Scan(&dsType, &config)
+	if err != nil {
+		return "", "", fmt.Errorf("查询数据源配置失败: %w", err)
+	}
+	return dsType, config, nil
 }
 
 // UpdateTaskNextRunTime 更新任务下次执行时间
